@@ -1,0 +1,33 @@
+output_dir = "runs/sft-replay-full-fsdp"
+max_steps = 20
+per_device_train_batch_size = 2
+per_device_eval_batch_size = 2
+learning_rate = 1e-5
+logging_steps = 2
+eval_strategy = "steps"
+eval_steps = 10
+save_strategy = "steps"
+bf16 = true
+report_to = "none"
+max_length = 256
+
+[model]
+path = "Qwen/Qwen3-0.6B"
+dtype = "bfloat16"
+
+[dataset]
+split = true
+dataset = "sft.jsonl"
+train = 60
+
+[replay]
+dataset = "replay.jsonl"
+fraction = 0.2
+kl_coef = 0.1
+
+[ranges]
+loss = [0.0, 3.0]
+eval_loss = [0.0, 3.0]
+mean_token_accuracy = [0.3, 1.0]
+replay_kl = [0.0, 1.0]
+grad_norm = [0.0, 10.0]

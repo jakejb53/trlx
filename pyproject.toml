@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=84"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trlx"
+version = "0.1.0"
+description = "Two executables that replace the TRL CLI: trlx drives trainers, dataset prepares data."
+requires-python = ">=3.11"
+# Exact pins per PLAN.md. torch is installed by the operator for their CUDA.
+dependencies = [
+    "trl==1.13.0",
+    "transformers==5.17.0",
+    "peft==0.21.0",
+    "accelerate==1.15.0",
+    "datasets==5.0.1",
+]
+
+# Generated wrappers, not copies of repo files: pip writes each one to import
+# the module and call main(), whose return value is the exit code.
+[project.scripts]
+trlx = "trlx.cli:main"
+dataset = "dataset.cli:main"
+
+[tool.setuptools]
+packages = ["trlx", "dataset"]

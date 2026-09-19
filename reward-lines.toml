@@ -1,0 +1,33 @@
+output_dir = "runs/reward-lines"
+max_steps = 20
+per_device_train_batch_size = 2
+per_device_eval_batch_size = 2
+learning_rate = 1e-4
+logging_steps = 2
+eval_strategy = "steps"
+eval_steps = 10
+save_strategy = "steps"
+bf16 = true
+report_to = "none"
+max_length = 256
+
+[model]
+path = "Qwen/Qwen3-0.6B"
+dtype = "bfloat16"
+
+
+[dataset]
+split = true
+dataset = "dpo.jsonl"
+train = 60
+
+[peft]
+r = 8
+lora_alpha = 16
+target_modules = "all-linear"
+
+[ranges]
+loss = [0.0, 5.0]
+eval_loss = [0.0, 5.0]
+accuracy = [0.0, 1.0]
+grad_norm = [0.0, 10.0]

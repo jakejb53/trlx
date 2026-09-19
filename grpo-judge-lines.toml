@@ -1,0 +1,40 @@
+output_dir = "runs/grpo-judge-lines"
+max_steps = 20
+per_device_train_batch_size = 4
+per_device_eval_batch_size = 4
+learning_rate = 1e-5
+logging_steps = 2
+eval_strategy = "steps"
+eval_steps = 10
+save_strategy = "steps"
+bf16 = true
+report_to = "none"
+num_generations = 4
+max_completion_length = 256
+beta = 0.04
+
+[model]
+path = "Qwen/Qwen3-0.6B"
+dtype = "bfloat16"
+
+[dataset]
+split = true
+dataset = "grpo.jsonl"
+train = 60
+
+[peft]
+r = 8
+lora_alpha = 16
+target_modules = "all-linear"
+
+[rewards]
+funcs = [
+  { name = "llm_judge", args = { url = "https://openrouter.ai/api/v1", model = "google/gemma-4-31b-it", api_key = "OPENROUTER_API_KEY", rubric = "Score the response from 0 to 10 for whether it correctly answers the arithmetic question. Reply with the number only.", timeout = 60.0, retries = 2, concurrency = 4, max_tokens = 16 } },
+]
+
+[ranges]
+reward = [-10.0, 10.0]
+reward_std = [0.0, 10.0]
+kl = [0.0, 1.0]
+"completions/mean_length" = [0.0, 4096.0]
+grad_norm = [0.0, 10.0]

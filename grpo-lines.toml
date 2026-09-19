@@ -1,0 +1,42 @@
+output_dir = "runs/grpo-lines"
+max_steps = 20
+per_device_train_batch_size = 4
+per_device_eval_batch_size = 4
+learning_rate = 1e-5
+logging_steps = 2
+eval_strategy = "steps"
+eval_steps = 10
+save_strategy = "steps"
+bf16 = true
+report_to = "none"
+num_generations = 4
+max_completion_length = 64
+beta = 0.04
+
+[model]
+path = "Qwen/Qwen3-0.6B"
+dtype = "bfloat16"
+
+[dataset]
+split = true
+dataset = "grpo.jsonl"
+train = 60
+
+[peft]
+r = 8
+lora_alpha = 16
+target_modules = "all-linear"
+
+[rewards]
+funcs = [
+  { name = "reference_match", args = { column = "answer", mode = "contains" } },
+  "think_format_reward",
+  "rewards_extra.py:brevity",
+]
+
+[ranges]
+reward = [-10.0, 10.0]
+reward_std = [0.0, 10.0]
+kl = [0.0, 1.0]
+"completions/mean_length" = [0.0, 4096.0]
+grad_norm = [0.0, 10.0]
