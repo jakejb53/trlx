@@ -5,12 +5,17 @@ fail silently if wrong, by letting a changed config resume a checkpoint.
 model, run directory, or GPU is involved.
 """
 
+import io
+import pathlib
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from trlx.preflight import compare_snapshot
+from trlx import TrlxError, toml_write
+from trlx.preflight import _check_resume, compare_snapshot
 
-# A run config as the operator wrote it, and the snapshot trlx made of it:
-# run_name prepended, [launch] appended.
+# Effective inputs after method selection and CLI overrides, and their snapshot:
+# run_name resolved, [launch] appended.
 CURRENT = {
     "output_dir": "runs/a",
     "learning_rate": 1e-4,
@@ -24,7 +29,7 @@ SNAPSHOT = {
     "learning_rate": 1e-4,
     "model": {"path": "m", "dtype": "bfloat16"},
     "ranges": {"loss": [0, 5]},
-    "launch": {"strategy": "ddp", "gpus": ["0", "1"]},
+    "launch": {"method": "sft", "strategy": "ddp", "gpus": ["0", "1"]},
 }
 
 
@@ -37,6 +42,12 @@ class CompareSnapshot(unittest.TestCase):
         # file must carry it. Neither that nor [launch].gpus is a difference.
         current = dict(CURRENT, resume_from_checkpoint="runs/a/checkpoint-40")
         snapshot = dict(SNAPSHOT, launch={"strategy": "ddp", "gpus": ["1"]})
+        self.assertEqual(compare_snapshot(current, snapshot, "ddp"), [])
+
+    # Presentation and device choices can change without changing trained weights.
+    def test_run_controls_are_not_training_input_differences(self):
+        current = dict(CURRENT, run={"gpus": "1", "strategy": "auto", "tui": True, "verify": False})
+        snapshot = dict(SNAPSHOT, run={"gpus": "all", "strategy": "ddp", "tui": False, "verify": True})
         self.assertEqual(compare_snapshot(current, snapshot, "ddp"), [])
 
     def test_no_strategy_skips_sharding(self):
@@ -79,6 +90,32 @@ class CompareSnapshot(unittest.TestCase):
         diffs = compare_snapshot(current, SNAPSHOT, "ddp")
         self.assertEqual(len(diffs), 1)
         self.assertIn("run_name", diffs[0])
+
+
+class ResumeCheck(unittest.TestCase):
+    # Resume needs the already resolved inputs, never a second read of the operator config.
+    def config(self, document):
+        return SimpleNamespace(
+            args=SimpleNamespace(resume_from_checkpoint="runs/a/checkpoint-20", output_dir="runs/a"),
+            method=SimpleNamespace(name="sft"), document=document,
+        )
+
+    # A temporary CLI override must invalidate resume even when the source file is unchanged.
+    def test_resume_compares_effective_inputs(self):
+        current = dict(CURRENT, model={"path": "different/model", "dtype": "bfloat16"})
+        snapshot = io.BytesIO(toml_write.dumps(SNAPSHOT).encode())
+        with patch("trlx.preflight.open", return_value=snapshot) as opening:
+            with self.assertRaisesRegex(TrlxError, "resume refused") as caught:
+                _check_resume(self.config(current), "operator.toml", "ddp")
+        self.assertIn("model.path", str(caught.exception))
+        opening.assert_called_once_with(pathlib.Path("runs/a/config.toml"), "rb")
+
+    # Identical argument shapes do not make a checkpoint from another method compatible.
+    def test_resume_rejects_different_method(self):
+        saved = dict(SNAPSHOT, launch={"method": "dpo", "strategy": "ddp", "gpus": ["0"]})
+        with patch("trlx.preflight.open", return_value=io.BytesIO(toml_write.dumps(saved).encode())):
+            with self.assertRaisesRegex(TrlxError, "is for dpo, not sft"):
+                _check_resume(self.config(CURRENT), "operator.toml", "ddp")
 
 
 if __name__ == "__main__":

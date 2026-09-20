@@ -80,6 +80,10 @@ class Writer:
         line = f"[{_key(name)}]"
         self._lines.append("# " + line if commented else line)
 
+    # Dotted table paths keep their components distinct from literal dotted keys.
+    def table_path(self, *parts):
+        self._lines.append("[" + ".".join(_key(part) for part in parts) + "]")
+
     # A key line. value=None writes "# name =" with no value: TOML has no
     # null, and uncommenting the line without supplying a value is a parse
     # error rather than a silent placeholder. A None value is therefore
@@ -94,3 +98,24 @@ class Writer:
     # The document. Always ends in a newline.
     def text(self):
         return "\n".join(self._lines) + "\n"
+
+
+# Serialize the selected run inputs, including CLI values, for worker hand-off.
+# Dictionaries become tables; dictionaries inside arrays remain inline values.
+def dumps(document):
+    writer = Writer()
+
+    # Scalars must precede child table headers or TOML would change their owner.
+    def emit(table, path):
+        if path:
+            writer.blank()
+            writer.table_path(*path)
+        for key, value in table.items():
+            if not isinstance(value, dict):
+                writer.key(key, value)
+        for key, value in table.items():
+            if isinstance(value, dict):
+                emit(value, (*path, key))
+
+    emit(document, ())
+    return writer.text()

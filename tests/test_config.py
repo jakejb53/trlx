@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from trlx import TrlxError, config, init_cmd, trainers
+from trlx.hardware import Hardware
 
 # Minimal valid sft config. Tests prepend top-level overrides, so the
 # top-level keys come first and blocks after.
@@ -21,17 +22,19 @@ dtype = "bfloat16"
 [dataset]
 split = true
 dataset = "data/train.jsonl"
-train = 100
+eval_fraction = 0.1
 [ranges]
 loss = [0, 5]
 """
 
 
 class ConfigCase(unittest.TestCase):
+    # Keep all generated config files inside the repository's approved scratch area.
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent)
         self.dir = pathlib.Path(self._tmp.name)
 
+    # Remove only this test's temporary directory after success or failure.
     def tearDown(self):
         self._tmp.cleanup()
 
@@ -40,7 +43,7 @@ class ConfigCase(unittest.TestCase):
     def load(self, top="", method="sft", text=None):
         path = self.dir / "run.toml"
         path.write_text(text if text is not None else top + BASE)
-        return config.load(str(path), method)
+        return config.load(str(path), method, overrides={"use_cpu": True, "bf16": False, "fp16": False})
 
     def assertRejected(self, fragment, top="", method="sft", text=None):
         with self.assertRaises(TrlxError) as ctx:
@@ -100,24 +103,28 @@ class TopLevelKeys(ConfigCase):
 
 
 class DatasetBlock(ConfigCase):
+    # Split modes remain mutually exclusive after replacing row counts with fractions.
     def test_split_true_rejects_split_false_keys(self):
-        text = BASE.replace("train = 100\n", 'train = 100\ndataset_train = "a.jsonl"\n')
+        text = BASE.replace("eval_fraction = 0.1\n", 'eval_fraction = 0.1\ndataset_train = "a.jsonl"\n')
         self.assertRejected("'dataset_train' is for split = false", text=text)
 
+    # A separate evaluation source cannot also request a fractional split.
     def test_split_false_rejects_split_true_keys(self):
-        text = BASE.replace("split = true\ndataset = \"data/train.jsonl\"\ntrain = 100\n",
-                            'split = false\ndataset_train = "a.jsonl"\ntrain = 100\n')
-        self.assertRejected("'train' is for split = true", text=text)
+        text = BASE.replace("split = true\ndataset = \"data/train.jsonl\"\neval_fraction = 0.1\n",
+                            'split = false\ndataset_train = "a.jsonl"\neval_fraction = 0.1\n')
+        self.assertRejected("'eval_fraction' is for split = true", text=text)
 
+    # Explicit evaluation controls require an evaluation source.
     def test_split_false_without_eval_rejects_eval_keys(self):
-        text = BASE.replace("split = true\ndataset = \"data/train.jsonl\"\ntrain = 100\n",
+        text = BASE.replace("split = true\ndataset = \"data/train.jsonl\"\neval_fraction = 0.1\n",
                             'split = false\ndataset_train = "a.jsonl"\n')
         self.assertRejected("eval keys are set: eval_steps", text='eval_steps = 10\n' + text)
         cfg = self.load(text=text)
         self.assertFalse(cfg.dataset.eval_enabled)
 
+    # A separate evaluation file is preserved without inventing a fractional split.
     def test_split_false_with_eval(self):
-        text = BASE.replace("split = true\ndataset = \"data/train.jsonl\"\ntrain = 100\n",
+        text = BASE.replace("split = true\ndataset = \"data/train.jsonl\"\neval_fraction = 0.1\n",
                             'split = false\ndataset_train = "a.jsonl"\ndataset_eval = "b.parquet"\n')
         cfg = self.load(text=text)
         self.assertTrue(cfg.dataset.eval_enabled)
@@ -136,8 +143,22 @@ class DatasetBlock(ConfigCase):
             config.dataset_ref("run.toml", "[dataset].dataset", "rows.txt")
         self.assertIn("neither a dataset file", str(ctx.exception))
 
-    def test_bool_is_not_a_row_count(self):
-        self.assertRejected("[dataset].train must be int", text=BASE.replace("train = 100", "train = true"))
+    # Python booleans must not pass the numeric fraction validator.
+    def test_bool_is_not_an_eval_fraction(self):
+        self.assertRejected("[dataset].eval_fraction must be a number",
+                            text=BASE.replace("eval_fraction = 0.1", "eval_fraction = true"))
+
+    # Existing row-count configs receive the explicit migration instruction.
+    def test_train_row_count_is_rejected(self):
+        self.assertRejected("[dataset].train is no longer supported; use eval_fraction",
+                            text=BASE.replace("eval_fraction = 0.1", "train = 100"))
+
+    # Both subsets must have a nonzero requested fraction before any data loads.
+    def test_fraction_must_be_inside_unit_interval(self):
+        for value in ("0", "1", "-0.1", "1.1", "nan"):
+            with self.subTest(value=value):
+                self.assertRejected("between 0 and 1, exclusive",
+                                    text=BASE.replace("eval_fraction = 0.1", "eval_fraction = " + value))
 
 
 class Blocks(ConfigCase):
@@ -192,20 +213,30 @@ class Blocks(ConfigCase):
 
 
 class InitRoundTrip(ConfigCase):
-    # Every template loads back; placeholders are valid at load time.
+    # The same generated file accepts every method once real task inputs arrive.
+    # CPU arguments avoid initializing CUDA; no model or dataset is loaded.
     def test_every_method(self):
+        path = self.dir / "run.toml"
+        path.write_text(init_cmd.render(Hardware(8, ())))
         for name in trainers.METHODS:
-            path = self.dir / f"{name}.toml"
-            path.write_text(init_cmd.render(name))
-            cfg = config.load(str(path), name)
-            self.assertEqual(cfg.method.name, name)
-            self.assertEqual(list(cfg.ranges), list(init_cmd.RANGES[name]))
+            with self.subTest(method=name):
+                overrides = {"model.path": "some/model", "dataset.source": "data/train.jsonl", "use_cpu": True}
+                if "teacher" in trainers.get(name).blocks:
+                    overrides["teacher.path"] = "some/teacher"
+                if "rewards" in trainers.get(name).blocks:
+                    overrides["rewards.funcs"] = ["think_format_reward"]
+                cfg = config.load(str(path), name, overrides=overrides)
+                self.assertEqual(cfg.method.name, name)
+                self.assertEqual(list(cfg.ranges), list(init_cmd.RANGES[name]))
+                self.assertEqual(cfg.dataset.eval_fraction, 0.1)
+                self.assertEqual(cfg.peft.target_modules, "all-linear")
 
+    # Repeated init must preserve the existing file, even before hardware inspection.
     def test_init_refuses_to_overwrite(self):
         path = self.dir / "x.toml"
         path.write_text("")
         with self.assertRaises(TrlxError):
-            init_cmd.write("sft", str(path))
+            init_cmd.write(str(path))
 
 
 if __name__ == "__main__":

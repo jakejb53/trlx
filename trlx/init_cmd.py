@@ -1,40 +1,17 @@
-"""`trlx init <method> --out <path>`: writes a run config template.
+"""`trlx init`: persistent environment defaults for every training method.
 
-Everything about a TRL or peft field (name, default, help text, whether it
-admits None) is read from the live dataclass at generation time. This file
-holds only what is trlx's own: the curated TrainingArguments subset, the
-initial [ranges] per method, the block descriptions, and the placeholder
-values for keys that have no meaningful default.
-
-Nothing here names a model family, an architecture, or a machine. Placeholders
-are written where the operator must supply a value.
+Hardware can determine native precision support, but cannot establish model
+fit or optimal batch sizes without a model and data. The emitted configuration
+distinguishes those measured capabilities from conservative starting settings.
 """
 
 import dataclasses
 import pathlib
+import tempfile
 
-from peft import LoraConfig
-from transformers import TrainingArguments
-
-from trlx import TrlxError, config, trainers
-from trlx.toml_write import Writer, format_value
-
-# TrainingArguments fields written by init, in this order. Any other field may
-# be added to the config by name.
-CURATED = [
-    "output_dir", "run_name", "learning_rate", "num_train_epochs", "max_steps",
-    "per_device_train_batch_size", "per_device_eval_batch_size", "gradient_accumulation_steps",
-    "eval_strategy", "eval_steps", "save_strategy", "save_steps", "save_total_limit",
-    "logging_steps", "warmup_steps", "lr_scheduler_type", "weight_decay", "max_grad_norm",
-    "optim", "bf16", "gradient_checkpointing", "seed", "resume_from_checkpoint",
-]
-
-# trlx's own rules for curated fields, appended to the field's help text.
-CURATED_NOTES = {
-    "output_dir": "trlx: required. The run directory (SPEC 2.3).",
-    "run_name": "trlx: when absent, the last component of output_dir.",
-    "save_steps": "trlx: when absent, equal to eval_steps.",
-}
+from trlx import TrlxError, config, hardware, trainers
+from trlx.hardware import Hardware
+from trlx.toml_write import Writer
 
 # Initial [ranges] per method. Intervals are starting points to be tuned
 # against real runs; the metric names are the display columns.
@@ -54,178 +31,178 @@ RANGES = {
     "distillation": {"loss": [0, 5], "eval_loss": [0, 5], "grad_norm": [0, 10]},
 }
 
-# [model] and [teacher] keys with the values init writes. `path` is the one
-# placeholder; the rest are the values an operator most often wants and can
-# change.
-MODEL_BLOCK = [
-    ("path", "<model path or HF id>", "Local directory or HF model id. The model class is read from its config."),
-    ("dtype", "bfloat16", "torch dtype name the weights are loaded in."),
-    ("trust_remote_code", False, "Allow model code shipped with the checkpoint."),
-    ("attn_implementation", "sdpa", "Attention backend passed to from_pretrained, e.g. sdpa, eager, flash_attention_2."),
-]
-
-_TA_FIELDS = {f.name for f in dataclasses.fields(TrainingArguments)}
-
-
-# Renders the template for one method as TOML text.
-def render(method_name):
-    method = trainers.get(method_name)
-    cls = method.config_cls
-    fields = {f.name: f for f in dataclasses.fields(cls)}
+# These are visible starting values, not a claim that a particular model fits.
+# Native BF16 is a hardware fact; batch sizes require later model/data tuning.
+def render(system: Hardware) -> str:
+    bf16 = bool(system.gpus) and all(gpu.bf16 for gpu in system.gpus)
+    dtype = "bfloat16" if bf16 else "float32"
     w = Writer()
-
-    w.comment(f"trlx run config for {method.name}. Written by `trlx init {method.name}`.")
-    w.comment(
-        f"Top-level keys are fields of {cls.__name__}: unknown keys are errors, absent keys take the "
-        'dataclass default, and the string "None" sets a field to None where its type allows. '
-        "Keys written commented out default to None. Every other TrainingArguments field may be "
-        "added by name. The [blocks] are trlx's own."
-    )
+    w.comment("trlx defaults for all training methods. Written by trlx init.")
+    w.comment("CLI arguments override this file for one run. Edit this file for persistent changes. "
+              "Shared settings go before table headings; methods.NAME overrides shared values.")
+    w.comment(f"Detected {system.cpu_count} logical CPUs and {len(system.gpus)} visible CUDA devices.")
+    for gpu in system.gpus:
+        w.comment(f"GPU {gpu.index}: {gpu.name}; {gpu.free_bytes / 2**30:.1f} GiB free / "
+                  f"{gpu.total_bytes / 2**30:.1f} GiB total; native BF16: {gpu.bf16}.")
+    w.comment("Memory availability is a snapshot. Without a model and dataset, batch sizing is "
+              "conservative, not calibrated; model fit and optimal throughput are unknown.")
+    if not system.gpus:
+        w.comment("No CUDA GPUs detected. These FP32 defaults can be prepared on a CPU host; "
+                  "training requires visible CUDA GPUs.")
     w.blank()
 
-    w.comment("Training arguments (transformers.TrainingArguments, curated subset)")
+    w.comment("One pass through the training data; -1 means no fixed optimizer-step limit.")
+    w.key("num_train_epochs", 1.0)
+    w.key("max_steps", -1)
+    w.comment("One example per GPU at a time; accumulate eight batches before an optimizer update.")
+    w.key("per_device_train_batch_size", 1)
+    w.key("gradient_accumulation_steps", 8)
+    w.key("per_device_eval_batch_size", 1)
+    w.comment("Evaluate and save after each epoch, retain two checkpoints, log every optimizer update.")
+    w.key("eval_strategy", "epoch")
+    w.key("save_strategy", "epoch")
+    w.key("save_total_limit", 2)
+    w.key("logging_steps", 1)
+    w.key("report_to", "none")
+    w.comment("Checkpoint activations to reduce memory. Use BF16 only when all visible GPUs support it natively.")
+    w.key("gradient_checkpointing", True)
+    w.key("bf16", bf16)
+    w.key("fp16", False)
+    w.comment("Load data in the trainer process to avoid multiplying unknown dataset memory use.")
+    w.key("dataloader_num_workers", 0)
+    w.key("dataloader_pin_memory", bool(system.gpus))
     w.blank()
-    for name in CURATED:
-        f = fields[name]
-        value = "runs/" + method.name if name == "output_dir" else _default(f)
-        _field(w, f, value, note=CURATED_NOTES.get(name))
 
-    w.comment(f"{cls.__name__} fields")
+    w.comment("Use all visible GPUs and estimate the launch strategy from the model at training time. "
+              "Print line-based progress and run verification after training. CLI flags override these settings.")
+    w.table("run")
+    for key, value in config.run_settings({}).items():
+        w.key(key, value)
     w.blank()
-    # Fields config.load rejects are not offered: model loading belongs to
-    # [model], and grpo/rloo's vLLM switches are forced on.
-    owned = set(config.MODEL_LOADING_FIELDS) | config.STRATEGY_FIELDS
-    if "rewards" in method.blocks:
-        owned |= set(config.VLLM_FORCED)
-    for f in dataclasses.fields(cls):
-        if f.name in _TA_FIELDS or f.name in owned:
-            continue
-        _field(w, f, _default(f))
 
-    _model_block(w, "model", "The model to train.")
-    if "teacher" in method.blocks:
-        _model_block(w, "teacher", "The teacher for distillation. Same keys as [model].")
-
-    w.comment("Datasets. Files by extension (.jsonl, .json, .csv, .parquet) or HF ids as org/name:split.")
-    w.comment("split = true: `dataset` is cut after `train` rows (file order); the rest is eval.")
-    w.comment("split = false: `dataset_train` and optional `dataset_eval`; without dataset_eval, "
-              "evaluation is disabled and eval_* keys are rejected.")
+    w.comment("Supply the base model with --model, or persist its local path / Hub id here.")
+    _model_block(w, ("model",), dtype)
+    w.comment("Supply --dataset with a file or Hub reference. Hold out the final 10% in file order.")
     w.table("dataset")
     w.key("split", True)
-    # A placeholder that is itself a valid reference, so the template loads.
-    w.key("dataset", "data/train.jsonl")
-    w.key("train", 1000)
-    w.key("dataset_train", None)
-    w.key("dataset_eval", None)
+    w.key("eval_fraction", 0.1)
+    w.key("dataset", None)
     w.blank()
 
-    _peft_block(w, method)
+    w.comment("Train a LoRA adapter on all linear layers, including vision layers when present. "
+              "Remove this block for full fine-tuning; trlx selects the appropriate task_type.")
+    w.table("peft")
+    w.key("r", 8)
+    w.key("lora_alpha", 16)
+    w.key("lora_dropout", 0.05)
+    w.key("target_modules", "all-linear")
+    w.blank()
 
-    w.comment("Expected interval per metric. Required. Metrics named here are the display columns; "
-              "values outside their interval are marked.")
-    w.table("ranges")
+    w.comment("Only the chosen training method's section applies. Additional TRL fields may be "
+              "added by name; omitted fields use TRL defaults. See trlx METHOD --help.")
+    for method in trainers.METHODS.values():
+        _method_block(w, method, dtype)
+    return w.text()
+
+
+# Keep the model and distillation teacher at the same hardware-selected dtype.
+# Missing paths remain absent so the CLI must supply a real model, never a placeholder.
+def _model_block(w, table, dtype):
+    w.table_path(*table)
+    w.key("path", None)
+    w.key("dtype", dtype)
+    w.key("trust_remote_code", False)
+    w.key("attn_implementation", "sdpa")
+    w.blank()
+
+
+# Method-specific defaults are stored, not reconstructed when launching a run.
+# Fields we do not override come from the installed TRL dataclass, without construction.
+def _method_block(w, method, dtype):
+    fields = {field.name: field for field in dataclasses.fields(method.config_cls)}
+    w.table_path("methods", method.name)
+    w.key("output_dir", "runs/" + method.name)
+    learning_rate = 1e-4 if method.name in {"sft", "reward", "distillation"} else _default(fields["learning_rate"])
+    w.key("learning_rate", learning_rate)
+    if "rewards" in method.blocks:
+        w.comment("Training generations must divide the effective generation batch; "
+                  "evaluation uses one generation so a single-prompt batch works.")
+        w.key("num_generations", _default(fields["num_generations"]))
+        w.key("num_generations_eval", 1)
+    w.blank()
+
+    w.comment("Display columns and expected intervals; values outside these ranges are marked.")
+    w.table_path("methods", method.name, "ranges")
     for metric, bounds in RANGES[method.name].items():
         w.key(metric, bounds)
     w.blank()
 
     if "preflight" in method.blocks:
-        w.comment("Off-policy warning: responses whose mean per-token log-prob under the starting "
-                  "model is below the threshold are reported. `rows` bounds the check to the first "
-                  "N train rows; it is one forward pass per response.")
-        w.table("preflight")
-        w.key("offpolicy_logp_per_token", -1.0)
+        w.comment("Warn about off-policy responses using up to 64 training rows; "
+                  "threshold is mean log probability per token.")
+        w.table_path("methods", method.name, "preflight")
         w.key("rows", 64)
+        w.key("offpolicy_logp_per_token", -1.0)
         w.blank()
-
+    if "teacher" in method.blocks:
+        w.comment("Distillation requires a teacher: supply --teacher or set its path here.")
+        _model_block(w, ("methods", method.name, "teacher"), dtype)
     if "rewards" in method.blocks:
-        w.comment("Reward functions, in order. Each entry is a bare name from trl.rewards or a trlx "
-                  "built-in, {name = ..., args = {...}} for a factory, an HF model path, or "
-                  "module:function / path.py:function.")
-        w.table("rewards")
-        w.key("funcs", ["think_format_reward"])
+        w.comment("Supply an explicit reward objective via CLI or funcs here. "
+                  "Entries accept reward names, factories, model paths, or Python callables.")
+        w.table_path("methods", method.name, "rewards")
+        w.key("funcs", None)
         w.blank()
 
-    if "replay" in method.blocks:
-        w.comment("Replay: mix `dataset` into training so `fraction` of the mixed train set is replay "
-                  "rows (built by `trlx replay-build`); kl_coef > 0 adds a KL term against the original "
-                  "model on replay batches. With kl_coef > 0, trlx sets loss_type = \"nll\" (the KL needs "
-                  "logits) and rejects the key, and use_liger_kernel, packing, and padding_free are refused.")
-        w.table("replay", commented=True)
-        w.key("dataset", None)
-        w.key("fraction", None)
-        w.key("kl_coef", None)
-        w.blank()
 
-    w.comment("Prompts for the post-training generation check. A built-in set is used when absent.")
-    w.table("verify", commented=True)
-    w.key("prompts", None)
-
-    return w.text()
-
-
-# Default value of a dataclass field, materialising factories. MISSING is
-# treated as None so the key is written commented out.
-def _default(f):
-    if f.default is not dataclasses.MISSING:
-        return f.default
-    if f.default_factory is not dataclasses.MISSING:
-        return f.default_factory()
+# Dataclass factories provide defaults without instantiating training arguments,
+# which would otherwise initialize devices and validate missing run-specific inputs.
+def _default(field):
+    if field.default is not dataclasses.MISSING:
+        return field.default
+    if field.default_factory is not dataclasses.MISSING:
+        return field.default_factory()
     return None
 
 
-# Help text, optional trlx note, then the key. None values come out commented.
-def _field(w, f, value, note=None, commented=False):
-    w.comment(f.metadata["help"])
-    if note:
-        w.comment(note)
-    w.key(f.name, value, commented=commented)
-    w.blank()
-
-
-def _model_block(w, name, description):
-    w.comment(description)
-    w.table(name)
-    for key, value, help_text in MODEL_BLOCK:
-        w.comment(help_text)
-        w.key(key, value)
-    w.blank()
-
-
-# [peft] is optional (absent means full fine-tune), so the whole block is
-# commented out. Fields are LoraConfig's own, minus those typed as peft
-# config objects, which TOML cannot express.
-def _peft_block(w, method):
-    w.comment("LoRA adapter (peft.LoraConfig fields). Absent means full fine-tune. "
-              "Uncomment the header and the fields to set to train an adapter. task_type is set by trlx.")
-    w.table("peft", commented=True)
-    w.blank()
-    for f in dataclasses.fields(LoraConfig):
-        if f.name in config.PEFT_OWNED_FIELDS:
-            continue
-        value = _default(f)
-        if value is not None and not _expressible(value):
-            continue
-        _field(w, f, value, commented=True)
-
-
-# True when format_value can spell the value; nested dataclass defaults cannot
-# be written and are skipped.
-def _expressible(value):
-    try:
-        format_value(value)
-    except TypeError:
-        return False
-    return True
-
-
-# Writes the template to `out`. Refuses an existing file: a template must never
-# replace a config an operator has edited.
-def write(method_name, out):
+# Existing settings require explicit replacement. Detect and render first so a
+# failed inspection cannot damage them; ordinary creation remains race-safe.
+def write(out="run.toml", force=False) -> Hardware:
     path = pathlib.Path(out)
-    if path.exists():
-        raise TrlxError(f"{out}: already exists; init does not overwrite")
-    text = render(method_name)
+    exists_message = f"{out} already exists. Use --force to overwrite it."
+    if path.exists() and not force:
+        raise TrlxError(exists_message)
+    system = hardware.inspect()
+    text = render(system)
     try:
-        path.write_text(text, encoding="utf-8")
-    except OSError as e:
-        raise TrlxError(f"{out}: cannot write: {e.strerror or e}")
+        if force:
+            _replace(path, text)
+        else:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(text)
+    except FileExistsError as exc:
+        raise TrlxError(exists_message) from exc
+    except OSError as exc:
+        raise TrlxError(f"{out}: cannot write: {exc.strerror or exc}") from exc
+    return system
+
+
+# Publish a forced replacement only after the complete file is written. A failed
+# write or replace leaves the original intact; temporary files stay beside it.
+def _replace(path, text):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as handle:
+            temporary = pathlib.Path(handle.name)
+            handle.write(text)
+        try:
+            mode = path.stat().st_mode & 0o777
+        except FileNotFoundError:
+            pass  # --force also permits first-time creation.
+        else:
+            temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

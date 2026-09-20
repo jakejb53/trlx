@@ -4,9 +4,9 @@ Two executables that replace the TRL CLI. `trlx` drives TRL trainers from a run 
 
 Design rule: do what makes sense, not what the HF/ML ecosystem does.
 
-Design rule: general-purpose. Both tools run on any machine and any model transformers can load. No model family, architecture, module name, path, device, or machine fact is hardcoded in source, in `init` output, or in tests. Such facts come from the run config or the model's own metadata. Section 5 records facts about one test model, not assumptions the tools rely on.
+Design rule: general-purpose. No model family, architecture, module name, path, device, or machine fact is assumed in source or tests. Model facts come from explicit inputs or model metadata; `init` obtains environment facts from hardware inspection. Section 5 records one test model, not assumptions the tools rely on.
 
-Project-specific exceptions to `PRINCIPLES.md`'s prohibition on runtime defaults for operational settings: absent top-level trainer settings use the TRL config dataclass defaults; `run_name` defaults to the output directory's name; the checkpoint interval defaults to the evaluation interval (§2.2); GPU selection defaults to all visible GPUs (§2.5); and verification uses the built-in prompt set when `[verify].prompts` is absent (§2.7). These five defaults are intentional exceptions; the general rule remains in effect for other operational settings unless an exception is explicitly documented.
+Project-specific runtime-default exceptions: absent trainer settings use TRL dataclass defaults; `run_name` uses the output directory's name; a step-based checkpoint interval follows the evaluation interval (§2.2); verification uses built-in prompts when none are supplied. Flat configs without `[run]` retain the original CLI defaults: all visible GPUs, automatic strategy, line display, and verification enabled. A present `[run]` requires all its keys. Other operational defaults are written explicitly by `init`.
 
 ## 1. Repository
 
@@ -29,30 +29,36 @@ trlx/              repo root
 
 | Command | Does |
 |---|---|
-| `trlx init <method> --out <path>` | Writes a run config for the method with every trainer-specific field, a curated subset of training arguments, and all blocks below. Each field carries its TRL docstring as a comment. Fields whose default is `None` are written commented out. |
-| `trlx <method> <config> [--tui] [--gpus i,j] [--strategy ddp\|fsdp] [--no-verify]` | Runs preflight, trains, runs verify. Displays metrics until the job completes. |
+| `trlx init [--out <path>] [--force]` | Writes `run.toml` by default, with shared environment-informed settings and all method sections. Existing files require `--force`, which replaces saved settings with freshly generated defaults. No method, model, dataset, or calibration run is required. |
+| `trlx <method> [--config <path>] [--model <model>] [--dataset <data>] [options]` | Uses `run.toml` by default. Explicit CLI settings override this run only. Runs preflight, training, and verification. Model/data must come from config or CLI. |
 | `trlx show <run> [--tui]` | Renders a run's `metrics.jsonl` with the same renderers. |
-| `trlx check <method> <config>` | Preflight only. |
+| `trlx check <method> [--config <path>] [options]` | Preflight only, with the same training-setting overrides. |
 | `trlx verify <checkpoint> --base <model> [--prompts <dataset>]` | Artifact checks only. |
 | `trlx merge --base <model> --adapter <dir> --out <dir>` | Merge with adapter-load check. |
 | `trlx replay-build --model <path\|name> [--endpoint <url>] --prompts <dataset> --out <path> --max-tokens <n>` | Samples a model on prompts, writes a `messages` dataset. `--model` is a local path or HF id, or with `--endpoint` the served model name; the endpoint takes the connection flags of `dataset chat`. |
 
 Methods: `sft`, `dpo`, `grpo`, `kto`, `rloo`, `reward`, `distillation`. Stable TRL trainers only.
 
-`--tui` shows a full-screen view that stays until the user quits. Without it, output is one line per log step.
+Training options use hyphenated field names; LoRA fields use `--lora-*` (`lora_alpha` becomes `--lora-alpha`). Boolean options have positive and negative forms; lists and tables use shell-quoted TOML. `--no-lora` and `--no-replay` remove those features for one run. Repeated `--reward` entries replace the reward list; distillation exposes `--teacher`. Conflicting explicit options are errors.
+
+Both CLIs provide top-level command descriptions and command-level help with inputs, options, types, defaults, constraints, and examples. Help reads no run config and performs no hardware inspection, model loading, dataset access, or training. Detailed training help derives fields from installed library metadata.
+
+`init` records native BF16 support and GPU memory metadata, selects BF16 only when all visible GPUs support it, otherwise FP32, and emits conservative batching/checkpointing defaults. LoRA is active with rank 8, alpha 16, dropout 0.05, and `all-linear` targets. It writes `eval_fraction = 0.1`; no model/data/reward objective is guessed. CPU-only initialization is allowed; training requires CUDA. Model fit remains a launch-time estimate.
 
 ### 2.2 Run config
 
-TOML. One file describes the whole job.
+TOML. One file holds persistent defaults for all methods. Precedence is explicit CLI values, then the selected `[methods.<name>]` section, then shared top-level settings. Nested method tables are merged by key. Unselected method settings are not passed to TRL. A flat per-run config remains supported.
 
-- Top-level keys map onto the method's TRL config dataclass. Unknown key: error. Absent key: dataclass default. String `"None"`: `None`, accepted only where the field type admits `None`.
-- `output_dir` required. `run_name` defaults to the directory name. Checkpoint interval defaults to the eval interval.
+- Top-level keys map onto the method's TRL config dataclass. Unknown key: error. Absent key: dataclass default. Nullable trainer and LoRA fields accept the string `"None"`; nullable CLI booleans also accept an explicit `None` value.
+- `output_dir` required after resolution; init writes `runs/<method>` in each method section. `run_name` defaults to the directory name. For step evaluation, an omitted checkpoint interval follows the eval interval.
+- `[run]`: `gpus` (`all` or comma-separated visible indices), `strategy` (`auto`, `ddp`, `fsdp`), `tui` and `verify` (booleans). CLI forms are `--gpus`, `--strategy`, `--tui`/`--no-tui`, `--verify`/`--no-verify`.
 - `[model]`: `path`, `dtype`, `trust_remote_code`, `attn_implementation`. Class is read from the model's own config, never hardcoded. `reward` resolves the sequence-classification variant of that architecture.
 - `[teacher]`: `distillation` only. Same keys as `[model]`.
 - `[dataset]`:
-  - `split = true`: `dataset` (file path or HF id) and `train` (row count, file order). Remaining rows are eval.
+  - `split = true`: `dataset` and `eval_fraction` strictly between 0 and 1. At load time, the final `ceil(row_count * eval_fraction)` rows evaluate; earlier rows train. Both sides must be nonempty. The old `train` key is rejected.
   - `split = false`: `dataset_train`, optional `dataset_eval`. No `dataset_eval` disables evaluation and rejects `eval_*` fields.
   - Key mismatch with `split` is an error.
+  - CLI `--dataset` selects the primary source in either mode. `--no-split` removes fractional-split keys; without `--dataset-eval`, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
   - HF ids carry a split as `org/name:split`. Without one, a single-split repo is accepted; a multi-split repo is an error listing the splits.
 - `[peft]`: LoraConfig fields. Absent means full fine-tune.
 - `[ranges]`: expected interval per metric. Required. Missing block is a fatal error. Metrics named here are the display columns.
@@ -67,13 +73,15 @@ Dataset files: JSONL, JSON array, CSV, Parquet, by extension. Applies everywhere
 
 ```
 <run>/
-  config.toml      snapshot, including chosen strategy and GPUs
+  config.toml      resolved method + CLI settings, including chosen strategy and GPUs
   metrics.jsonl    one record per log step, written by the trlx callback; the only metric source
   log.txt          TRL and transformers output, always written; also passed to stderr without --tui
   preflight.json
   verify.json
   checkpoint-N/    TRL checkpoint
 ```
+
+The supervisor resolves inputs once and writes the snapshot before spawning workers. Workers read that snapshot, not the operator's source file. The source config is never rewritten by training. `[launch]` records method, actual strategy, and physical GPU identifiers; it is reserved for snapshots.
 
 ### 2.4 Display
 
@@ -100,7 +108,7 @@ Fatal:
 - `grpo`/`rloo`: TRL vLLM server unreachable, or the server answering is not the TRL server.
 - `[replay]` with `kl_coef > 0` alongside `use_liger_kernel`, `packing`, or `padding_free`.
 - `save_strategy = "no"`: nothing would be left to verify or merge.
-- Resume from checkpoint whose saved config differs from the run config. Compared on parsed values; `resume_from_checkpoint` itself and the GPU list are not compared, sharding (FSDP or not) is, except under `trlx check`, which chooses no strategy.
+- Resume from a different method or changed effective training settings, including CLI overrides. `resume_from_checkpoint`, display/launch controls, and the GPU list are excluded; actual sharding is compared except under `trlx check`, which chooses no strategy.
 
 Warnings:
 - Preference methods: mean per-token log-prob of chosen and rejected (`completion` for `kto`) under the starting model below the threshold in `[preflight]` (off-policy data), over the first `[preflight].rows` train rows.

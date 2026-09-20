@@ -126,7 +126,7 @@ def _total_memory(physical):
     return [torch.cuda.get_device_properties(i).total_memory for i in range(len(physical))]
 
 
-# Starts one worker per selected device. Workers re-run the CLI with --_rank;
+# Starts one worker per selected device over the supervisor's resolved snapshot.
 # stdout and stderr go to log.txt (`log_file`, an open handle). With one
 # device no distributed variables are set, so accelerate runs single-process.
 def spawn(method, config_path, strategy, physical, log_file):
@@ -143,11 +143,9 @@ def spawn(method, config_path, strategy, physical, log_file):
                 MASTER_ADDR=MASTER_ADDR,
                 MASTER_PORT=str(port),
             )
-        # A worker only needs to know whether to shard; ddp is accelerate's
-        # default under WORLD_SIZE > 1 and "single" is not a CLI choice.
-        cmd = [sys.executable, "-m", "trlx.cli", method, config_path, "--_rank", str(rank)]
-        if strategy == "fsdp":
-            cmd += ["--strategy", "fsdp"]
+        # Internal launch facts are separate from user configuration overrides.
+        cmd = [sys.executable, "-m", "trlx.cli", method, "--config", str(config_path),
+               "--_rank", str(rank), "--_strategy", strategy]
         try:
             procs.append(subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT))
         except OSError as e:

@@ -110,24 +110,23 @@ def _check_replay(cfg):
             raise TrlxError(f"[replay].kl_coef > 0 is incompatible with {field} = true")
 
 
-# Resume: the run directory's snapshot must describe the same run. The
-# snapshot is the operator's original file plus what trlx added, so the
-# comparison is on parsed values with trlx's additions and the resume key
-# itself set aside (see compare_snapshot).
+# Resume compares the effective inputs, including temporary CLI overrides;
+# comparing the source file alone would miss a changed model or learning rate.
 def _check_resume(cfg, config_path, strategy):
     if not cfg.args.resume_from_checkpoint:
         return
     snapshot_path = pathlib.Path(cfg.args.output_dir) / show.CONFIG_FILENAME
     try:
-        with open(config_path, "rb") as f:
-            current = tomllib.load(f)
         with open(snapshot_path, "rb") as f:
             snapshot = tomllib.load(f)
     except FileNotFoundError as e:
         raise TrlxError(f"resume_from_checkpoint is set but {e.filename} does not exist")
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise TrlxError(f"{snapshot_path}: cannot read snapshot: {e}")
-    diffs = compare_snapshot(current, snapshot, strategy)
+    saved_method = snapshot.get("launch", {}).get("method")
+    if saved_method is not None and saved_method != cfg.method.name:
+        raise TrlxError(f"resume refused: {snapshot_path} is for {saved_method}, not {cfg.method.name}")
+    diffs = compare_snapshot(cfg.document, snapshot, strategy)
     if diffs:
         raise TrlxError(
             f"resume refused: the run config differs from {snapshot_path}:\n  " + "\n  ".join(diffs)
@@ -137,19 +136,22 @@ def _check_resume(cfg, config_path, strategy):
 # Differences between the current config document and the run snapshot, as
 # human-readable lines; empty means the same run. Set aside before comparing:
 # `resume_from_checkpoint` on both sides (the operator must set it to resume
-# at all), the snapshot's `[launch]` table (trlx's record, compared only on
+# at all), `[run]` display/launch controls, the snapshot's `[launch]` table (compared on
 # sharding: an FSDP checkpoint and an unsharded one differ in format, while
 # single and ddp are both unsharded and a different GPU set resumes fine),
 # and the snapshot's `run_name` when the current file has none (trlx
-# prepended the resolved value). Everything else, including nested tables,
+# recorded the resolved value). Everything else, including nested tables,
 # must match value for value.
 def compare_snapshot(current, snapshot, strategy):
     current = dict(current)
     snapshot = dict(snapshot)
     current.pop("resume_from_checkpoint", None)
     snapshot.pop("resume_from_checkpoint", None)
+    current.pop("run", None)
+    snapshot.pop("run", None)
     launch = snapshot.pop("launch", None) or {}
-    if "run_name" not in current:
+    if current.get("run_name") in (None, "None"):
+        current.pop("run_name", None)
         snapshot.pop("run_name", None)
     diffs = _diff_tables(current, snapshot, "")
     saved_strategy = launch.get("strategy")

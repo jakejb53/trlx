@@ -72,13 +72,15 @@ class Supervisor(unittest.TestCase):
             args=types.SimpleNamespace(run_name="memory"), ranges={"loss": (0, 2)},
             model=types.SimpleNamespace(path="memory-model"), verify_prompts=None,
         )
-        self._patch("trlx.train.config_mod.load", return_value=cfg)
+        self._patch("trlx.train.config_mod.resolve", side_effect=self._resolved)
+        self._patch("trlx.train.config_mod.from_document", return_value=cfg)
         self._patch("trlx.train.preflight.check_config")
         self._patch("trlx.launch.select_gpus", return_value=([0], 1))
         self._patch("trlx.launch.physical_ids", return_value=["synthetic-device"])
         self._patch("trlx.launch.choose_strategy", return_value=("single", "test"))
         self._patch("trlx.train._create_run_dir", return_value=pathlib.Path("memory-run"))
-        self._patch("trlx.train._write_snapshot")
+        self.snapshot_path = pathlib.Path("memory-run/config.toml")
+        self._patch("trlx.train._write_snapshot", return_value=self.snapshot_path)
         self._patch("trlx.train._final_checkpoint", return_value=pathlib.Path("memory-run/checkpoint-1"))
         self.spawn = self._patch("trlx.launch.spawn", return_value=[self.worker])
         self.spawn_verify = self._patch("trlx.launch.spawn_verify", return_value=self.verify)
@@ -92,6 +94,12 @@ class Supervisor(unittest.TestCase):
         self._patch("trlx.show.load_config", return_value=("memory", cfg.ranges))
         self.load = self._patch("trlx.show.load", return_value=types.SimpleNamespace(log_tail=[]))
         self.tui = self.enterContext(patch.object(render_tui, "run", side_effect=lambda load: load(4)))
+
+    # Direct supervisor tests choose display mode by changing args; mirror the CLI's
+    # resolved launch controls so TUI failures still exercise the actual TUI path.
+    def _resolved(self, path, method, overrides):
+        return {"run": {"gpus": "all", "strategy": "auto", "tui": self.args.tui,
+                        "verify": not self.args.no_verify}}
 
     # Restore every patched boundary even when a failure propagates out of run.
     def _patch(self, target, **kwargs):
@@ -107,6 +115,7 @@ class Supervisor(unittest.TestCase):
     # Display failure must retain ownership through verification and reaping.
     def _assert_completed(self, expected=0):
         self.assertEqual(train.run(self.args), expected)
+        self.assertEqual(self.spawn.call_args.args[1], str(self.snapshot_path))
         self.spawn_verify.assert_called_once()
         self.assertEqual((self.worker.kills, self.verify.kills), (0, 0))
         self.assertEqual(self.verify.poll(), expected)

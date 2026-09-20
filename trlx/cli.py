@@ -1,8 +1,4 @@
-"""argparse tree and dispatch for the trlx executable.
-
-The tree here is the complete command surface from SPEC.md 2.1. Later phases
-replace the stub handlers; they do not change the tree.
-"""
+"""Operator CLI: environment defaults, explicit task inputs, and per-run overrides."""
 
 import argparse
 import sys
@@ -10,6 +6,7 @@ import sys
 from dataset.env import load as load_env
 from dataset.io import DatasetError
 from trlx import TrlxError
+from trlx.options import HelpFormatter, add_training_options, overrides
 
 # Stable TRL trainers only. Order is the order shown in --help.
 METHODS = ["sft", "dpo", "grpo", "kto", "rloo", "reward", "distillation"]
@@ -17,25 +14,16 @@ METHODS = ["sft", "dpo", "grpo", "kto", "rloo", "reward", "distillation"]
 STRATEGIES = ["ddp", "fsdp"]
 
 
-# Placeholder handler until the owning phase lands. Exits nonzero so a stubbed
-# command can never be mistaken for a silent success.
-def _not_implemented(args):
-    print(f"trlx {args.command}: not implemented", file=sys.stderr)
-    return 2
-
-
-# Handlers import their modules lazily: trlx.trainers imports trl and torch,
-# and --help must not pay for that.
-
-
+# Init needs only hardware metadata; task inputs belong to the training command.
 def _cmd_init(args):
     from trlx import init_cmd
 
-    init_cmd.write(args.method, args.out)
-    print(f"wrote {args.out}")
+    system = init_cmd.write(args.out, force=args.force)
+    print(f"wrote {args.out} for {len(system.gpus)} visible GPU(s), {system.cpu_count} logical processor(s)")
     return 0
 
 
+# Merge uses the model's own architecture and validates the loaded adapter.
 def _cmd_merge(args):
     from trlx import merge
 
@@ -47,9 +35,11 @@ def _cmd_merge(args):
 def _cmd_train(args):
     from trlx import train
 
+    args.overrides = overrides(args)
     return train.run(args)
 
 
+# Both views read the persisted run artifacts rather than rebuilding a trainer.
 def _cmd_show(args):
     from trlx import show
 
@@ -60,9 +50,11 @@ def _cmd_show(args):
     return 0
 
 
+# Check resolves the same config/CLI inputs as training, but launches no workers.
 def _cmd_check(args):
     from trlx import train
 
+    args.overrides = overrides(args)
     return train.check(args)
 
 
@@ -75,6 +67,7 @@ def _cmd_verify(args):
     return 0 if verify.run(args.checkpoint, args.base, prompts).ok else 1
 
 
+# Generate replay rows locally or through a configured endpoint.
 def _cmd_replay_build(args):
     from trlx import replay_build
 
@@ -82,48 +75,126 @@ def _cmd_replay_build(args):
     return 0
 
 
-# Builds the full parser. Kept separate from main so tests can inspect the tree
-# without invoking anything.
-def build_parser():
+# Method-specific examples explain additional inputs without selecting an objective.
+def _training_examples(method):
+    extra = ""
+    if method == "distillation":
+        extra = " \\\n    --teacher TEACHER"
+    elif method in ("grpo", "rloo"):
+        extra = " \\\n    --reward json_valid --vllm-server-base-url http://localhost:8000"
+    return (
+        f"Examples:\n  trlx {method} --model MODEL --dataset DATA{extra}\n"
+        f"  trlx {method} --model MODEL --dataset DATA{extra} \\\n"
+        "    --learning-rate 1e-5 --output-dir runs/experiment\n\n"
+        "Precedence: CLI > [methods." + method + "] > shared config; CLI values never rewrite run.toml.\n"
+        "Booleans use --flag / --no-flag. Lists and tables use shell-quoted TOML, for example:\n"
+        "  --lora-target-modules '[\"module_a\",\"module_b\"]'\n"
+        "  --ranges '{loss=[0,5],eval_loss=[0,5]}'\n"
+        "Fresh runs refuse nonempty output directories; use --output-dir for another run.\n"
+        "Resume: --resume-from-checkpoint runs/experiment/checkpoint-N with the same effective training settings."
+    )
+
+
+# Launch options have no argparse defaults that could overwrite saved settings.
+def _run_options(parser, training):
+    parser.add_argument("--config", default="run.toml", help="persistent settings file (default: run.toml)")
+    parser.add_argument("--gpus", dest="override:run.gpus", default=argparse.SUPPRESS,
+                        help="visible device indices, e.g. 0,1, or all (config: run.gpus; init: all)")
+    if training:
+        parser.add_argument("--strategy", choices=["auto", *STRATEGIES], dest="override:run.strategy",
+                            default=argparse.SUPPRESS, help="config: run.strategy; init: auto; ddp/fsdp require multiple GPUs")
+        parser.add_argument("--tui", action=argparse.BooleanOptionalAction, dest="override:run.tui",
+                            default=argparse.SUPPRESS, help="full-screen display; --no-tui prints lines (init: false)")
+        parser.add_argument("--verify", action=argparse.BooleanOptionalAction, dest="override:run.verify",
+                            default=argparse.SUPPRESS, help="post-training verification (init: true); --no-verify skips it")
+
+
+# Only the selected method's metadata is loaded; root and utility help stay light.
+def build_parser(method=None):
     parser = argparse.ArgumentParser(
-        prog="trlx", description="Drive TRL trainers from a run config."
+        prog="trlx", formatter_class=HelpFormatter,
+        description="Train with TRL using environment defaults and ordinary CLI options.",
+        epilog="Start here:\n  trlx init\n  trlx sft --model MODEL --dataset DATA\n\n"
+               "Settings: CLI overrides > selected method section > shared run.toml settings.\n"
+               "CLI overrides apply to one run; edit run.toml for persistent changes.\n"
+               "Inspect a command: trlx sft --help, trlx check sft --help, trlx merge --help.\n"
+               "Help never requires a config file, model, dataset, or GPU.",
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>", required=True)
 
-    p = sub.add_parser("init", help="write a run config for a method")
-    p.add_argument("method", choices=METHODS)
-    p.add_argument("--out", required=True, help="path of the config to write")
+    p = sub.add_parser("init", help="inspect the environment and write defaults for all methods",
+                       formatter_class=HelpFormatter,
+                       description="Write shared hardware-informed defaults and all method sections. "
+                                   "No model, dataset, training method, or calibration run is needed.",
+                       epilog="Examples:\n  trlx init\n  trlx init --force\n  trlx init --out experiment.toml\n\n"
+                              "Existing files require --force, which replaces saved settings with fresh defaults. "
+                              "Training still needs a CUDA GPU. "
+                              "Batch/memory defaults are estimates, not a model-fit guarantee.")
+    p.add_argument("--out", default="run.toml", help="config file to create (default: run.toml)")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite the config with fresh environment defaults, discarding saved edits")
     p.set_defaults(func=_cmd_init)
 
     # One subparser per method; all share the run flag set.
-    for method in METHODS:
-        p = sub.add_parser(method, help=f"run {method} training from a config")
-        p.add_argument("config", help="run config TOML")
-        p.add_argument("--tui", action="store_true", help="full-screen display")
-        p.add_argument("--gpus", help="comma-separated device indices, e.g. 0,1")
-        p.add_argument("--strategy", choices=STRATEGIES, help="override the automatic choice")
-        p.add_argument("--no-verify", action="store_true", help="skip post-training verify")
+    purposes = {
+        "sft": "supervised fine-tuning: messages, text, or prompt/completion",
+        "dpo": "preference training: chosen/rejected answers",
+        "kto": "preference training: prompt/completion with a boolean label",
+        "reward": "train a reward model on preference pairs",
+        "grpo": "policy training with reward functions and a generation server",
+        "rloo": "leave-one-out policy training with rewards and a generation server",
+        "distillation": "train from a teacher model on prompts",
+    }
+    for name in METHODS:
+        p = sub.add_parser(name, help=purposes[name], formatter_class=HelpFormatter,
+                           usage=f"trlx {name} [--config FILE] --model MODEL --dataset DATA [options]",
+                           description=f"{purposes[name]}. Uses run.toml unless --config is given. "
+                                       "Model/data may also be saved in the config. All options override one run only.",
+                           epilog=_training_examples(name))
+        _run_options(p, training=True)
         # Internal: set by the supervisor when spawning worker processes (PLAN.md multi-GPU design).
         p.add_argument("--_rank", type=int, help=argparse.SUPPRESS)
+        p.add_argument("--_strategy", choices=["single", *STRATEGIES], help=argparse.SUPPRESS)
+        if method == name:
+            add_training_options(p, name)
         p.set_defaults(func=_cmd_train)
 
-    p = sub.add_parser("show", help="render a run's metrics.jsonl")
-    p.add_argument("run", help="run directory")
-    p.add_argument("--tui", action="store_true", help="full-screen display")
+    p = sub.add_parser("show", help="inspect saved metrics, checkpoints, and reports", formatter_class=HelpFormatter,
+                       description="Read a run directory without loading a model. Values include changes and range markers.",
+                       epilog="Examples:\n  trlx show runs/sft\n  trlx show runs/sft --tui\n\n"
+                              "Line mode prints once. The TUI refreshes until q and includes logs/reports.")
+    p.add_argument("run", help="run directory containing config.toml and metrics.jsonl")
+    p.add_argument("--tui", action="store_true", help="full-screen view (default: print metric lines)")
     p.set_defaults(func=_cmd_show)
 
-    p = sub.add_parser("check", help="preflight only")
-    p.add_argument("method", choices=METHODS)
-    p.add_argument("config", help="run config TOML")
+    p = sub.add_parser("check", help="check a training setup without training", formatter_class=HelpFormatter,
+                       usage="trlx check METHOD [--config FILE] --model MODEL --dataset DATA [options]",
+                       description="Run preflight on the first selected GPU; the model must fit that GPU. "
+                                   "Training performs its own preflight for larger sharded models.",
+                       epilog="Examples:\n  trlx check sft --model MODEL --dataset DATA\n"
+                              "  trlx check dpo --config preferences.toml --model MODEL --dataset DATA\n\n"
+                              "Use trlx check METHOD --help for that method's full override reference.")
+    p.add_argument("method", choices=METHODS, help="training method to validate")
+    _run_options(p, training=False)
+    if method is not None:
+        add_training_options(p, method)
     p.set_defaults(func=_cmd_check)
 
-    p = sub.add_parser("verify", help="artifact checks only")
+    p = sub.add_parser("verify", help="verify a saved checkpoint against its base", formatter_class=HelpFormatter,
+                       description="Check adapter loading, changed outputs/scores, and chat-template equality. "
+                                   "Writes verify.json; returns nonzero when a check fails.",
+                       epilog="Examples:\n  trlx verify CHECKPOINT --base BASE\n"
+                              "  trlx verify CHECKPOINT --base BASE --prompts prompts.jsonl\n\n"
+                              "For checkpoints inside a run, --base must match its saved model path. "
+                              "All visible GPUs may be used.")
     p.add_argument("checkpoint", help="checkpoint directory")
     p.add_argument("--base", required=True, help="base model path")
-    p.add_argument("--prompts", help="dataset of prompts for the generation check")
+    p.add_argument("--prompts", help="prompt/messages dataset for comparison (default: built-in prompts)")
     p.set_defaults(func=_cmd_verify)
 
-    p = sub.add_parser("merge", help="merge an adapter with adapter-load check")
+    p = sub.add_parser("merge", help="merge a LoRA adapter into its base model", formatter_class=HelpFormatter,
+                       description="Validate adapter loading, then save merged model and processor. Output must not exist.",
+                       epilog="Example:\n  trlx merge --base BASE --adapter ADAPTER --out merged-model")
     p.add_argument("--base", required=True, help="base model path")
     p.add_argument("--adapter", required=True, help="adapter directory")
     p.add_argument("--out", required=True, help="output directory")
@@ -132,27 +203,71 @@ def build_parser():
     # --model is always the model identifier: a path or HF id locally, the
     # served name at an endpoint. --endpoint selects the endpoint path and
     # brings the connection flags dataset chat uses (SPEC 2.1, 2.10).
-    p = sub.add_parser("replay-build", help="sample a model on prompts into a messages dataset")
+    p = sub.add_parser("replay-build", help="generate a messages dataset for replay", formatter_class=HelpFormatter,
+                       description="Generate one completion per prompt. Output format follows its extension; "
+                                   "never writes over the input. Local generation uses the model's dtype.",
+                       epilog="Examples:\n"
+                              "  trlx replay-build --model MODEL --prompts prompts.jsonl --out replay.jsonl --max-tokens 256\n"
+                              "  trlx replay-build --model MODEL --endpoint URL --prompts prompts.jsonl --out replay.jsonl \\\n"
+                              "    --max-tokens 256 --timeout 120 --retries 2 --concurrency 4 --api-key API_KEY\n\n"
+                              "The endpoint is an OpenAI-compatible API base (including /v1 when required). "
+                              "Endpoint options are rejected without --endpoint. API_KEY names a variable "
+                              "from the environment or working-directory .env.")
     p.add_argument("--model", required=True, help="model path or HF id; with --endpoint, the served model name")
     p.add_argument("--endpoint", metavar="URL", help="OpenAI-compatible API base; absent means local generation")
     p.add_argument("--prompts", required=True, help="prompts dataset (prompt or messages column)")
     p.add_argument("--out", required=True, help="output dataset path")
-    p.add_argument("--max-tokens", type=int, required=True, help="completion length limit per prompt")
-    p.add_argument("--timeout", type=float, metavar="SECONDS", help="endpoint only; required with --endpoint")
-    p.add_argument("--retries", type=int, help="endpoint only; required with --endpoint")
-    p.add_argument("--concurrency", type=int, help="endpoint only; required with --endpoint")
+    p.add_argument("--max-tokens", type=int, required=True, help="positive completion token limit per prompt")
+    p.add_argument("--timeout", type=float, metavar="SECONDS", help="positive seconds per request; required with --endpoint")
+    p.add_argument("--retries", type=int, help="nonnegative retry count after first attempt; required with --endpoint")
+    p.add_argument("--concurrency", type=int, help="positive parallel request count; required with --endpoint")
     p.add_argument("--api-key", metavar="ENVVAR", help="endpoint only; environment variable holding the key")
     p.set_defaults(func=_cmd_replay_build)
 
     return parser
 
 
-# Entry point of the trlx console script and of `python -m trlx.cli`. Returns
-# the process exit code. TrlxError is the one exception caught here: it carries
-# a message already naming the path or key, so it is printed without a
-# traceback. Anything else is a bug.
+# Discover check's method without mistaking an option value (even "sft") for it.
+# The selector knows arities only; the final method parser owns type validation.
+def _check_method(argv):
+    if not argv or argv in (["--help"], ["-h"]):
+        return None
+    if argv[0] in METHODS:
+        return argv[0]
+    selector = argparse.ArgumentParser(prog="trlx check", add_help=False)
+    _run_options(selector, training=False)
+    selector.add_argument("--help", "-h", action="store_true")
+    seen = set(selector._option_string_actions)
+    for method in METHODS:
+        fields = argparse.ArgumentParser(add_help=False)
+        add_training_options(fields, method)
+        for action in fields._actions:
+            names = [name for name in action.option_strings if name not in seen]
+            if not names:
+                continue
+            seen.update(names)
+            kwargs = {"default": argparse.SUPPRESS}
+            if action.nargs == 0:
+                kwargs["action"] = "store_true"
+            else:
+                kwargs["nargs"] = action.nargs
+            selector.add_argument(*names, **kwargs)
+    selector.add_argument("method", choices=METHODS, nargs="?")
+    return selector.parse_known_args(argv)[0].method
+
+
+# Determine the method before building its dynamic options; help exits at parsing.
+def parse_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    method = argv[0] if argv and argv[0] in METHODS else None
+    if argv and argv[0] == "check":
+        method = _check_method(argv[1:])
+    return build_parser(method).parse_args(argv)
+
+
+# Only execution loads .env or dispatches work; help requires neither.
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     try:
         # Before any handler runs, so an api_key variable named in a run config
         # or on the command line can come from .env. The loader is shared with

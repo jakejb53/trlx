@@ -9,6 +9,7 @@ preflight and data_load concerns.
 Errors are TrlxError with the config path and the key involved.
 """
 
+import copy
 import dataclasses
 import enum
 import pathlib
@@ -80,14 +81,13 @@ class DatasetRef:
     split: str | None
 
 
-# Mirrors the [dataset] block. split=True: `source` is cut at `train_rows`,
-# remainder is eval. split=False: `source` is the train set and `eval_source`
-# the optional eval set.
+# Mirrors the [dataset] block. A split's evaluation share is resolved against
+# the actual row count by data_load, never frozen to a count during init.
 @dataclasses.dataclass(frozen=True)
 class DatasetSpec:
     split: bool
     source: DatasetRef
-    train_rows: int | None
+    eval_fraction: float | None
     eval_source: DatasetRef | None
 
     @property
@@ -136,20 +136,31 @@ class RunConfig:
     rewards: list | None
     replay: ReplaySpec | None
     verify_prompts: DatasetRef | None
+    # Selected method plus explicit CLI overrides, before launch-only fields.
+    # Workers, resume comparison, and the run snapshot share these inputs.
+    document: dict
 
 
 # Loads and validates a run config for `method_name`. `fsdp` is the value for
 # the TRL config's fsdp field when the launcher chose sharding; it goes in
 # through the constructor because transformers configures FSDP in
 # __post_init__, not on attribute assignment.
-def load(path, method_name, fsdp=None):
+def load(path, method_name, fsdp=None, overrides=None, resolved=False):
+    doc = resolve(path, method_name, overrides, resolved)
+    return from_document(doc, method_name, fsdp=fsdp, path=path)
+
+
+# Instantiate once the supervisor has applied the resolved GPU visibility.
+def from_document(doc, method_name, fsdp=None, path="run.toml"):
     method = trainers.get(method_name)
-    doc = _read_toml(path)
+    run_settings(doc, path)
 
     allowed_blocks = trainers.UNIVERSAL_BLOCKS | method.blocks
     all_blocks = trainers.UNIVERSAL_BLOCKS.union(*(m.blocks for m in trainers.METHODS.values()))
     blocks, top = {}, {}
     for key, value in doc.items():
+        if key == "run":
+            continue
         if key in all_blocks:
             if key not in allowed_blocks:
                 owners = sorted(m.name for m in trainers.METHODS.values() if key in m.blocks)
@@ -185,9 +196,117 @@ def load(path, method_name, fsdp=None):
         rewards=_rewards(path, blocks["rewards"]) if "rewards" in blocks else None,
         replay=replay,
         verify_prompts=_verify(path, blocks["verify"]) if "verify" in blocks else None,
+        document=doc,
     )
 
 
+# Launch controls were CLI defaults before [run] became persistently editable.
+# Flat per-run configs may omit the block; when present all four keys are required.
+def run_settings(doc, path="run.toml"):
+    table = doc.get("run", {"gpus": "all", "strategy": "auto", "tui": False, "verify": True})
+    if not isinstance(table, dict):
+        raise TrlxError(f"{path}: [run] must be a table")
+    _check_keys(path, "[run]", table, ("gpus", "strategy", "tui", "verify"))
+    gpus = _require(path, "[run]", table, "gpus", str)
+    strategy = _require(path, "[run]", table, "strategy", str)
+    if not gpus.strip():
+        raise TrlxError(f"{path}: [run].gpus must be all or comma-separated visible device indices")
+    if strategy not in ("auto", "ddp", "fsdp"):
+        raise TrlxError(f"{path}: [run].strategy must be auto, ddp, or fsdp")
+    return {"gpus": gpus, "strategy": strategy,
+            "tui": _require(path, "[run]", table, "tui", bool),
+            "verify": _require(path, "[run]", table, "verify", bool)}
+
+
+# Merge nested method settings without mutating the operator's document.
+def _merge(shared, selected):
+    result = copy.deepcopy(shared)
+    for key, value in selected.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+# Resolve persistent settings, then apply only explicitly supplied CLI values.
+# A worker reads the already resolved snapshot; it never reopens the source config.
+def resolve(path, method_name, overrides=None, resolved=False):
+    doc = copy.deepcopy(_read_toml(path))
+    if resolved:
+        launch = doc.pop("launch", None)
+        if not isinstance(launch, dict) or launch.get("method") != method_name:
+            raise TrlxError(f"{path}: resolved snapshot does not describe method '{method_name}'")
+        if overrides:
+            raise TrlxError(f"{path}: workers cannot override a resolved snapshot")
+        return doc
+    methods = doc.pop("methods", {})
+    if not isinstance(methods, dict):
+        raise TrlxError(f"{path}: [methods] must be a table")
+    unknown = sorted(set(methods) - set(trainers.METHODS))
+    if unknown:
+        raise TrlxError(f"{path}: unknown methods: {', '.join(unknown)}")
+    for name, settings in methods.items():
+        if not isinstance(settings, dict):
+            raise TrlxError(f"{path}: [methods.{name}] must be a table")
+        if "methods" in settings or "launch" in settings:
+            raise TrlxError(f"{path}: [methods.{name}] cannot contain methods or launch")
+    doc = _merge(doc, methods.get(method_name, {}))
+    overrides = dict(overrides or {})
+    source = overrides.pop("dataset.source", None)
+    if source is not None and any(key in overrides for key in ("dataset.dataset", "dataset.dataset_train")):
+        raise TrlxError(f"{path}: --dataset cannot be combined with another explicit training source")
+    if "run" not in doc and any(key.startswith("run.") for key in overrides):
+        doc["run"] = run_settings(doc, path)
+    for dotted, value in overrides.items():
+        parts = dotted.split(".")
+        table = doc
+        for part in parts[:-1]:
+            table = table.setdefault(part, {})
+            if not isinstance(table, dict):
+                raise TrlxError(f"{path}: cannot override '{dotted}': parent is not a table")
+        if value is None and dotted in ("peft", "replay"):
+            table.pop(parts[-1], None)
+        else:
+            table[parts[-1]] = value
+    # Changing split mode explicitly replaces its incompatible source keys.
+    # A CLI source is applied afterwards, in the selected mode's vocabulary.
+    dataset = doc.get("dataset", {})
+    if "dataset.split" in overrides and isinstance(dataset, dict):
+        incompatible = ("dataset_train", "dataset_eval") if dataset["split"] else ("dataset", "eval_fraction")
+        conflicts = [key for key in incompatible if "dataset." + key in overrides]
+        if conflicts:
+            raise TrlxError(f"{path}: explicit dataset split mode conflicts with {', '.join(conflicts)}")
+        if dataset["split"]:
+            previous = dataset.pop("dataset_train", None)
+            dataset.pop("dataset_eval", None)
+            if previous is not None:
+                dataset.setdefault("dataset", previous)
+        else:
+            previous = dataset.pop("dataset", None)
+            dataset.pop("eval_fraction", None)
+            if previous is not None:
+                dataset.setdefault("dataset_train", previous)
+    if source is not None:
+        dataset = doc.setdefault("dataset", {})
+        if not isinstance(dataset, dict):
+            raise TrlxError(f"{path}: [dataset] must be a table")
+        key = "dataset" if dataset.get("split") else "dataset_train"
+        dataset[key] = source
+    if overrides.get("dataset.split") is False and not dataset.get("dataset_eval"):
+        # --no-split without a separate eval source explicitly requests training
+        # only. Remove the generated eval schedule, but reject contradictory CLI input.
+        conflicts = [key for key in overrides if key.startswith("eval_") and
+                     not (key == "eval_strategy" and overrides[key] == "no")]
+        if conflicts:
+            raise TrlxError(f"{path}: evaluation is disabled but CLI sets {', '.join(conflicts)}")
+        for key in list(doc):
+            if key.startswith("eval_"):
+                del doc[key]
+    return doc
+
+
+# Read the operator config or a resolved snapshot; callers own interpretation.
 def _read_toml(path):
     try:
         with open(path, "rb") as f:
@@ -277,7 +396,7 @@ def _build_args(path, method, top, eval_enabled, fsdp, replay):
     # The checkpoint interval follows the eval interval. Applied after
     # __post_init__ because that is where transformers resolves eval_steps
     # (absent eval_steps with eval_strategy = "steps" becomes logging_steps).
-    if not save_steps_given and args.eval_strategy != "no":
+    if not save_steps_given and args.eval_strategy == "steps":
         args.save_steps = args.eval_steps
     return args
 
@@ -361,6 +480,8 @@ def _typed(path, where, table, key, kind):
 def model_spec(path, block, table):
     where = f"[{block}]"
     _check_keys(path, where, table, MODEL_KEYS)
+    if "path" not in table:
+        raise TrlxError(f"{path}: {where}.path is required; supply --{block} or save its path in the config")
     dtype = _require(path, where, table, "dtype", str)
     # The dtype is used as getattr(torch, dtype) at load time; check it now so
     # the error names the config key rather than surfacing from transformers.
@@ -388,40 +509,45 @@ def dataset_ref(path, where, value):
     return DatasetRef(source=m.group(1), is_file=False, split=m.group(2))
 
 
+# Validate the split contract without reading data or guessing its size.
 def _dataset(path, table):
     block = "[dataset]"
-    _check_keys(path, block, table, ("split", "dataset", "train", "dataset_train", "dataset_eval"))
+    if "train" in table:
+        raise TrlxError(f"{path}: [dataset].train is no longer supported; use eval_fraction (for example 0.1)")
+    _check_keys(path, block, table, ("split", "dataset", "eval_fraction", "dataset_train", "dataset_eval"))
     split = _require(path, block, table, "split", bool)
     # The two forms are exclusive; a key from the other form is an error rather
     # than silently ignored.
     if split:
         for wrong in ("dataset_train", "dataset_eval"):
             if wrong in table:
-                raise TrlxError(f"{path}: [dataset] split = true uses 'dataset' and 'train'; '{wrong}' is for split = false")
-        train = _require(path, block, table, "train", int)
-        if train <= 0:
-            raise TrlxError(f"{path}: [dataset].train must be a positive row count, got {train}")
+                raise TrlxError(f"{path}: [dataset] split = true uses 'dataset' and 'eval_fraction'; '{wrong}' is for split = false")
+        fraction = _require(path, block, table, "eval_fraction", (int, float))
+        if not 0 < fraction < 1:
+            raise TrlxError(f"{path}: [dataset].eval_fraction must be between 0 and 1, exclusive, got {fraction}")
         if "dataset" not in table:
-            raise TrlxError(f"{path}: [dataset] requires 'dataset'")
-        return DatasetSpec(True, dataset_ref(path, "[dataset].dataset", table["dataset"]), train, None)
-    for wrong in ("dataset", "train"):
+            raise TrlxError(f"{path}: [dataset] requires 'dataset'; supply --dataset or save the source in the config")
+        return DatasetSpec(True, dataset_ref(path, "[dataset].dataset", table["dataset"]), float(fraction), None)
+    for wrong in ("dataset", "eval_fraction"):
         if wrong in table:
             raise TrlxError(f"{path}: [dataset] split = false uses 'dataset_train' and 'dataset_eval'; '{wrong}' is for split = true")
     if "dataset_train" not in table:
-        raise TrlxError(f"{path}: [dataset] requires 'dataset_train'")
+        raise TrlxError(f"{path}: [dataset] requires 'dataset_train'; supply --dataset or --dataset-train")
     eval_ref = dataset_ref(path, "[dataset].dataset_eval", table["dataset_eval"]) if "dataset_eval" in table else None
     return DatasetSpec(False, dataset_ref(path, "[dataset].dataset_train", table["dataset_train"]), None, eval_ref)
 
 
-# The block is handed to peft as is; peft's own __post_init__ is the validator
-# for field combinations. trlx only sets task_type and translates peft's
-# errors into a message naming the config.
+# PEFT validates field combinations after nullable CLI/config values are decoded.
+# trlx owns task_type and translates failures into a message naming the config.
 def _peft(path, method, table):
     owned = sorted(set(table) & PEFT_OWNED_FIELDS)
     if owned:
         raise TrlxError(f"{path}: [peft] keys {', '.join(owned)} are set by trlx, not the config")
+    hints = typing.get_type_hints(LoraConfig)
+    values = {key: None if value == "None" and admits_none(hints.get(key)) else value
+              for key, value in table.items()}
     try:
-        return LoraConfig(task_type=method.peft_task_type, **table)
+        return LoraConfig(task_type=method.peft_task_type, **values)
     except TypeError as e:
         # dataclass __init__ names the offending keyword in its message.
         raise TrlxError(f"{path}: [peft] {e}")
@@ -444,6 +570,8 @@ def _preflight(path, table):
 # resolved by rewards.py, which can report it against the real registries.
 def _rewards(path, table):
     _check_keys(path, "[rewards]", table, ("funcs",))
+    if "funcs" not in table:
+        raise TrlxError(f"{path}: [rewards].funcs is required; supply --reward or configure the reward objective")
     funcs = _require(path, "[rewards]", table, "funcs", list)
     if not funcs:
         raise TrlxError(f"{path}: [rewards].funcs must list at least one reward")

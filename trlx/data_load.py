@@ -9,6 +9,9 @@ Errors are TrlxError naming the dataset source and, where relevant, the
 columns found.
 """
 
+import math
+from fractions import Fraction
+
 import datasets
 
 from dataset.io import DatasetError, read_rows
@@ -32,15 +35,19 @@ _FORMAT_COLUMNS = {
 def load(spec, dataset_format):
     if spec.split:
         whole = load_ref(spec.source)
-        # The first `train_rows` rows in file order train; the rest evaluate.
-        # A count that leaves no eval rows contradicts split = true.
-        if spec.train_rows >= whole.num_rows:
+        # Round evaluation upward so a positive fraction always reserves data.
+        # Refuse an empty side rather than silently changing the requested split.
+        # Decimal spelling avoids binary noise such as 100 * 0.07 rounding up to 8.
+        eval_rows = math.ceil(whole.num_rows * Fraction(str(spec.eval_fraction)))
+        train_rows = whole.num_rows - eval_rows
+        if train_rows < 1 or eval_rows < 1:
             raise TrlxError(
-                f"{spec.source.source}: [dataset].train = {spec.train_rows} leaves no eval rows "
-                f"(dataset has {whole.num_rows})"
+                f"{spec.source.source}: [dataset].eval_fraction = {spec.eval_fraction} leaves "
+                f"{train_rows} train rows and {eval_rows} eval rows; both must be nonempty "
+                f"(dataset has {whole.num_rows} rows)"
             )
-        train = whole.select(range(spec.train_rows))
-        eval_set = whole.select(range(spec.train_rows, whole.num_rows))
+        train = whole.select(range(train_rows))
+        eval_set = whole.select(range(train_rows, whole.num_rows))
     else:
         train = load_ref(spec.source)
         eval_set = load_ref(spec.eval_source) if spec.eval_source is not None else None

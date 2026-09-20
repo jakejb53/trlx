@@ -21,7 +21,7 @@ dtype = "bfloat16"
 [dataset]
 split = true
 dataset = "distill.jsonl"
-train = 60
+eval_fraction = 0.25
 
 [peft]
 r = 8

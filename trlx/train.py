@@ -22,12 +22,10 @@ Both display modes read the run directory only: metrics.jsonl is the single
 metric source (SPEC 2.3), and log.txt is mirrored to stderr in line mode.
 """
 
-import json
 import logging
 import os
 import pathlib
 import sys
-import tomllib
 
 from trlx import (
     TrlxError,
@@ -40,6 +38,7 @@ from trlx import (
     ranges,
     render_lines,
     show,
+    toml_write,
 )
 
 # Library loggers whose output is log.txt. Python warnings are routed through
@@ -61,20 +60,26 @@ def run(args):
 
 # Supervisor side.
 def _supervise(args):
-    gpus, count = launch.select_gpus(args.gpus)
+    document = config_mod.resolve(args.config, args.command, getattr(args, "overrides", None))
+    controls = config_mod.run_settings(document, args.config)
+    args.tui = controls["tui"]
+    args.no_verify = not controls["verify"]
+    gpu_flag = None if controls["gpus"] == "all" else controls["gpus"]
+    strategy_flag = None if controls["strategy"] == "auto" else controls["strategy"]
+    gpus, count = launch.select_gpus(gpu_flag)
     physical = launch.physical_ids(gpus, count)
     # From here the supervisor sees only the selected devices: config.load
     # initializes CUDA, and the memory query in choose_strategy indexes them.
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
-    cfg = config_mod.load(args.config, args.command)
-    strategy, why = launch.choose_strategy(args.strategy, cfg, physical)
+    cfg = config_mod.from_document(document, args.command, path=args.config)
+    strategy, why = launch.choose_strategy(strategy_flag, cfg, physical)
     # Config-only preflight (SPEC 2.6) before anything is written: a fatal
     # check must not leave a half-made run directory behind.
     preflight.check_config(cfg, args.config, strategy)
     startup = f"strategy: {strategy} ({why}); GPUs {','.join(physical)}"
 
     run_dir = _create_run_dir(cfg.args)
-    _write_snapshot(args.config, run_dir, physical, strategy, cfg.args.run_name)
+    snapshot = _write_snapshot(cfg, run_dir, physical, strategy)
     log_path = run_dir / show.LOG_FILENAME
     with open(log_path, "ab") as log_file:
         log_file.write((startup + "\n").encode("utf-8"))
@@ -92,7 +97,7 @@ def _supervise(args):
             print(startup, file=sys.stderr, flush=True)
         except Exception as error:
             on_display_error(error)
-        workers = launch.spawn(args.command, args.config, strategy, physical, log_file)
+        workers = launch.spawn(args.command, str(snapshot), strategy, physical, log_file)
         start_verify = None
         if not args.no_verify:
             # Called by the Job once the workers are done: the checkpoint to
@@ -245,9 +250,8 @@ def _supervise_tui(run_dir, job, on_display_error):
     return job.wait(lambda: None)
 
 
-# The highest-numbered checkpoint-N in the run directory: the final weights,
-# since the Trainer saves at the last step under a step save strategy and
-# preflight refuses save_strategy = "no".
+# Verify the latest saved checkpoint by step number, after training has exited.
+# Preflight refuses save_strategy = "no" so a run must leave an artifact.
 def _final_checkpoint(run_dir):
     steps = []
     for entry in run_dir.iterdir():
@@ -269,8 +273,9 @@ def _dataset_arg(ref):
 # Worker side. Everything printed here lands in log.txt.
 def _worker(args):
     rank = args._rank
-    fsdp = "full_shard" if args.strategy == "fsdp" else None
-    cfg = config_mod.load(args.config, args.command, fsdp=fsdp)
+    fsdp = "full_shard" if args._strategy == "fsdp" else None
+    cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
+                          overrides=getattr(args, "overrides", None), resolved=True)
     run_dir = pathlib.Path(cfg.args.output_dir)
     _attach_logging()
 
@@ -299,8 +304,8 @@ def _worker(args):
     return 0
 
 
-# `trlx check <method> <config>`: preflight alone (SPEC 2.6). One process on
-# the first visible GPU, loading and building the trainer exactly as a
+# `trlx check <method> [--config <path>]`: preflight alone (SPEC 2.6).
+# One process on the first selected GPU, loading and building the trainer as a
 # single-GPU worker does, so the checks see what training would see; the
 # Trainer places the model. Not device_map="auto": accelerate's dispatch
 # hooks replace `forward` with a partial, which TRL's SFTTrainer cannot
@@ -311,10 +316,13 @@ def _worker(args):
 def check(args):
     import torch
 
-    gpus, count = launch.select_gpus(None)
+    document = config_mod.resolve(args.config, args.method, getattr(args, "overrides", None))
+    controls = config_mod.run_settings(document, args.config)
+    gpu_flag = None if controls["gpus"] == "all" else controls["gpus"]
+    gpus, count = launch.select_gpus(gpu_flag)
     physical = launch.physical_ids(gpus[:1], count)
     os.environ["CUDA_VISIBLE_DEVICES"] = physical[0]
-    cfg = config_mod.load(args.config, args.method)
+    cfg = config_mod.from_document(document, args.method, path=args.config)
     print(f"check: one process on GPU {physical[0]}", file=sys.stderr)
     preflight.check_config(cfg, args.config, None)
     print("preflight: config checks passed", file=sys.stderr)
@@ -430,29 +438,18 @@ def _create_run_dir(args):
     return run_dir
 
 
-# config.toml snapshot: the operator's file byte for byte, then a [launch]
-# table with the facts trlx decided (SPEC 2.3). The copy keeps the operator's
-# comments; nothing of theirs is re-emitted. show.load_config needs run_name
-# at top level, and config.py fills it in when absent, so the resolved value
-# is prepended in that case: prepended, because a top-level key written after
-# the operator's tables would belong to the last table. GPUs are the physical
-# ids as CUDA_VISIBLE_DEVICES spells them, which may be UUIDs, hence strings.
-def _write_snapshot(config_path, run_dir, physical, strategy, run_name):
+# Snapshot the selected method and CLI values once, before spawning workers.
+# The operator's file is untouched; workers consume this exact hand-off instead.
+def _write_snapshot(cfg, run_dir, physical, strategy):
     dest = run_dir / show.CONFIG_FILENAME
+    document = dict(cfg.document)
+    document["run_name"] = cfg.args.run_name
+    document["launch"] = {"method": cfg.method.name, "strategy": strategy, "gpus": list(physical)}
     try:
-        with open(config_path, "rb") as f:
-            original = f.read()
-        # config.load already parsed this file, so a second parse cannot fail
-        # on syntax; it only answers whether the operator set run_name.
-        header = b"" if "run_name" in tomllib.loads(original.decode("utf-8")) else (
-            f"# resolved by trlx\nrun_name = {json.dumps(run_name)}\n\n".encode("utf-8")
-        )
-        gpus = ", ".join(json.dumps(g) for g in physical)
-        launch_table = f"\n[launch]\nstrategy = {json.dumps(strategy)}\ngpus = [{gpus}]\n".encode("utf-8")
-        with open(dest, "wb") as f:
-            f.write(header + original + launch_table)
+        dest.write_text(toml_write.dumps(document), encoding="utf-8")
     except OSError as e:
         raise TrlxError(f"{dest}: cannot write snapshot: {e.strerror or e}")
+    return dest
 
 
 # Worker logging: library loggers to stderr, which the supervisor wired to

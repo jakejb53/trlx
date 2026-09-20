@@ -169,83 +169,220 @@ def _cmd_stats(args):
 # without invoking anything.
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="dataset", description="Prepare datasets. Reads one input, writes one output."
+        prog="dataset",
+        description=(
+            "Prepare training data without Python: convert, inspect, split, edit,\n"
+            "or generate rows. No training config or GPU is needed for preparation.\n\n"
+            "Files: .jsonl (one object per line), .json (array of objects),\n"
+            ".csv (header row; cells read as strings), or .parquet.\n"
+            "cpt/chat read plain text; heal accepts JSON/JSONL only.\n"
+            "Outputs may replace existing files, but never an input file."
+        ),
+        epilog=(
+            "Start here:\n"
+            "  dataset stats data.jsonl\n"
+            "  dataset convert data.json --out data.jsonl\n"
+            "  dataset shuffle data.jsonl --seed 42 --out shuffled.jsonl\n\n"
+            "Run dataset COMMAND --help for inputs, options, and examples.\n"
+            "Help never reads datasets, loads models, or contacts endpoints."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", metavar="<subcommand>", required=True)
+    sub = parser.add_subparsers(dest="command", title="commands", metavar="COMMAND", required=True)
 
-    # Adds the shared input positional and --out. Subcommands with several
-    # inputs or no output file pass their own values.
-    def add(name, help_text, func, inputs=1, out=True):
-        p = sub.add_parser(name, help=help_text)
+    # Keep format and overwrite rules beside each command so subcommand help
+    # is useful on its own. Handler dispatch and argument semantics stay shared.
+    def add(name, help_text, func, description, examples, inputs=1, out=True, input_help=None):
+        p = sub.add_parser(
+            name, help=help_text, description=description,
+            epilog="Examples:\n" + examples,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        input_help = input_help or "dataset file: .jsonl, .json, .csv, or .parquet"
         if inputs == 1:
-            p.add_argument("input", help="input file")
+            p.add_argument("input", help=input_help)
         else:
-            p.add_argument("input", nargs="+", help="input files")
+            p.add_argument("input", nargs="+", help=input_help)
         if out:
-            p.add_argument("--out", required=True, help="output file; format by extension")
+            p.add_argument("--out", required=True, metavar="FILE", help=(
+                "output file: .jsonl, .json, .csv, or .parquet; replaces existing output, never an input"
+                if name != "heal" else
+                "output file with the same extension as input; replaces existing output, never the input"
+            ))
         p.set_defaults(func=func)
         return p
 
-    p = add("convert", "between file formats and TRL dataset formats", _cmd_convert)
-    p.add_argument("--to", choices=convert.TARGETS, help="TRL format to convert rows to")
+    p = add("convert", "change file format or messages/prompt-completion shape", _cmd_convert,
+            "Change file format using the output extension; optionally reshape rows.\n"
+            "messages holds {role, content} objects and must end with an assistant.\n"
+            "prompt and completion must both be strings or both be message lists.\n"
+            "Other columns are preserved. CSV output cannot contain lists or objects.",
+            "  dataset convert data.json --out data.jsonl\n"
+            "  dataset convert chat.jsonl --to prompt-completion --out prompts.jsonl\n"
+            "  dataset convert prompts.jsonl --to messages --out chat.parquet")
+    p.add_argument("--to", choices=convert.TARGETS,
+                   help="target row shape; default: preserve columns; source must be the opposite shape")
 
-    p = add("shuffle", "reorder rows with a seed", _cmd_shuffle)
-    p.add_argument("--seed", type=int, required=True)
+    p = add("shuffle", "reorder all rows reproducibly", _cmd_shuffle,
+            "Reorder all rows using an explicit random seed. Columns are unchanged.",
+            "  dataset shuffle data.jsonl --seed 42 --out shuffled.jsonl")
+    p.add_argument("--seed", type=int, required=True, help="integer random seed; same input and seed reproduce order")
 
-    p = add("split", "first N rows or a fraction to --out, remainder to --rest", _cmd_split)
-    p.add_argument("--n", type=int, help="rows to the first output")
-    p.add_argument("--fraction", type=float, help="fraction of rows to the first output")
-    p.add_argument("--rest", required=True, help="output file for the remainder")
-    p.add_argument("--key", help="column whose equal values must land on one side")
+    p = add("split", "divide rows into two files, optionally keeping groups together", _cmd_split,
+            "Give exactly one of --n or --fraction. Takes rows in input order;\n"
+            "shuffle first for a random split. The remainder goes to --rest.\n"
+            "With --key, whole groups are kept together in first-occurrence order;\n"
+            "the first output may exceed the requested count.",
+            "  dataset split data.jsonl --fraction 0.9 --out train.jsonl --rest eval.jsonl\n"
+            "  dataset split data.jsonl --n 100 --key source --out first.jsonl --rest rest.jsonl")
+    p.add_argument("--n", type=int, metavar="ROWS", help="integer rows to --out, from 0 to input count; excludes --fraction")
+    p.add_argument("--fraction", type=float, metavar="FRACTION",
+                   help="share of input to --out, 0..1; count = round(rows * fraction); excludes --n")
+    p.add_argument("--rest", required=True, metavar="FILE",
+                   help="remainder file; format by extension; must differ from input and --out")
+    p.add_argument("--key", metavar="COLUMN",
+                   help="group by equal scalar column values; default: split individual rows")
 
-    p = add("mix", "concatenate several inputs with per-source fractions", _cmd_mix, inputs="+")
-    p.add_argument("--fractions", required=True, help="comma-separated fraction per input")
-    p.add_argument("--seed", type=int, required=True)
+    p = add("mix", "sample a fraction of each input and concatenate", _cmd_mix,
+            "Fractions select a share of EACH input, not a share of the final mix.\n"
+            "Each count is round(source rows * fraction); fractions need not sum to 1.\n"
+            "Samples preserve source order and are concatenated in input order.\n"
+            "Run shuffle afterward if the final mix should be randomized.",
+            "  dataset mix primary.jsonl replay.jsonl --fractions 1,0.2 --seed 42 --out mixed.jsonl",
+            inputs="+")
+    p.add_argument("--fractions", required=True, metavar="F1,F2,...",
+                   help="comma-separated numbers in 0..1; exactly one per input, in the same order")
+    p.add_argument("--seed", type=int, required=True, help="integer random seed for reproducible source sampling")
 
-    p = add("fields", "add, remove, rename, or swap fields", _cmd_fields)
-    p.add_argument("--add", action="append", default=[], metavar="NAME=EXPR")
-    p.add_argument("--remove", action="append", default=[], metavar="NAME")
-    p.add_argument("--rename", action="append", default=[], metavar="OLD=NEW")
-    p.add_argument("--swap", action="append", default=[], metavar="A=B")
+    expressions = (
+        "Expressions are Python: columns are names; row['column-name'] accesses\n"
+        "any column. Available functions: len, str, int, float. Quote expressions\n"
+        "in the shell to preserve Python strings and operators."
+    )
+    p = add("fields", "add, remove, rename, or swap columns", _cmd_fields,
+            "Operations run in this order: add, remove, rename, swap. Each flag may\n"
+            "be repeated. With no operations, rows are copied unchanged.\n"
+            "Add and rename may replace existing columns; missing sources are errors.\n\n" + expressions,
+            "  dataset fields data.jsonl --add 'label=True' --out labeled.jsonl\n"
+            "  dataset fields data.jsonl --add 'size=len(text)' --remove id --out sized.jsonl\n"
+            "  dataset fields data.jsonl --rename answer=completion --out renamed.jsonl\n"
+            "  dataset fields data.jsonl --swap chosen=rejected --out swapped.jsonl")
+    p.add_argument("--add", action="append", default=[], metavar="NAME=EXPR",
+                   help="set a column from a per-row Python expression; repeatable; default: none")
+    p.add_argument("--remove", action="append", default=[], metavar="NAME",
+                   help="delete an existing column; repeatable; default: none")
+    p.add_argument("--rename", action="append", default=[], metavar="OLD=NEW",
+                   help="rename an existing column; repeatable; default: none")
+    p.add_argument("--swap", action="append", default=[], metavar="A=B",
+                   help="exchange two existing column values; repeatable; default: none")
 
-    p = add("filter", "keep rows by length limit or expression", _cmd_filter)
-    p.add_argument("--where", action="append", default=[], metavar="EXPR", help="Python expression over the row")
+    p = add("filter", "keep rows matching all length limits and expressions", _cmd_filter,
+            "Keep a row only when ALL supplied conditions pass. With no conditions,\n"
+            "all rows are retained. Length limits count characters or list items,\n"
+            "not tokens.\n\n" + expressions,
+            "  dataset filter data.jsonl --max-length text=8000 --out short.jsonl\n"
+            "  dataset filter data.jsonl --where 'label == True' --out positive.jsonl")
+    p.add_argument("--where", action="append", default=[], metavar="EXPR",
+                   help="keep rows where the Python expression is truthy; repeatable; default: none")
     p.add_argument("--max-length", action="append", default=[], metavar="COLUMN=N",
-                   help="characters for strings, items for lists")
+                   help="inclusive integer limit: string characters or list items; repeatable; default: none")
 
-    p = add("sample", "take N rows, random with seed or head", _cmd_sample)
-    p.add_argument("--n", type=int, required=True)
-    p.add_argument("--seed", type=int, help="random sample with this seed")
-    p.add_argument("--head", action="store_true", help="first N rows")
+    p = add("sample", "take a random sample or the first N rows", _cmd_sample,
+            "Give exactly one of --seed or --head. Random sampling is without\n"
+            "replacement and preserves input order among the selected rows.",
+            "  dataset sample data.jsonl --n 100 --seed 42 --out sample.jsonl\n"
+            "  dataset sample data.jsonl --n 10 --head --out preview.jsonl")
+    p.add_argument("--n", type=int, required=True, metavar="ROWS", help="integer rows to take, from 0 to input count")
+    p.add_argument("--seed", type=int, help="integer random seed; required unless --head is used")
+    p.add_argument("--head", action="store_true", help="take first N rows instead of sampling; excludes --seed")
 
-    p = add("cpt", "text file to a text-field dataset in token-limited chunks", _cmd_cpt)
-    p.add_argument("--max-tokens", type=int, required=True, help=f"chunk limit, {cpt.ESTIMATE_LABEL}")
+    p = add("cpt", "chunk plain text into a text-column training dataset", _cmd_cpt,
+            "Prepare continued-pretraining data: each row holds one text chunk.\n"
+            "Keeps paragraphs together when possible; splits oversized text at\n"
+            "sentences, then characters. Token limits are estimates, not tokenizer counts.",
+            "  dataset cpt corpus.txt --max-tokens 2048 --out chunks.jsonl",
+            input_help="UTF-8 plain text file")
+    p.add_argument("--max-tokens", type=int, required=True, metavar="TOKENS",
+                   help=f"positive integer chunk limit ({cpt.ESTIMATE_LABEL}); no tokenizer is loaded")
 
-    p = add("pairs", "two messages datasets (chosen, rejected) to preference pairs; "
-            "one to prompt/completion", _cmd_pairs, inputs="+")
-    p.add_argument("--strict", action="store_true", help="unmatched rows are fatal")
+    p = add("pairs", "make preference pairs or prompt/completion rows", _cmd_pairs,
+            "One input: split messages into prompt and final assistant completion.\n"
+            "Two inputs: chosen first, rejected second; output prompt/chosen/rejected.\n"
+            "Both inputs need messages lists of {role, content}, ending in assistant.\n"
+            "Pairs match all user-turn contents, ignoring system turns; duplicate\n"
+            "keys pair in order. Unmatched rows are reported and omitted by default.",
+            "  dataset pairs answers.jsonl --out prompts.jsonl\n"
+            "  dataset pairs chosen.jsonl rejected.jsonl --strict --out preference.jsonl",
+            inputs="+")
+    p.add_argument("--strict", action="store_true",
+                   help="two-input mode: fail before writing if any row is unmatched; default: omit unmatched rows")
 
-    add("heal", "deterministic JSON and JSONL repairs", _cmd_heal)
+    add("heal", "repair common JSON/JSONL syntax errors", _cmd_heal,
+        "Repair single quotes, Python literals, unquoted keys, trailing commas,\n"
+        "unclosed brackets, and concatenated objects. A truncated final JSONL\n"
+        "record may be dropped. Every repair is reported. Unrepairable text is\n"
+        "preserved in the output and reported with exit status 1. Review the report.",
+        "  dataset heal damaged.jsonl --out repaired.jsonl",
+        input_help=".json or .jsonl file; output must use the same extension")
 
-    p = add("chat", "text file to messages via an endpoint", _cmd_chat)
-    p.add_argument("--questions-endpoint", required=True, metavar="URL")
-    p.add_argument("--questions-model", required=True, metavar="NAME")
-    p.add_argument("--questions-prompt", metavar="FILE", help="replaces the built-in instruction")
-    p.add_argument("--answers-endpoint", metavar="URL", help="defaults to the questions endpoint")
-    p.add_argument("--answers-model", metavar="NAME", help="defaults to the questions model")
-    p.add_argument("--answers-prompt", metavar="FILE", help="replaces the built-in instruction")
-    p.add_argument("--n", type=int, required=True, help="questions per chunk")
-    p.add_argument("--max-tokens", type=int, required=True, help=f"chunk limit, {cpt.ESTIMATE_LABEL}")
-    p.add_argument("--concurrency", type=int, required=True)
-    p.add_argument("--timeout", type=float, required=True, metavar="SECONDS")
-    p.add_argument("--retries", type=int, required=True)
-    p.add_argument("--api-key", metavar="ENVVAR", help="environment variable holding the key")
-    p.add_argument("--strip-reasoning-tags", action="store_true",
-                   help="remove an inline reasoning block instead of failing on it")
+    p = add("chat", "generate question/answer messages from text via an endpoint", _cmd_chat,
+            "Chunk text, generate questions, then answer them using their source chunk.\n"
+            "Outputs messages plus a separate reasoning column. Empty replies are\n"
+            "reported and skipped. Uses an OpenAI-compatible /chat/completions API.\n"
+            "Provide both answers endpoint/model flags, or neither to reuse questions.\n"
+            "--max-tokens limits source chunks; completion length is controlled by\n"
+            "the server. Configure its reasoning parser to keep reasoning separate.\n"
+            "Credentials: --api-key names a variable from the environment or .env\n"
+            "in the working directory; an exported value takes precedence.",
+            "  dataset chat notes.txt --out chat.jsonl \\\n"
+            "    --questions-endpoint http://localhost:8000/v1 --questions-model my-model \\\n"
+            "    --n 3 --max-tokens 2048 --concurrency 4 --timeout 120 --retries 2\n"
+            "  # Add --api-key API_KEY for authentication; pass the variable name, not its value.",
+            input_help="UTF-8 plain text file")
+    questions = p.add_argument_group("question generation")
+    questions.add_argument("--questions-endpoint", required=True, metavar="URL",
+                   help="API base URL (e.g. http://localhost:8000/v1); /chat/completions is appended")
+    questions.add_argument("--questions-model", required=True, metavar="NAME",
+                           help="question model name served by the API")
+    questions.add_argument("--questions-prompt", metavar="FILE",
+                   help="UTF-8 instruction template with {n} and {chunk}; default: built-in question instruction")
+    questions.add_argument("--n", type=int, required=True, metavar="QUESTIONS",
+                           help="integer requested questions per source chunk; fewer may be returned")
+    questions.add_argument("--max-tokens", type=int, required=True, metavar="TOKENS",
+                           help=f"positive integer SOURCE chunk limit ({cpt.ESTIMATE_LABEL}); not a completion limit")
+    answers = p.add_argument_group("answer generation")
+    answers.add_argument("--answers-endpoint", metavar="URL",
+                   help="answer API base URL; requires --answers-model; default: questions endpoint")
+    answers.add_argument("--answers-model", metavar="NAME",
+                   help="answer model name; requires --answers-endpoint; default: questions model")
+    answers.add_argument("--answers-prompt", metavar="FILE",
+                   help="UTF-8 template with {chunk} and {question}; default: built-in answer instruction")
+    requests = p.add_argument_group("requests and credentials (both passes)")
+    requests.add_argument("--concurrency", type=int, required=True, metavar="REQUESTS",
+                   help="maximum simultaneous API requests per pass; integer >= 1")
+    requests.add_argument("--timeout", type=float, required=True, metavar="SECONDS",
+                   help="positive timeout per API request, in seconds")
+    requests.add_argument("--retries", type=int, required=True, metavar="COUNT",
+                   help="integer retries after initial request, >= 0; transient failures use exponential backoff")
+    requests.add_argument("--api-key", metavar="ENVVAR",
+                   help="name of variable holding the key, shared by both endpoints; default: no Authorization header")
+    requests.add_argument("--strip-reasoning-tags", action="store_true",
+                   help="discard a leading inline reasoning block; default: fail; unclosed blocks always fail")
 
-    p = add("stats", "token length distribution per column; --model adds log-prob", _cmd_stats, out=False)
-    p.add_argument("--columns", help="comma-separated columns; default all text columns")
-    p.add_argument("--model", help="model path; exact tokens and per-token log-prob")
+    p = add("stats", "inspect token lengths; optionally score responses with a model", _cmd_stats,
+            "Print count/min/mean/median/p90/max per column; no output file.\n"
+            f"Without --model, lengths are estimates ({cpt.ESTIMATE_LABEL}).\n"
+            "With --model, load weights on CUDA if available, otherwise CPU; report\n"
+            "exact tokenizer counts and mean response log-probabilities in nats.\n"
+            "Scores completion/chosen/rejected conditioned on prompt, and the final\n"
+            "assistant turn in messages. --columns selects length columns only.",
+            "  dataset stats data.jsonl\n"
+            "  dataset stats pairs.jsonl --columns chosen,rejected --model /models/base",
+            out=False)
+    p.add_argument("--columns", metavar="NAME,NAME,...",
+                   help="comma-separated length columns; default: text/message columns found in first row")
+    p.add_argument("--model", metavar="MODEL",
+                   help="local model path or Hub ID for exact counts and response scoring; default: estimates only")
 
     return parser
 
