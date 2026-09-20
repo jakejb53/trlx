@@ -78,6 +78,14 @@ Methods: `sft`, `dpo`, `grpo`, `kto`, `rloo`, `reward`, `distillation`. Stable T
 
 Training options use hyphenated field names; LoRA fields use `--lora-*` (`lora_alpha` becomes `--lora-alpha`). Boolean options have positive and negative forms; lists and tables use shell-quoted TOML. `--no-lora` and `--no-replay` remove those features for one run. Repeated `--reward` entries replace the reward list; distillation exposes `--teacher`. Conflicting explicit options are errors.
 
+Fresh and resumed training print relevant settings for the selected method to stdout after config
+validation, before model inspection, dataset loading, run allocation, or resume rewind. Each override
+uses CLI syntax with aligned description/type comments; inactive settings are omitted, automatic
+values are explained, and secrets are redacted. Forced settings appear as explanatory comments.
+Both display modes require Enter to continue or `q` to cancel successfully. Other input repeats the
+prompt; EOF or review I/O failure stops startup with an error. Progress notices pause during review.
+Workers and `check` do not prompt. Display failures after launch retain supervisor ownership.
+
 Both CLIs provide top-level command descriptions and command-level help with inputs, options, types, defaults, constraints, and examples. Help reads no run config and performs no hardware inspection, model loading, dataset access, or training. Detailed training help derives fields from installed library metadata.
 
 `init` records native BF16 support and GPU memory metadata, selects BF16 only when all visible GPUs support it, otherwise FP32, and emits conservative batching/checkpointing defaults. LoRA is active with rank 8, alpha 16, dropout 0.05, and `all-linear` targets. It writes `eval_fraction = 0.1`; no model/data/reward objective is guessed. CPU-only initialization is allowed; training requires CUDA. Model fit remains a launch-time estimate.

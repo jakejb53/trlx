@@ -10,6 +10,15 @@ import types
 import typing
 
 
+# Parser and startup review share override names, types, and descriptions.
+@dataclasses.dataclass(frozen=True)
+class Setting:
+    flag: str
+    key: str
+    hint: object
+    description: str
+
+
 # Preserve paragraphs/examples while bounding help to a normal terminal width.
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
     # Long option names get their own line instead of squeezing descriptions.
@@ -85,15 +94,18 @@ def _boolean_or_none(raw):
 
 
 # One field maps its CLI spelling directly to an effective-config key.
-def _option(group, flag, key, hint, help_text):
+def _option(group, flag, key, hint, help_text, *, choices=None):
     # --dataset addresses the primary source in either split mode, not a TOML alias.
     setting = "dataset.dataset or dataset.dataset_train, according to split" if key == "dataset.source" else key
     text = f"{help_text} Config: {setting}; omitted CLI options retain the config value."
     kwargs = {"dest": "override:" + key, "default": argparse.SUPPRESS, "help": text.replace("%", "%%")}
+    if choices is not None:
+        kwargs["choices"] = choices
     non_null = [item for item in _alternatives(hint) if item is not type(None)]
     if non_null == [bool] and type(None) in _alternatives(hint):
-        group.add_argument(flag, nargs="?", const=True, type=_boolean_or_none,
-                           metavar="{true,false,None}", **kwargs)
+        action = group.add_argument(flag, nargs="?", const=True, type=_boolean_or_none,
+                                    metavar="{true,false,None}", **kwargs)
+        action.setting = Setting(flag, key, hint, help_text)
         negative = dict(kwargs, help=f"Set {key} to false for this run.")
         group.add_argument("--no-" + flag[2:], action="store_false", **negative)
         return
@@ -103,7 +115,27 @@ def _option(group, flag, key, hint, help_text):
         kwargs["type"] = functools.partial(parse_value, hint=hint)
         kwargs["metavar"] = "VALUE"
         kwargs["help"] += f" Type: {type_label(hint)}."
-    group.add_argument(flag, **kwargs)
+    action = group.add_argument(flag, **kwargs)
+    action.setting = Setting(flag, key, hint, help_text)
+
+
+# These controls are shared by the launch parser and its pre-launch review.
+def add_run_settings(parser, training):
+    _option(parser, "--gpus", "run.gpus", str, "Visible device indices, e.g. 0,1, or all.")
+    if training:
+        _option(parser, "--strategy", "run.strategy", str,
+                "Launch strategy; auto is selected after this review; ddp/fsdp require multiple GPUs.",
+                choices=["auto", "ddp", "fsdp"])
+        _option(parser, "--tui", "run.tui", bool, "Use the full-screen training display.")
+        _option(parser, "--verify", "run.verify", bool, "Verify the final checkpoint after training.")
+
+
+# Build only the selected method's option metadata; no config or model is loaded.
+def settings(method_name):
+    parser = argparse.ArgumentParser(add_help=False)
+    add_run_settings(parser, training=True)
+    add_training_options(parser, method_name)
+    return [action.setting for action in parser._actions if hasattr(action, "setting")]
 
 
 # The original field remains authoritative for defaults not specified in config.
@@ -185,13 +217,14 @@ def add_training_options(parser, method_name):
         _option(extra, "--preflight-rows", "preflight.rows", int, "Train rows to score for off-policy warnings; positive integer.")
         _option(extra, "--offpolicy-logp-per-token", "preflight.offpolicy_logp_per_token", float, "Off-policy warning threshold.")
     if "rewards" in method.blocks:
-        extra.add_argument(
+        action = extra.add_argument(
             "--reward", action="append", metavar="NAME_OR_TABLE",
             help="Required unless configured. Repeat for multiple rewards; replaces the configured list. "
                  "Use a name, model ID, module:function, or a TOML factory table. "
                  "Example: --reward '{name=\"reference_match\",args={column=\"answer\",mode=\"equals\"}}'. "
                  "A running TRL-compatible vLLM weight-transfer server is also required; set --vllm-server-base-url.",
         )
+        action.setting = Setting("--reward", "rewards.funcs", str | dict, action.help)
     if "replay" in method.blocks:
         _option(extra, "--replay-dataset", "replay.dataset", str, "Replay source with the same columns as training data.")
         _option(extra, "--replay-fraction", "replay.fraction", float, "Replay share of mixed training rows, strictly between 0 and 1.")

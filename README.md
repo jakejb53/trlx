@@ -30,6 +30,11 @@ runs one epoch by default, and saves each run in its own directory under `runs/M
 For example: `runs/sft/20260920-1--qwen-qwen3.8-27b--chunks/`. Training prints the actual
 directory at startup; use that path wherever `RUN_DIR` appears below.
 
+Before loading models or datasets, training prints relevant settings as CLI overrides with aligned
+description/type comments. Press Enter to continue or `q` to quit before any run files change.
+This review also applies to `--tui` and resume. EOF or failed review I/O stops startup with an error;
+`--force` does not skip the review. Quit and relaunch with different overrides to change settings.
+
 **CLI options change one run. Editing `run.toml` changes future runs.**
 For example, add `--learning-rate 5e-5` for one run or edit `learning_rate` under
 `[methods.sft]` to keep that value. Use `--output-dir runs/experiment` to change the parent

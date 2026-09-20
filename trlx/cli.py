@@ -7,7 +7,7 @@ from dataset.env import load as load_env
 from dataset.io import DatasetError
 from dataset.progress import Progress, stage
 from trlx import TrlxError
-from trlx.options import HelpFormatter, add_training_options, overrides
+from trlx.options import HelpFormatter, add_run_settings, add_training_options, overrides
 
 # Stable TRL trainers only. Order is the order shown in --help.
 METHODS = ["sft", "dpo", "grpo", "kto", "rloo", "reward", "distillation"]
@@ -90,6 +90,9 @@ def _training_examples(method):
         f"  trlx {method} --model MODEL --dataset DATA{extra} \\\n"
         "    --learning-rate 1e-5 --output-dir runs/experiment\n\n"
         "Precedence: CLI > [methods." + method + "] > shared config; CLI values never rewrite run.toml.\n"
+        "Before loading models or datasets, review the settings printed to stdout.\n"
+        "Press Enter to continue or q to quit, including with --tui and when resuming.\n"
+        "Input is required; EOF cancels startup with an error.\n"
         "Booleans use --flag / --no-flag. Lists and tables use shell-quoted TOML, for example:\n"
         "  --lora-target-modules '[\"module_a\",\"module_b\"]'\n"
         "  --ranges '{loss=[0,5],eval_loss=[0,5]}'\n"
@@ -108,15 +111,7 @@ def _run_options(parser, training):
                             help="write outputs directly; failures can leave incomplete outputs")
     parser.add_argument("--config", default="run.toml",
                         help="fresh-run settings (default: run.toml); resume loads the selected run's saved config")
-    parser.add_argument("--gpus", dest="override:run.gpus", default=argparse.SUPPRESS,
-                        help="visible device indices, e.g. 0,1, or all (config: run.gpus; init: all)")
-    if training:
-        parser.add_argument("--strategy", choices=["auto", *STRATEGIES], dest="override:run.strategy",
-                            default=argparse.SUPPRESS, help="config: run.strategy; init: auto; ddp/fsdp require multiple GPUs")
-        parser.add_argument("--tui", action=argparse.BooleanOptionalAction, dest="override:run.tui",
-                            default=argparse.SUPPRESS, help="full-screen display; --no-tui prints lines (init: false)")
-        parser.add_argument("--verify", action=argparse.BooleanOptionalAction, dest="override:run.verify",
-                            default=argparse.SUPPRESS, help="post-training verification (init: true); --no-verify skips it")
+    add_run_settings(parser, training)
 
 
 # Only the selected method's metadata is loaded; root and utility help stay light.

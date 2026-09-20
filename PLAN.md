@@ -6,8 +6,8 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8 complete. Optional acceleration recommendations remain planned, awaiting approval.
-Phase 8 records current work; the addendum records earlier work and supersedes historical Phases 1-7.
+Current status: Phases 1-8 and startup settings review complete. Optional acceleration recommendations remain planned, awaiting approval.
+Phase 8 and the startup review section record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
 
@@ -315,6 +315,28 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
 PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest tests.test_rewards -v
 PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   tests.test_merge tests.test_cli tests.test_io tests.test_imports -q
+```
+
+### Startup settings review (complete, 2026-09-20)
+
+- Fresh and resumed training show relevant settings for the selected trainer on stdout as CLI
+  overrides with aligned description/type comments. Values include resolved defaults; automatic
+  and forced settings are explained, inactive controls omitted, and credentials redacted.
+- After config validation, Enter continues and `q` cancels before model inspection, dataset loading,
+  run allocation, or resume rewind. Both display modes prompt; workers and `check` do not.
+  EOF or review I/O failure stops startup. Progress pauses while awaiting input; post-launch
+  display failures retain existing supervision behavior.
+- Files: new `trlx/review.py` and `tests/test_review.py`; updated `trlx/options.py`, `trlx/train.py`,
+  `trlx/cli.py`, `tests/test_train.py`, `tests/test_cli.py`, `SPEC.md`, and `README.md`.
+- Verification: 92 focused tests passed, including real CLI/config rendering with mocked GPU and
+  run boundaries. Independent review findings were fixed and re-reviewed with no remaining blockers.
+  Live GPU training was not run. Runtime configs and existing runs were unchanged.
+
+From the repo root, with the project environment's Python executable:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_review tests.test_train tests.test_cli tests.test_resolution tests.test_imports -q
 ```
 
 ### Additional TODO: optional acceleration recommendations (planned)

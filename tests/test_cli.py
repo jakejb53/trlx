@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import ANY, patch
 
 from dataset.progress import Progress
-from trlx import TrlxError, cli, config, hardware, model, options
+from trlx import TrlxError, cli, config, hardware, model, options, train
 
 
 class Interface(unittest.TestCase):
@@ -135,6 +135,32 @@ class Interface(unittest.TestCase):
         self.assertEqual(args._strategy, "fsdp")
         self.assertEqual(options.overrides(args), {})
 
+    # Actual parsing, config defaults, rendering, and input precede every expensive boundary.
+    def test_quit_from_real_review_loads_no_model_or_run(self):
+        document = {
+            "output_dir": "runs/untouched", "bf16": False,
+            "model": {"path": "unloaded-model", "dtype": "float32"},
+            "dataset": {"split": False, "dataset_train": "unread.jsonl"},
+            "ranges": {"loss": [0, 5]},
+        }
+        for mode in ("--tui", "--no-tui"):
+            with self.subTest(mode=mode), patch.object(cli, "load_env"), \
+                 patch.dict(train.os.environ), patch.object(config, "_read_toml", return_value=document), \
+                 patch.object(train.launch, "select_gpus", return_value=([0], 1)), \
+                 patch.object(train.launch, "physical_ids", return_value=["synthetic-device"]), \
+                 patch.object(model, "load_config", side_effect=AssertionError("inspected model")), \
+                 patch.object(model, "load_model", side_effect=AssertionError("loaded model")), \
+                 patch.object(train.data_load, "load", side_effect=AssertionError("loaded dataset")), \
+                 patch.object(train, "_create_run_dir", side_effect=AssertionError("allocated run")), \
+                 patch.object(cli.sys, "stdin", io.StringIO("q\n")), \
+                 contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                 contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(cli.main(["sft", "--use-cpu", mode]), 0)
+            self.assertIn("Settings applied to this run:", stdout.getvalue())
+            self.assertIn("--learning-rate 2e-05", stdout.getvalue())
+            self.assertIn("Press Enter to continue or q to quit:", stdout.getvalue())
+            self.assertIn("cancelled", stderr.getvalue())
+
     # All help paths exit before reading config, probing hardware, or loading models.
     def test_help_is_complete_and_side_effect_free(self):
         paths = [[], ["init"], ["show"], ["check"], ["merge"], ["verify"], ["replay-build"]]
@@ -159,6 +185,9 @@ class Interface(unittest.TestCase):
                     self.assertIn("Library default", help_text)
                     self.assertNotIn("--_rank", help_text)
                     self.assertNotIn("Config: dataset.source", help_text)
+                    if path[0] != "check":
+                        self.assertIn("Press Enter to continue or q to quit", help_text)
+                        self.assertIn("stdout", help_text)
 
 
 class CommandProgress(unittest.TestCase):

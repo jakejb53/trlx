@@ -1,7 +1,7 @@
 """`trlx <method> [options]`: supervisor and worker sides of a training run.
 
-Supervisor (no --_rank): select GPUs -> validate the config -> choose the
-strategy -> allocate a fresh run or rewind the selected checkpoint's run ->
+Supervisor (no --_rank): select GPUs -> validate the config -> review settings
+and await consent -> choose strategy -> allocate or rewind the selected run ->
 write config.toml -> spawn workers (launch.py) -> display and propagate exit.
 The supervisor owns the directory through verification; workers never allocate it.
 It never loads a model. It does hold a CUDA context on the first selected
@@ -41,6 +41,7 @@ from trlx import (
     preflight,
     ranges,
     render_lines,
+    review,
     run_dirs,
     show,
     toml_write,
@@ -80,8 +81,15 @@ def _supervise(args):
     # From here the supervisor sees only the selected devices: config.load
     # initializes CUDA, and the memory query in choose_strategy indexes them.
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
-    with stage(progress, "validating trainer settings and estimating model memory"):
+    with stage(progress, "validating trainer settings"):
         cfg = config_mod.from_document(document, args.command, path=source)
+    # Consent precedes model inspection and all run allocation/resume mutation.
+    # Workers consume the saved snapshot later and never repeat this prompt.
+    if not review.confirm(cfg, progress=progress):
+        if progress is not None:
+            progress.finish("cancelled")
+        return 0
+    with stage(progress, "estimating model memory and selecting strategy"):
         strategy, why = launch.choose_strategy(strategy_flag, cfg, physical)
     # Config-only preflight (SPEC 2.6) before anything is written: a fatal
     # check must not leave a half-made run directory behind.

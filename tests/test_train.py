@@ -77,10 +77,12 @@ class Supervisor(unittest.TestCase):
         )
         self._patch("trlx.train.config_mod.resolve", side_effect=self._resolved)
         self._patch("trlx.train.config_mod.from_document", return_value=cfg)
+        self.original_confirm = train.review.confirm
+        self.confirm = self._patch("trlx.train.review.confirm", return_value=True)
         self.check_config = self._patch("trlx.train.preflight.check_config")
         self._patch("trlx.launch.select_gpus", return_value=([0], 1))
         self._patch("trlx.launch.physical_ids", return_value=["synthetic-device"])
-        self._patch("trlx.launch.choose_strategy", return_value=("single", "test"))
+        self.strategy = self._patch("trlx.launch.choose_strategy", return_value=("single", "test"))
         self.create_run = self._patch("trlx.train._create_run_dir", return_value=pathlib.Path("memory-run"))
         self._patch("trlx.train.run_dirs.locked", return_value=contextlib.nullcontext())
         self.snapshot_path = pathlib.Path("memory-run/config.toml")
@@ -123,6 +125,49 @@ class Supervisor(unittest.TestCase):
         self.spawn_verify.assert_called_once()
         self.assertEqual((self.worker.kills, self.verify.kills), (0, 0))
         self.assertEqual(self.verify.poll(), expected)
+
+    # Exercise real consent while other supervisor tests isolate already-started jobs.
+    def _review_input(self, response):
+        self.confirm.side_effect = self.original_confirm
+        self._patch("trlx.review.render", return_value="Settings applied to this run:\n")
+        self.enterContext(patch.object(sys, "stdin", io.StringIO(response)))
+
+    # Both UI modes and resumes must quit before model inspection or any persistent mutation.
+    def test_review_quit_precedes_model_inspection_and_run_writes(self):
+        self._review_input("q\n" * 4)
+        rewind = self._patch("trlx.run_dirs.rewind")
+        for tui in (False, True):
+            for resume in (None, "memory-run/checkpoint-1"):
+                with self.subTest(tui=tui, resume=resume):
+                    self.args.tui = tui
+                    self.cfg.args.resume_from_checkpoint = resume
+                    self.assertEqual(train.run(self.args), 0)
+        for operation in (self.strategy, self.check_config, self.create_run, self.snapshot, self.spawn, rewind):
+            operation.assert_not_called()
+        self.tui.assert_not_called()
+        self.assertEqual(self.stdout.getvalue().count("Press Enter to continue or q to quit:"), 4)
+
+    # Confirmation happens once and precedes strategy choice even when the TUI is requested.
+    def test_review_enter_precedes_strategy_and_tui(self):
+        self.args.tui = True
+        self._review_input("\n")
+        events = Mock()
+        for name, operation in (("review", self.confirm), ("strategy", self.strategy),
+                                ("allocate", self.create_run), ("spawn", self.spawn), ("tui", self.tui)):
+            events.attach_mock(operation, name)
+        self._assert_completed()
+        self.assertEqual([call[0] for call in events.mock_calls], ["review", "strategy", "allocate", "spawn", "tui"])
+
+    # Consent is never inferred from EOF or loss of the startup stdout stream.
+    def test_review_io_failure_starts_no_job(self):
+        self._review_input("")
+        with self.assertRaisesRegex(TrlxError, "EOF"):
+            train.run(self.args)
+        with patch.object(sys, "stdout", BrokenStream()), self.assertRaisesRegex(TrlxError, "settings review"):
+            train.run(self.args)
+        self.strategy.assert_not_called()
+        self.create_run.assert_not_called()
+        self.spawn.assert_not_called()
 
     # Runtime publication controls cross process boundaries without entering snapshots.
     def test_output_controls_reach_workers_and_verify(self):
