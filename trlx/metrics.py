@@ -54,7 +54,7 @@ def activity_callback_class():
         # is our first evidence of evaluation. Never infer a batch total from the train set.
         def on_prediction_step(self, args, state, control, **kwargs):
             if self.evaluation is None:
-                self.evaluation = stage(self.activity, "evaluating", unit="batches")
+                self.evaluation = stage(self.activity, "evaluating", unit="batches", visible=True)
                 self.evaluation.__enter__()
             self.evaluation.advance()
 
@@ -65,7 +65,14 @@ def activity_callback_class():
 
         # on_save runs after the trainer saved; it is not evidence that saving has begun.
         def on_save(self, args, state, control, **kwargs):
-            self.activity.note(f"checkpoint saved at step {state.global_step} in {args.output_dir}")
+            if not state.is_world_process_zero:
+                return
+            # The callback proves saving finished; verify the actual directory rather
+            # than labelling the run parent as the saved checkpoint.
+            checkpoint = pathlib.Path(args.output_dir) / f"checkpoint-{state.global_step}"
+            if not checkpoint.is_dir():
+                raise TrlxError(f"checkpoint save completed but {checkpoint} is missing")
+            self.activity.note(f"checkpoint saved: {checkpoint}")
 
         # Close an outstanding evaluation stage on normal completion or trainer failure.
         def close(self, exc_info=(None, None, None)):

@@ -10,10 +10,10 @@ import pathlib
 from types import SimpleNamespace
 import unittest
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 from trlx import TrlxError, run_dirs, toml_write
-from trlx.preflight import _check_resume, _check_vllm, compare_snapshot
+from trlx.preflight import Report, _check_example, _check_resume, _check_vllm, compare_snapshot
 
 # Effective inputs after method selection and CLI overrides, and their snapshot:
 # run_name resolved, [launch] appended.
@@ -151,6 +151,49 @@ class VllmDiagnostics(unittest.TestCase):
         self.assertIn("example.test/v1/get_world_size", str(caught.exception))
         for secret in ("user", "secret", "private", "token="):
             self.assertNotIn(secret, str(caught.exception))
+
+
+class ExampleOutput(unittest.TestCase):
+    # Exercise the real report formatting while controlling tokenization and masks.
+    def example(self, labels, text, trained_text):
+        dataset = MagicMock(column_names=["input_ids", "labels"], num_rows=1)
+        dataset.__getitem__.return_value = {"input_ids": [1, 2], "labels": labels}
+        tokenizer = Mock()
+        tokenizer.decode.side_effect = [text, trained_text]
+        report = Report()
+        _check_example(SimpleNamespace(method=SimpleNamespace(name="sft")),
+                       SimpleNamespace(train_dataset=dataset), tokenizer, report)
+        output = io.StringIO()
+        report.flush(output)
+        return report.to_dict(), output.getvalue()
+
+    # Fully trained examples display once without changing the machine-readable facts.
+    def test_all_tokens_trained_prints_text_once(self):
+        text = "Café\n\n雪"
+        facts, output = self.example([1, 2], text, text)
+        self.assertIn("first row text:\n  Café\n  \n  雪", output)
+        self.assertEqual(output.count("Café"), 1)
+        self.assertIn("all tokens trained", output)
+        self.assertNotIn("first row trained text:", output)
+        self.assertEqual(facts["example"], {
+            "tokens": 2, "trained_tokens": 2, "text": text, "trained_text": text,
+        })
+
+    # Equal decoded text does not imply all tokens participate in the loss.
+    def test_partial_mask_retains_both_text_blocks(self):
+        facts, output = self.example([-100, 2], "é", "é")
+        self.assertIn("first row text:\n  é", output)
+        self.assertIn("first row trained text:\n  é", output)
+        self.assertNotIn("all tokens trained", output)
+        self.assertEqual(facts["example"]["trained_tokens"], 1)
+
+    # Removing duplicate text must not hide the existing empty-label warning.
+    def test_no_trained_tokens_keeps_warning(self):
+        facts, output = self.example([-100, -100], "prompt", "")
+        self.assertIn("first row trained text:\n  \n", output)
+        self.assertIn("first row has no trained tokens in its label mask", output)
+        self.assertNotIn("all tokens trained", output)
+        self.assertEqual(facts["example"]["trained_text"], "")
 
 
 if __name__ == "__main__":

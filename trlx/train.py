@@ -9,8 +9,8 @@ device, because transformers validates bf16 against a real device when the
 config is instantiated.
 
 Worker (--_rank r): load the config, the model, the datasets, and train.
-Rank 0 owns metrics.jsonl and the preflight report. stdout and stderr are
-log.txt, wired by the supervisor.
+Rank 0 owns metrics.jsonl and the preflight report. The supervisor drains
+raw output and typed feedback separately, recording both in log.txt.
 
 Preflight runs in stages where its inputs exist: the config-only checks in
 the supervisor before the run directory is made, the trainer checks on rank
@@ -19,15 +19,15 @@ the supervisor before the run directory is made, the trainer checks on rank
 on all selected GPUs (launch.Job), so the trained checkpoint is loaded from
 disk the way an operator would load it.
 
-Both display modes read the run directory only: metrics.jsonl is the single
-metric source (SPEC 2.3), and log.txt is mirrored to stderr in line mode.
+metrics.jsonl is the single metric source (SPEC 2.3). Live line mode presents
+useful feedback; complete diagnostics remain in log.txt for the TUI and inspection.
 """
 
 import contextlib
-import functools
 import logging
 import os
 import pathlib
+import shutil
 import sys
 
 from dataset.progress import Progress, stage
@@ -35,6 +35,7 @@ from trlx import (
     TrlxError,
     config as config_mod,
     data_load,
+    feedback,
     launch,
     metrics,
     model as model_mod,
@@ -46,10 +47,6 @@ from trlx import (
     show,
     toml_write,
 )
-
-# Library loggers whose output is log.txt. Python warnings are routed through
-# logging so they land in the file too.
-_LOGGERS = ("transformers", "trl", "py.warnings")
 
 # Lines of log.txt shown after a worker failure in TUI mode, where the log was
 # not mirrored while the display was up.
@@ -108,41 +105,33 @@ def _supervise(args):
                             "check available space and permissions") from e
 
 
-# Log failures remain supervision failures, independently of terminal rendering.
-def _write_progress_log(log_file, log_path, line):
-    try:
-        log_file.write((line + "\n").encode("utf-8"))
-        log_file.flush()
-    except OSError as error:
-        raise TrlxError(f"{log_path}: cannot write progress log: {error}; check available space and permissions") from error
-
-
 # Startup feedback reaches the terminal until the supervisor starts its display.
 # The inner reporter stops before log_file closes; child processes own their reporters.
 @contextlib.contextmanager
-def _job_feedback(args, log_file, log_path):
+def _job_feedback(args, collector):
     parent = getattr(args, "progress", None)
     if parent is None:
         yield None
         return
 
-    # Before live mirroring starts, metadata operations must be visible too.
-    def emit(line):
-        _write_progress_log(log_file, log_path, line)
-        if parent.error is None:
-            try:
-                parent.emit(line)
-            except Exception as error:
-                parent.error = error
-
-    with parent.suspended(), Progress(f"trlx {args.command} supervisor", emit=emit) as progress:
-        yield progress
+    startup = parent.events if isinstance(parent.events, feedback.Startup) else None
+    if startup is not None:
+        startup.attach(collector)
+    try:
+        with parent.suspended(), Progress(f"trlx {args.command} supervisor",
+                events=lambda event: collector.accept("supervisor", event)) as progress:
+            yield progress
+    finally:
+        if startup is not None:
+            startup.detach()
 
 
 # The directory is owned and config preflight has passed before history is changed.
 def _run_job(args, cfg, run_dir, physical, strategy, startup):
     log_path = run_dir / show.LOG_FILENAME
-    with open(log_path, "ab") as log_file, _job_feedback(args, log_file, log_path) as progress:
+    with open(log_path, "ab") as log_file, \
+            feedback.Collector(log_file, log_path, display=not args.tui) as collector, \
+            _job_feedback(args, collector) as progress:
         retained = 0
         startup = f"run directory: {run_dir}\n{startup}"
         if cfg.args.resume_from_checkpoint:
@@ -158,13 +147,6 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
             log_file.flush()
         except OSError as e:
             raise TrlxError(f"{log_path}: cannot write startup log: {e}; check available space and permissions") from e
-        # Capture the boundary before workers start, including fast first writes.
-        # Startup is printed below; only subsequent log bytes need mirroring.
-        log_offset = log_file.tell()
-        if progress is not None:
-            # From now on the log reader/TUI owns presentation; writing stderr here
-            # would duplicate line output or corrupt the curses screen.
-            progress.set_sink(functools.partial(_write_progress_log, log_file, log_path))
         display_failed = False
 
         # The log remains authoritative after presentation stops. A failure to
@@ -172,7 +154,9 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
         def on_display_error(error):
             nonlocal display_failed
             display_failed = True
-            _report_display_error(error, log_file, log_path)
+            collector.disable_display()
+            with collector.lock:
+                _report_display_error(error, log_file, log_path)
 
         parent_progress = getattr(args, "progress", None)
         if parent_progress is not None and parent_progress.error is not None:
@@ -183,7 +167,7 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
         except Exception as error:
             on_display_error(error)
         with stage(progress, "starting training workers", total=len(physical), unit="workers") as activity:
-            workers = launch.spawn(args.command, str(snapshot), strategy, physical, log_file,
+            workers = launch.spawn(args.command, str(snapshot), strategy, physical, collector,
                                    force=getattr(args, "force", False), no_staging=getattr(args, "no_staging", False))
             activity.update(len(workers))
         start_verify = None
@@ -191,14 +175,14 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
             # Called by the Job once the workers are done: the checkpoint to
             # verify exists only then.
             def start_verify():
-                with stage(progress, "starting post-training verification"):
+                with stage(progress, "starting post-training verification", visible=True):
                     checkpoint = _final_checkpoint(run_dir)
                     prompts = _dataset_arg(cfg.verify_prompts)
-                    return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, log_file,
+                    return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, collector,
                                                force=getattr(args, "force", False),
                                                no_staging=getattr(args, "no_staging", False))
 
-        job = launch.Job(workers, start_verify, progress=progress)
+        job = launch.Job(workers, start_verify, progress=progress, feedback=collector)
         try:
             with stage(progress, "supervising training workers and verification"):
                 if display_failed:
@@ -207,7 +191,7 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
                     failure = _supervise_tui(run_dir, job, on_display_error)
                 else:
                     failure = _supervise_lines(run_dir, cfg.ranges, log_path, job, on_display_error,
-                                               printed=retained, log_offset=log_offset)
+                                               printed=retained)
             if failure is not None:
                 label, code = failure
                 # Final diagnostics are display work too: a broken stream or
@@ -262,18 +246,26 @@ def _report_display_error(error, log_file, log_path):
 
 
 # Line mode: render failures disable only this callback. Job.wait and its
-# process polling stay outside the presentation exception boundary. Resume offsets
-# suppress old output, while evaluating all retained metrics preserves change columns.
-def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, printed=0, log_offset=0):
-    try:
-        print(render_lines.header(range_table), flush=True)
-        log_reader = open(log_path, "rb")
-        log_reader.seek(log_offset)
-    except Exception as error:
-        on_display_error(error)
-        return job.wait(lambda: None)
+# process polling stay outside the presentation exception boundary. The collector
+# supplies only current output; retained metrics still supply resume change columns.
+def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, printed=0):
     metrics_path = run_dir / metrics.FILENAME
     active = True
+
+    # Metric output remains stdout; diagnostic interruptions restore the next header.
+    def metric_line(text):
+        print(text, flush=True)
+
+    stream = render_lines.Stream(range_table, metric_line, width=shutil.get_terminal_size().columns)
+
+    # One renderer owns both streams, so messages cannot bisect a metric row.
+    def message(text):
+        stream.interrupt()
+        if sys.stderr is None:
+            raise BrokenPipeError("training stderr is unavailable")
+        print(text, file=sys.stderr, flush=True)
+
+    view = feedback.View(message)
 
     # Once a read or render fails, do not retry it on subsequent job polls.
     def tick():
@@ -281,28 +273,30 @@ def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, prin
         if not active:
             return
         try:
-            chunk = log_reader.read()
-            if chunk:
-                if job.progress is not None:
-                    job.progress.output_seen()
-                sys.stderr.buffer.write(chunk)
-                sys.stderr.buffer.flush()
+            for event in job.feedback.take():
+                view.consume(event)
             if metrics_path.exists():
-                rows = ranges.evaluate(metrics.read(metrics_path), range_table)
-                for row in rows[printed:]:
-                    print(render_lines.line(row), flush=True)
+                records = metrics.read(metrics_path)
+                rows = ranges.evaluate(records, range_table)
+                stream.width = shutil.get_terminal_size().columns
+                for record, row in zip(records[printed:], rows[printed:]):
+                    stream.record(record, row)
+                    view.last_feedback = view.clock()
                 printed = len(rows)
+            view.waiting()
         except Exception as error:
             active = False
+            job.feedback.disable_display()
             on_display_error(error)
 
-    try:
-        return job.wait(tick)
-    finally:
+    failure = job.wait(tick)
+    if active:
         try:
-            log_reader.close()
+            view.warning_summary()
+            message(f"run artifacts: {run_dir}; diagnostics: {log_path}")
         except Exception as error:
             on_display_error(error)
+    return failure
 
 
 # TUI mode: the same display as `trlx show --tui`, polling the run directory.
@@ -375,6 +369,32 @@ def _dataset_arg(ref):
 
 # Worker side. Everything printed here lands in log.txt.
 def _worker(args):
+    import torch.distributed as distributed
+
+    failure = None
+    try:
+        return _train_worker(args)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        # Every worker owns its process group, including failures during trainer
+        # construction. No extra barrier: another rank may already have failed.
+        if distributed.is_available() and distributed.is_initialized():
+            try:
+                distributed.destroy_process_group()
+            except Exception as error:
+                if failure is None:
+                    raise TrlxError(f"cannot shut down distributed training: {error}") from error
+                try:
+                    logging.getLogger("trl").error("distributed cleanup also failed: %s", error)
+                except Exception as reporting_error:
+                    # Even a broken diagnostic pipe cannot replace the training error.
+                    failure.add_note(f"distributed cleanup failed: {error}; reporting failed: {reporting_error}")
+
+
+# Load and train inside the process-group lifetime owned by _worker.
+def _train_worker(args):
     import torch
 
     rank = args._rank
@@ -384,12 +404,16 @@ def _worker(args):
         cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
                               overrides=getattr(args, "overrides", None), resolved=True)
     run_dir = pathlib.Path(cfg.args.output_dir)
-    _attach_logging()
+    _attach_logging(progress)
+    feedback.configure_worker_progress(rank)
 
     model = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
     processor = model_mod.load_processor(cfg.model, progress=progress)
     train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
     train_set = _mix_replay(cfg, train_set, progress=progress)
+    if rank == 0:
+        print(f"dataset: {train_set.num_rows} training rows; "
+              f"{eval_set.num_rows if eval_set is not None else 0} evaluation rows", flush=True)
 
     # Preflight (SPEC 2.6): rank 0 holds the report; every rank carries the
     # callback because the forward-pass check is a collective under FSDP.
@@ -409,13 +433,13 @@ def _worker(args):
             report.flush()
         report.write(run_dir, no_staging=getattr(args, "no_staging", False), progress=progress)
     try:
-        with stage(progress, "trainer running", unit="steps") as activity:
-            feedback = metrics.activity_callback_class()(activity)
-            trainer.add_callback(feedback)
+        with stage(progress, "trainer running", unit="steps", visible=True) as activity:
+            activity_callback = metrics.activity_callback_class()(activity)
+            trainer.add_callback(activity_callback)
             try:
                 trainer.train(resume_from_checkpoint=cfg.args.resume_from_checkpoint)
             finally:
-                feedback.close(sys.exc_info())
+                activity_callback.close(sys.exc_info())
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError("CUDA memory exhausted during training; reduce batch size or sequence length, "
                         "or use more GPU memory") from e
@@ -509,7 +533,7 @@ def build_trainer(cfg, model, processor, train_set, eval_set, callbacks, *, prog
     from peft.utils.error import NoMatchingPeftModuleError
 
     try:
-        with stage(progress, "constructing trainer and preparing datasets"):
+        with stage(progress, "constructing trainer and preparing datasets", visible=True):
             trainer = trainer_cls(
                 model=model,
                 args=cfg.args,
@@ -582,12 +606,6 @@ def _write_snapshot(cfg, run_dir, physical, strategy, *, no_staging=False):
     return dest
 
 
-# Worker logging: library loggers to stderr, which the supervisor wired to
-# log.txt. Handlers are added, never replaced, so the operator's log_level on
-# the TRL config still governs verbosity.
-def _attach_logging():
-    logging.captureWarnings(True)
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    for name in _LOGGERS:
-        logging.getLogger(name).addHandler(handler)
+# Replace console delivery once; library levels and file handlers remain intact.
+def _attach_logging(progress=None):
+    feedback.configure_logging(progress.events if progress is not None else None)

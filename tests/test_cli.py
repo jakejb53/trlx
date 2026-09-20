@@ -212,7 +212,12 @@ class CommandProgress(unittest.TestCase):
                 def work(*args, **kwargs):
                     output = stderr.getvalue()
                     self.assertIn(f"{label}: starting", output)
-                    self.assertIn(f"{label}: running {argv[0]}", output)
+                    if argv[0] in cli.METHODS:
+                        self.assertNotIn(f"{label}: running {argv[0]}", output)
+                        self.assertNotIn("loading command options", output)
+                        self.assertNotIn("loading credentials", output)
+                    else:
+                        self.assertIn(f"{label}: running {argv[0]}", output)
                     self.assertNotIn(f"{label}: completed;", output)
                     progress = kwargs.get("progress", getattr(args[0], "progress", None))
                     self.assertIsInstance(progress, Progress)
@@ -252,7 +257,7 @@ class CommandProgress(unittest.TestCase):
         def parse(argv):
             self.assertEqual(argv, ["sft"])
             self.assertIn("trlx sft: starting", output.getvalue())
-            self.assertIn("loading command options", output.getvalue())
+            self.assertNotIn("loading command options", output.getvalue())
             return types.SimpleNamespace(command="sft", _rank=None, func=lambda args: 0)
 
         with patch.object(cli, "parse_args", side_effect=parse) as parse_args, \

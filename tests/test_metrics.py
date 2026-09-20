@@ -10,7 +10,7 @@ import pathlib
 import tempfile
 import types
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from dataset.progress import Progress, stage
 from trlx import TrlxError, metrics, ranges, render_lines
@@ -119,7 +119,7 @@ class Activity(unittest.TestCase):
         lines = []
         progress = Progress("trlx sft rank 0", emit=lines.append, clock=clock)
         args = types.SimpleNamespace(output_dir="memory-run")
-        state = types.SimpleNamespace(global_step=5, max_steps=10)
+        state = types.SimpleNamespace(global_step=5, max_steps=10, is_world_process_zero=True)
         control = types.SimpleNamespace(should_evaluate=True, should_save=True)
         original_control = vars(control).copy()
         with stage(progress, "training", unit="steps") as activity:
@@ -149,8 +149,16 @@ class Activity(unittest.TestCase):
             progress.waiting()
             self.assertIn("waiting: training; 6/10 steps", lines[-1])
             self.assertIn("last measured progress 22.0s ago", lines[-1])
+            with patch("pathlib.Path.is_dir", return_value=True):
+                callback.on_save(args, state, control)
+            self.assertIn("checkpoint saved: memory-run/checkpoint-6", lines[-1])
+            state.is_world_process_zero = False
+            before = list(lines)
             callback.on_save(args, state, control)
-            self.assertIn("checkpoint saved at step 6 in memory-run", lines[-1])
+            self.assertEqual(lines, before)
+            state.is_world_process_zero = True
+            with patch("pathlib.Path.is_dir", return_value=False), self.assertRaisesRegex(TrlxError, "checkpoint-6.*missing"):
+                callback.on_save(args, state, control)
         self.assertEqual(vars(control), original_control)
 
     # Trainer failure must not leave a stale evaluation stage active during outer cleanup.
@@ -224,6 +232,91 @@ class Lines(unittest.TestCase):
         self.assertIn("-0.500", lines[3])
         # A metric absent from a record renders blank, never "None".
         self.assertNotIn("None", text)
+
+
+class StreamingLines(unittest.TestCase):
+    # Evaluate full history outside the renderer, as the supervisor does on resume.
+    def display(self, records, table, width=120, skip=0):
+        output = []
+        stream = render_lines.Stream(table, output.append, width=width)
+        rows = ranges.evaluate(records, table)
+        for record, row in zip(records[skip:], rows[skip:]):
+            stream.record(record, row)
+        return stream, output
+
+    # Train and evaluation logs use their own present columns, keeping exact keys.
+    def test_present_columns_and_phase_headings(self):
+        table = {"loss": (0, 2), "eval_loss": (0, 2), "grad_norm": (0, 1)}
+        _, output = self.display([rec(1, {"loss": 1.0}),
+                                  rec(2, {"eval_loss": 3.0}, eval=True)], table)
+        self.assertTrue(output[0].startswith("Training —"))
+        self.assertEqual(output[1].split(), ["step", "epoch", "%", "loss", "chg"])
+        self.assertIn("1/100", output[2])
+        self.assertTrue(output[3].startswith("Evaluation —"))
+        self.assertEqual(output[4].split(), ["step", "epoch", "%", "eval_loss", "chg"])
+        self.assertIn("3.000!", output[5])
+        self.assertNotIn("grad_norm", "\n".join(output))
+
+    # Headings return after unrelated feedback and after twenty uninterrupted rows.
+    def test_repeats_headings_after_twenty_rows_and_interrupt(self):
+        table = {"loss": (0, 2)}
+        records = [rec(step, {"loss": 1.0}) for step in range(1, 22)]
+        stream, output = self.display(records, table)
+        headings = [i for i, line in enumerate(output) if line.startswith("Training —")]
+        self.assertEqual(headings, [0, 22])
+        stream.interrupt()
+        record = rec(22, {"loss": 1.0})
+        stream.record(record, ranges.evaluate([*records, record], table)[-1])
+        self.assertTrue(output[-3].startswith("Training —"))
+        self.assertIn("step", output[-2])
+        self.assertIn("22/100", output[-1])
+
+    # A new configured metric cannot silently shift values under an old heading.
+    def test_columns_change_repeats_headings(self):
+        table = {"loss": (0, 2), "grad_norm": (0, 1)}
+        _, output = self.display([rec(1, {"loss": 1.0}),
+                                  rec(2, {"loss": 0.5, "grad_norm": 0.1})], table)
+        self.assertNotIn("grad_norm", output[1])
+        self.assertIn("grad_norm", output[4])
+        self.assertIn("-0.500", output[5])
+
+    # Wrapped groups repeat progress and headings; they never clip a metric name/value.
+    def test_narrow_terminal_groups_keep_names_and_values(self):
+        table = {"loss": (0, 2), "mean_token_accuracy": (0, 1), "grad_norm": (0, 1)}
+        _, output = self.display([rec(1, {"loss": 1.0, "mean_token_accuracy": 0.8,
+                                            "grad_norm": 0.125})], table, width=58)
+        groups = [line for line in output if line.startswith("Training metrics (")]
+        self.assertEqual(len(groups), 3)
+        text = "\n".join(output)
+        self.assertIn("mean_token_accuracy", text)
+        self.assertIn("0.800", text)
+        self.assertIn("0.125", text)
+        self.assertEqual(sum("1/100" in line for line in output), 3)
+        for line in output[1:]:
+            self.assertLessEqual(len(line), 58)
+
+    # Summary fields are useful even when none are configured as table metrics.
+    def test_final_summary_keeps_all_recorded_fields(self):
+        record = rec(100, {"train_runtime": 123.4567, "train_loss": 1.25,
+                           "train_samples_per_second": 2.6, "epoch": 2.0})
+        _, output = self.display([record], {"loss": (0, 2)})
+        self.assertEqual(output, ["Training summary:", "  train_runtime: 123.4567",
+                                  "  train_loss: 1.25", "  train_samples_per_second: 2.6",
+                                  "  epoch: 2.0"])
+
+    # Unconfigured ordinary logs must not produce progress-only metric rows.
+    def test_no_metrics_produces_no_blank_row(self):
+        _, output = self.display([rec(1, {"learning_rate": 0.0001})], {"loss": (0, 2)})
+        self.assertEqual(output, [])
+
+    # Hidden historical records still supply deltas for the first visible resumed row.
+    def test_resume_retains_history_without_replaying_old_rows(self):
+        _, output = self.display([rec(1, {"loss": 1.0}), rec(2, {"loss": 0.5})],
+                                 {"loss": (0, 2)}, skip=1)
+        self.assertEqual(len(output), 3)
+        self.assertNotIn("1/100", "\n".join(output))
+        self.assertIn("2/100", output[-1])
+        self.assertIn("-0.500", output[-1])
 
 
 if __name__ == "__main__":

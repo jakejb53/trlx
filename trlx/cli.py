@@ -123,7 +123,8 @@ def build_parser(method=None):
                "Settings: CLI overrides > selected method section > shared run.toml settings.\n"
                "CLI overrides apply to one run; edit run.toml for persistent changes.\n"
                "Progress goes to stderr; training also records it in log.txt.\n"
-               "Waiting notices follow 10 seconds without feedback.\n"
+               "Training coordinates waiting notices after 30 seconds without substantive feedback;\n"
+               "other commands report after 10 seconds. Training diagnostics remain in log.txt.\n"
                "Inspect a command: trlx sft --help, trlx check sft --help, trlx merge --help.\n"
                "Help never requires a config file, model, dataset, or GPU.",
     )
@@ -309,9 +310,14 @@ def main(argv=None):
             worker_rank = token.partition("=")[2]
     if worker_rank is not None and worker_rank.isdecimal():
         label += f" rank {worker_rank}"
+    from trlx import feedback
+
+    connection = feedback.connect()
+    events = connection if connection is not None else (
+        feedback.Startup() if command in METHODS and worker_rank is None else None)
     try:
         on_error = _defer_training_display_error if command in METHODS and worker_rank is None else None
-        with Progress(label, on_error=on_error) as progress:
+        with Progress(label, on_error=on_error, events=events) as progress:
             with stage(progress, "loading command options"):
                 args = parse_args(argv)
             rank = getattr(args, "_rank", None)
@@ -320,6 +326,8 @@ def main(argv=None):
                 # Worker stderr is the authoritative log, so its write failures are fatal.
                 progress.on_error = None
             args.progress = progress
+            if connection is not None:
+                feedback.configure_logging(connection)
             # Secrets are loaded before dispatch, without including their values in feedback.
             with stage(progress, "loading credentials"):
                 try:
@@ -335,6 +343,9 @@ def main(argv=None):
         if sys.stderr is not None:
             print(f"trlx {command}: {e}", file=sys.stderr)
         return 1
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 # launch.py starts workers as `python -m trlx.cli`, so they run under the same

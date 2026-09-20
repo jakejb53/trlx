@@ -101,7 +101,7 @@ def load_model(spec, kind, device_map=None, *, progress=None):
         # A reward model outputs one scalar; TRL's RewardTrainer requires it.
         kwargs["num_labels"] = 1
     try:
-        with stage(progress, f"loading model weights {spec.path}"):
+        with stage(progress, f"loading model weights {spec.path}", visible=True):
             return cls.from_pretrained(spec.path, **kwargs)
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError(f"[model].path '{spec.path}': CUDA memory exhausted while loading weights; "
@@ -114,7 +114,7 @@ def load_model(spec, kind, device_map=None, *, progress=None):
 # for text-only checkpoints, so one call covers both.
 def load_processor(spec, *, progress=None):
     try:
-        with stage(progress, f"loading processor {spec.path}"):
+        with stage(progress, f"loading processor {spec.path}", visible=True):
             return AutoProcessor.from_pretrained(spec.path, **_pretrained_kwargs(spec))
     except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load tokenizer or processor: {e}")

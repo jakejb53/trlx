@@ -48,7 +48,7 @@ def load(spec, dataset_format, *, progress=None):
                 f"{train_rows} train rows and {eval_rows} eval rows; both must be nonempty "
                 f"(dataset has {whole.num_rows} rows)"
             )
-        with stage(progress, "splitting training and evaluation rows") as activity:
+        with stage(progress, "splitting training and evaluation rows", visible=True) as activity:
             train = whole.select(range(train_rows))
             eval_set = whole.select(range(train_rows, whole.num_rows))
             activity.note(f"{train_rows} training rows; {eval_rows} evaluation rows")
@@ -98,7 +98,7 @@ def mix_replay(train, spec, flag, *, progress=None):
             train = train.add_column(REPLAY_COLUMN, [False] * train.num_rows)
             replay = replay.add_column(REPLAY_COLUMN, [True] * count)
     try:
-        with stage(progress, "mixing replay rows") as activity:
+        with stage(progress, "mixing replay rows", visible=True) as activity:
             mixed = datasets.concatenate_datasets([train, replay])
             activity.note(f"{train.num_rows} training rows + {count} replay rows = {mixed.num_rows} rows")
             return mixed
@@ -125,7 +125,7 @@ def load_ref(ref, *, progress=None):
         except (ArrowInvalid, ArrowTypeError) as e:
             raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {e}; "
                             "use consistent value types within each column") from e
-    with stage(progress, f"loading dataset {ref.source}") as activity:
+    with stage(progress, f"loading dataset {ref.source}", visible=True) as activity:
         loaded = _load_hub(ref)
         activity.note(f"loaded {loaded.num_rows} rows")
         return loaded

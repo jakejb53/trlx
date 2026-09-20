@@ -1,5 +1,7 @@
 """Verification report replacement without loading a GPU model."""
 
+import contextlib
+import io
 import json
 import pathlib
 import tempfile
@@ -25,6 +27,39 @@ class VerifyOutput(unittest.TestCase):
         self.raw_outputs = verify._outputs
         self.outputs = self.enterContext(patch("trlx.verify._outputs", side_effect=[["base"], ["trained"]]))
         self.enterContext(patch("trlx.verify._chat_template_equal", return_value=True))
+
+    # Multiline content and reasoning stay visible; JSON retains the exact originals.
+    def test_comparisons_are_readable_and_label_each_sample(self):
+        prompt = [{"role": "user", "content": "Bonjour\n雪"}]
+        base = "<think>réflexion\n\n</think>\nréponse"
+        trained = "<think>réflexion\n\n</think>\n新しい"
+        self.outputs.side_effect = [[base, "same"], [trained, "same"]]
+        output = io.StringIO()
+        with patch("trlx.verify.generate.prompts_from", return_value=[prompt, "second"]):
+            with contextlib.redirect_stdout(output):
+                result = verify.run(self.checkpoint, "base", None)
+        text = output.getvalue()
+        self.assertIn("sample 1/2: differs", text)
+        self.assertIn("sample 2/2: identical", text)
+        self.assertIn("prompt:\n    user: Bonjour\n    雪", text)
+        self.assertIn("base:\n    <think>réflexion\n    \n    </think>\n    réponse", text)
+        self.assertIn("checkpoint:\n    <think>réflexion\n    \n    </think>\n    新しい", text)
+        self.assertEqual(text.count("    same"), 2)
+        self.assertNotIn("\\u", text)
+        self.assertEqual(result.behaviour["samples"][0], {
+            "prompt": prompt, "base": base, "checkpoint": trained, "differs": True,
+        })
+        self.assertEqual(json.loads(self.report.read_text())["behaviour"], result.behaviour)
+
+    # Reward scores remain labelled comparisons rather than being treated as generated text.
+    def test_reward_scores_are_printed_without_json_quotes(self):
+        self.outputs.side_effect = [["score 0.25"], ["score 0.5"]]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = verify.run(self.checkpoint, "base", None)
+        self.assertIn("base:\n    score 0.25", output.getvalue())
+        self.assertIn("checkpoint:\n    score 0.5", output.getvalue())
+        self.assertTrue(result.behaviour["samples"][0]["differs"])
 
     # Collision refusal preserves the report and avoids unnecessary model loads.
     def test_existing_report_refuses_before_loading(self):

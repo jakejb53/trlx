@@ -163,7 +163,7 @@ class Resolution(unittest.TestCase):
              patch.object(train, "_attach_logging"), \
              patch.object(train.model_mod, "load_model"), \
              patch.object(train.model_mod, "load_processor"), \
-             patch.object(train.data_load, "load", return_value=(Mock(), Mock())), \
+             patch.object(train.data_load, "load", return_value=(Mock(num_rows=3), Mock(num_rows=1))), \
              patch.object(train.preflight, "Report"), \
              patch.object(train.preflight, "callback_class"), \
              patch.object(train.preflight, "check_trainer"), \
@@ -279,10 +279,11 @@ class Resolution(unittest.TestCase):
 
     # Every launched worker receives the immutable resolved path and internal strategy.
     def test_spawn_worker_arguments(self):
-        with patch.object(launch.subprocess, "Popen") as popen:
-            launch.spawn("sft", "memory-run/config.toml", "single", ["device"], Mock())
-        argv = popen.call_args.args[0]
+        collector = Mock()
+        launch.spawn("sft", "memory-run/config.toml", "single", ["device"], collector)
+        argv = collector.spawn.call_args.args[0]
         self.assertEqual(argv[4:], ["--config", "memory-run/config.toml", "--_rank", "0", "--_strategy", "single"])
+        self.assertEqual(collector.spawn.call_args.args[2], "rank 0")
 
 
 if __name__ == "__main__":

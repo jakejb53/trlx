@@ -54,8 +54,16 @@ last measured progress; waiting notices do not establish that work is advancing.
 Opaque operations have no inferred percentage. Counter output is coalesced to
 one second; these intervals are display constants. Help does not start reporting.
 
-Training records operational feedback in `log.txt`; line mode mirrors it and the
-TUI shows its existing log pane. Worker feedback identifies the rank. Metrics
+Training records complete diagnostics in `log.txt`. The supervisor collects typed
+feedback and raw child output separately and owns terminal presentation. Line mode
+shows useful operations, measured progress, findings, and unknown output; internal
+bookkeeping stays in the log. Identical warnings and rank progress are consolidated,
+with warning counts and affected ranks retained. Library preparation bars come from
+rank zero; other ranks still report their phases and diagnostics. Only the known PyTorch
+`all_gather_into_tensor` FutureWarning is log-only. Training has one waiting notice
+after 30 seconds without substantive feedback, including optimizer steps between
+metric records. Notices identify active operations and available progress by rank.
+The TUI retains its log pane. Collection continues after display failure. Metrics
 remain authoritative in `metrics.jsonl`. Publication success follows publication
 and cleanup. Endpoint batches report completions as observed while preserving
 input order in their returned results.
@@ -127,7 +135,7 @@ by `-`; leading/trailing punctuation is removed. Exact inputs remain in the snap
 <run>/
   config.toml      resolved method + CLI settings, including chosen strategy and GPUs
   metrics.jsonl    one record per log step, written by the trlx callback; the only metric source
-  log.txt          TRL and transformers output, always written; also passed to stderr without --tui
+  log.txt          complete operational and library diagnostics, with child source attribution
   preflight.json
   verify.json
   checkpoint-N/    TRL checkpoint
@@ -150,7 +158,17 @@ at the continuation; `show` and the TUI retain access to historical metrics. Che
 
 Values to three decimals. Each `[ranges]` metric has a change column: difference from the previous logged value of that metric. Out-of-range values per `[ranges]` are marked.
 
-Default: one line per log step: step/total, epoch/total, percent complete, the `[ranges]` metrics with change columns. Eval rows marked. No progress bar. Safe to pipe.
+Default: training and evaluation tables show step/total, epoch/total, percent complete,
+and present `[ranges]` metrics with change columns. Headings precede the first row,
+repeat after interruptions or 20 rows, and change with the columns. Narrow terminals
+use labelled column groups without dropping values. Final trainer statistics appear
+as named summary values. Output is plain text and safe to pipe.
+
+Preflight examples and every verification prompt/base/checkpoint comparison remain
+inline with readable Unicode and line breaks. A fully trained example prints once
+with an explicit mask statement. Checkpoint completion identifies the verified
+checkpoint directory; only the saving rank announces it. One final command outcome
+includes elapsed time, with artifact locations displayed alongside the results.
 
 `--tui`: fixed layout, no scrolling, no toggles. Status bar: percent complete, steps done/total, epochs done/total, phase. Metrics table: most recent rows that fit. Checkpoints: step, eval loss, best marked. Log tail. Preflight and verify results. Stays until quit.
 
@@ -158,7 +176,7 @@ Default: one line per log step: step/total, epoch/total, percent complete, the `
 
 - All visible GPUs by default. `--gpus` takes device indices.
 - trlx starts its own worker processes. No `accelerate launch`, no accelerate config file.
-- A supervisor process starts one worker per selected GPU. The supervisor owns the run directory, `config.toml`, `log.txt`, and the display, and never loads a model. Rank 0 owns the callback, `metrics.jsonl`, and preflight. Other ranks train silently. A worker exiting nonzero stops the others and the supervisor exits with that code. Verify runs as a further process after every worker has exited, with all selected GPUs visible, and its exit code is the job's.
+- A supervisor process starts one worker per selected GPU. The supervisor owns the run directory, `config.toml`, `log.txt`, and the display, and never loads a model. Rank 0 owns the metric callback, `metrics.jsonl`, and preflight. All ranks report attributed diagnostics and progress. Workers destroy initialized process groups on exit; cleanup failures must not replace an existing training failure. A worker exiting nonzero stops the others and the supervisor exits with that code. Verify runs as a further process after every worker has exited, with all selected GPUs visible, and its exit code is the job's.
 - Strategy: trlx chooses data-parallel when the model at its dtype fits one selected GPU with headroom, sharded otherwise. A sharded run whose per-rank estimate, the training state divided by the rank count plus any unsharded original copy (2.9), still exceeds the smallest selected GPU is refused, forced or not. `--strategy` overrides. Choice printed at startup and recorded in the snapshot.
 
 ### 2.6 Preflight

@@ -241,7 +241,7 @@ class Supervisor(unittest.TestCase):
         self.tui.assert_called_once()
         self.assertEqual(len(children), 1)
         log = self.log.getvalue().decode()
-        self.assertIn("trlx sft supervisor: waiting", log)
+        self.assertIn("[supervisor] waiting", log)
         self.assertIn("starting post-training verification", log)
         self.assertNotIn("display stopped", log)
         self.assertFalse(children[0]._thread.is_alive())
@@ -260,16 +260,15 @@ class Supervisor(unittest.TestCase):
             return original_write(data)
 
         # Keep a running worker alive until the independent reporter hits the bad log.
-        def header(*args, **kwargs):
+        def record(*args, **kwargs):
             self.assertTrue(failed_write.wait(3), "background reporter never attempted a log write")
-            return "metrics header"
 
         self.enterContext(patch.object(self.log, "write", side_effect=write))
-        self._patch("trlx.render_lines.header", side_effect=header)
+        self._patch("trlx.render_lines.Stream.record", side_effect=record)
         with patch("dataset.progress.WAIT_SECONDS", 0.01):
             with Progress("trlx sft", on_error=cli._defer_training_display_error) as progress:
                 self.args.progress = progress
-                with self.assertRaisesRegex(TrlxError, "log.txt.*cannot write progress log.*disk full"):
+                with self.assertRaisesRegex(TrlxError, "log.txt.*cannot record feedback.*disk full"):
                     train.run(self.args)
         self.assertTrue(failed_write.is_set())
         self.assertEqual(self.worker.kills, 1)
@@ -287,7 +286,7 @@ class Supervisor(unittest.TestCase):
     # A renderer bug has the same job-lifetime boundary as an I/O failure.
     def test_line_render_error_preserves_verify_failure(self):
         self.verify.code = 7
-        line = self._patch("trlx.render_lines.line", side_effect=ValueError("invalid metric"))
+        line = self._patch("trlx.render_lines.Stream.record", side_effect=ValueError("invalid metric"))
         self._assert_completed(7)
         line.assert_called_once()
         self.assertIn(b"ValueError: invalid metric", self.log.getvalue())
@@ -361,7 +360,7 @@ class Supervisor(unittest.TestCase):
         if tui:
             self.tui.side_effect = KeyboardInterrupt
         else:
-            self._patch("trlx.render_lines.header", side_effect=KeyboardInterrupt)
+            self._patch("trlx.render_lines.Stream.record", side_effect=KeyboardInterrupt)
         with self.assertRaises(KeyboardInterrupt):
             train.run(self.args)
         self.assertEqual(self.worker.kills, 1)
@@ -378,8 +377,20 @@ class Supervisor(unittest.TestCase):
 
     # A missing authoritative log is a supervisor failure, not degraded display.
     def test_display_error_log_failure_remains_fatal(self):
-        self._patch("trlx.render_lines.header", side_effect=BrokenPipeError("closed"))
-        self.enterContext(patch.object(self.log, "flush", side_effect=[None, OSError("disk full")]))
+        failed_display = threading.Event()
+
+        # Fail persistence only after the presentation error, not during startup logging.
+        def render(*args):
+            failed_display.set()
+            raise BrokenPipeError("closed")
+
+        # Feedback flushes now occur throughout startup, so count-based failures are brittle.
+        def flush():
+            if failed_display.is_set():
+                raise OSError("disk full")
+
+        self._patch("trlx.render_lines.Stream.record", side_effect=render)
+        self.enterContext(patch.object(self.log, "flush", side_effect=flush))
         with self.assertRaisesRegex(TrlxError, "cannot record display failure"):
             train.run(self.args)
         self.assertEqual(self.worker.kills, 1)
@@ -462,16 +473,87 @@ class Supervisor(unittest.TestCase):
         retained = dict(self.records.return_value[0], step=20)
         continued = dict(retained, step=21, log={"loss": 0.75})
         self.records.return_value = [retained, continued]
-        line = self._patch("trlx.render_lines.line", wraps=train.render_lines.line)
+        line = self._patch("trlx.render_lines.Stream.record", autospec=True,
+                           side_effect=train.render_lines.Stream.record)
+
+        # New child diagnostics arrive through the collector, never by replaying log bytes.
+        def spawn(*args, **kwargs):
+            args[4].accept("rank 0", {"kind": "raw", "message": "worker log"})
+            return [self.worker]
+
+        self.spawn.side_effect = spawn
         self._assert_completed()
         line.assert_called_once()
-        row = line.call_args.args[0]
+        row = line.call_args.args[2]
         self.assertEqual(row.step, 21)
         self.assertEqual(row.cells["loss"].change, -0.25)
         shown_log = self.stderr.buffer.getvalue()
         self.assertNotIn(b"old history", shown_log)
         self.assertIn(b"worker log", shown_log)
-        self.assertTrue(self.log.getvalue().startswith(b"old history\nresume marker\n"))
+        self.assertTrue(self.log.getvalue().startswith(b"old history\n"))
+        self.assertIn(b"resume marker\n", self.log.getvalue())
+
+
+class WorkerCleanup(unittest.TestCase):
+    # Mock the distributed boundary: these lifecycle checks require neither CUDA nor a group.
+    def setUp(self):
+        self.args = types.SimpleNamespace(_rank=0)
+        self.work = self.enterContext(patch("trlx.train._train_worker", return_value=0))
+        self.available = self.enterContext(patch("torch.distributed.is_available", return_value=True))
+        self.initialized = self.enterContext(patch("torch.distributed.is_initialized", return_value=True))
+        self.destroy = self.enterContext(patch("torch.distributed.destroy_process_group"))
+        self.logger = Mock()
+        self.enterContext(patch("trlx.train.logging.getLogger", return_value=self.logger))
+
+    # Successful training releases its initialized process group before returning.
+    def test_success_destroys_group(self):
+        self.assertEqual(train._worker(self.args), 0)
+        self.work.assert_called_once_with(self.args)
+        self.destroy.assert_called_once_with()
+
+    # A worker that never joined a group must not attempt distributed teardown.
+    def test_uninitialized_group_needs_no_cleanup(self):
+        self.initialized.return_value = False
+        self.assertEqual(train._worker(self.args), 0)
+        self.destroy.assert_not_called()
+
+    # Distributed support can be absent even though ordinary training is available.
+    def test_unavailable_distributed_needs_no_cleanup(self):
+        self.available.return_value = False
+        self.assertEqual(train._worker(self.args), 0)
+        self.initialized.assert_not_called()
+        self.destroy.assert_not_called()
+
+    # Teardown also owns construction failures and user cancellation, without an extra barrier.
+    def test_training_failure_and_interrupt_still_destroy_group(self):
+        for error in (ValueError("training failed"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                self.destroy.reset_mock()
+                self.work.side_effect = error
+                with self.assertRaises(type(error)) as caught:
+                    train._worker(self.args)
+                self.assertIs(caught.exception, error)
+                self.destroy.assert_called_once_with()
+
+    # Cleanup failure must remain actionable when it is the only failure.
+    def test_cleanup_failure_after_success_is_error(self):
+        self.destroy.side_effect = RuntimeError("NCCL cleanup failed")
+        with self.assertRaisesRegex(TrlxError, "cannot shut down distributed training: NCCL cleanup failed"):
+            train._worker(self.args)
+
+    # Secondary teardown and logging errors cannot replace the original training failure.
+    def test_original_failure_survives_cleanup_and_reporting_failures(self):
+        original = ValueError("original training failure")
+        self.work.side_effect = original
+        self.destroy.side_effect = RuntimeError("NCCL cleanup failed")
+        for reporting_error in (None, OSError("log unavailable")):
+            with self.subTest(reporting_error=reporting_error):
+                self.logger.error.reset_mock()
+                self.logger.error.side_effect = reporting_error
+                with self.assertRaises(ValueError) as caught:
+                    train._worker(self.args)
+                self.assertIs(caught.exception, original)
+                self.logger.error.assert_called_once()
 
 
 class Shutdown(unittest.TestCase):

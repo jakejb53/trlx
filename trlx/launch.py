@@ -9,7 +9,6 @@ once every worker has exited, with every selected device visible (SPEC 2.7).
 
 import os
 import socket
-import subprocess
 import sys
 import time
 
@@ -127,9 +126,9 @@ def _total_memory(physical):
 
 
 # Starts one worker per selected device over the supervisor's resolved snapshot.
-# stdout and stderr go to log.txt (`log_file`, an open handle). With one
+# The collector drains feedback and raw output into log.txt. With one
 # device no distributed variables are set, so accelerate runs single-process.
-def spawn(method, config_path, strategy, physical, log_file, *, force=False, no_staging=False):
+def spawn(method, config_path, strategy, physical, collector, *, force=False, no_staging=False):
     world = len(physical)
     port = _free_port() if world > 1 else None
     procs = []
@@ -151,7 +150,7 @@ def spawn(method, config_path, strategy, physical, log_file, *, force=False, no_
         if no_staging:
             cmd.append("--no-staging")
         try:
-            procs.append(subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT))
+            procs.append(collector.spawn(cmd, env, f"rank {rank}"))
         except OSError as e:
             terminate(procs)
             raise TrlxError(f"cannot start worker rank {rank}: {e.strerror or e}")
@@ -179,7 +178,7 @@ def running(procs):
 # command on the run's final checkpoint, with every selected device visible
 # so a model larger than one GPU can spread across them. Output joins
 # log.txt like the workers'.
-def spawn_verify(checkpoint, base, prompts, physical, log_file, *, force=False, no_staging=False):
+def spawn_verify(checkpoint, base, prompts, physical, collector, *, force=False, no_staging=False):
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(physical))
     cmd = [sys.executable, "-m", "trlx.cli", "verify", str(checkpoint), "--base", base]
     if prompts is not None:
@@ -189,7 +188,7 @@ def spawn_verify(checkpoint, base, prompts, physical, log_file, *, force=False, 
     if no_staging:
         cmd.append("--no-staging")
     try:
-        return subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        return collector.spawn(cmd, env, "verify")
     except OSError as e:
         raise TrlxError(f"cannot start verify: {e.strerror or e}")
 
@@ -200,14 +199,17 @@ def spawn_verify(checkpoint, base, prompts, physical, log_file, *, force=False, 
 # only after training. A failure is (label, code) for the message and exit.
 class Job:
     # Own worker/verify lifetimes; a progress-log failure remains a supervisor failure.
-    def __init__(self, workers, start_verify, *, progress=None):
+    def __init__(self, workers, start_verify, *, progress=None, feedback=None):
         self.workers = workers
         self.start_verify = start_verify
         self.verify = None
         self.progress = progress
+        self.feedback = feedback
 
     # Non-blocking. Starts verify when its turn comes.
     def poll(self):
+        if self.feedback is not None:
+            self.feedback.check()
         if self.progress is not None:
             self.progress.check_error()
         failure = check(self.workers)
@@ -238,10 +240,16 @@ class Job:
             tick()
             failure = self.poll()
             if failure is not None:
+                if self.feedback is not None:
+                    self.feedback.finish()
+                tick()
                 return failure
             time.sleep(_POLL_SECONDS)
+        failure = self.poll()
+        if self.feedback is not None:
+            self.feedback.finish()
         tick()
-        return self.poll()
+        return failure
 
     # Kills whatever is still running, verify included.
     def terminate(self):

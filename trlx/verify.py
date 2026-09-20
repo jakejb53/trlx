@@ -92,9 +92,9 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progres
             failures.append("adapter check failed")
         # Same weights, adapters off: the base's behaviour without a second
         # copy of the model in memory.
-        with stage(progress, "checking base behaviour") as activity, peft_model.disable_adapter():
+        with stage(progress, "checking base behaviour", visible=True) as activity, peft_model.disable_adapter():
             base_outputs = _outputs(peft_model, processor, prompts, progress=activity)
-        with stage(progress, "checking checkpoint behaviour") as activity:
+        with stage(progress, "checking checkpoint behaviour", visible=True) as activity:
             ckpt_outputs = _outputs(peft_model, processor, prompts, progress=activity)
     else:
         # A full fine-tune: the checkpoint is a whole model, and its own
@@ -107,13 +107,13 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progres
         base_model = model_mod.load_model(spec, kind, device_map="auto", progress=progress)
         processor = model_mod.load_processor(spec, progress=progress)
         print(f"loaded {type(base_model).__name__} from {base}", flush=True)
-        with stage(progress, "checking base behaviour") as activity:
+        with stage(progress, "checking base behaviour", visible=True) as activity:
             base_outputs = _outputs(base_model, processor, prompts, progress=activity)
         del base_model
         torch.cuda.empty_cache()
         ckpt_model = model_mod.load_model(ckpt_spec, kind, device_map="auto", progress=progress)
         print(f"loaded {type(ckpt_model).__name__} from {checkpoint}", flush=True)
-        with stage(progress, "checking checkpoint behaviour") as activity:
+        with stage(progress, "checking checkpoint behaviour", visible=True) as activity:
             ckpt_outputs = _outputs(ckpt_model, processor, prompts, progress=activity)
 
     samples = [
@@ -123,10 +123,12 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progres
     differing = sum(s["differs"] for s in samples)
     behaviour = {"prompts": len(prompts), "differing": differing, "samples": samples}
     print(f"behaviour: {differing} of {len(prompts)} outputs differ between base and checkpoint", flush=True)
-    for s in samples:
-        print(f"  prompt:     {json.dumps(_text(s['prompt']))}", flush=True)
-        print(f"  base:       {json.dumps(s['base'])}", flush=True)
-        print(f"  checkpoint: {json.dumps(s['checkpoint'])}", flush=True)
+    for index, s in enumerate(samples, 1):
+        print(f"\n  sample {index}/{len(samples)}: {'differs' if s['differs'] else 'identical'}", flush=True)
+        # Indentation is presentation only: retain full generated text (including
+        # reasoning and blank lines), with the untouched values in verify.json.
+        for label, value in (("prompt", _text(s["prompt"])), ("base", s["base"]), ("checkpoint", s["checkpoint"])):
+            print(f"  {label}:\n    " + str(value).replace("\n", "\n    "), flush=True)
     if differing == 0:
         failures.append("behaviour unchanged: every output equals the base's")
 
@@ -218,7 +220,7 @@ def _chat_template_equal(spec, ckpt, base_processor, failures, *, progress=None)
     return equal
 
 
-# One-line form of a prompt for the printed report; messages become
+# Readable form of a prompt for the printed report; messages become
 # "role: content" lines.
 def _text(prompt):
     if isinstance(prompt, str):

@@ -17,14 +17,16 @@ COUNT_SECONDS = 1.0
 
 class Progress:
     # The command owns this reporter and closes it before its output sink closes.
-    def __init__(self, command, *, emit=None, on_error=None, clock=time.monotonic):
+    def __init__(self, command, *, emit=None, on_error=None, clock=time.monotonic, events=None):
         self.command = command
         self.emit = emit if emit is not None else self._stderr
         self.on_error = on_error
+        self.events = events
         self.clock = clock
         self.started = clock()
         self.last_output = self.started
         self.active = []
+        self.sequences = {}
         self.error = None
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -96,12 +98,21 @@ class Progress:
                 self.last_output = self.clock()
 
     # All sinks, including concurrent request notices, share one serialization lock.
-    def _write(self, message):
+    def _write(self, message, *, kind="diagnostic", activity=None):
         with self._lock:
             if self.error is not None or self._suspended:
                 return
             try:
-                self.emit(f"{self.command}: {message}")
+                if self.events is None:
+                    self.emit(f"{self.command}: {message}")
+                else:
+                    event = {"kind": kind, "message": message, "command": self.command}
+                    if activity is not None:
+                        event.update(label=activity.label, completed=activity.completed,
+                                     total=activity.total, unit=activity.unit, visible=activity.visible,
+                                     measured=activity.last_progress, parent=activity.parent,
+                                     sequence=activity.sequence)
+                    self.events(event)
             except Exception as error:
                 self.error = error
                 if self.on_error is not None:
@@ -119,9 +130,9 @@ class Progress:
                 detail = current._description()
                 since = (f"last measured progress {now - current.last_progress:.1f}s ago"
                          if current.last_progress is not None else "no measured progress yet")
-                self._write(f"waiting: {detail}; stage elapsed {now - current.started:.1f}s; {since}")
+                self._write(f"waiting: {detail}; stage elapsed {now - current.started:.1f}s; {since}", kind="waiting")
             else:
-                self._write(f"waiting for command; elapsed {now - self.started:.1f}s; no active stage reported")
+                self._write(f"waiting for command; elapsed {now - self.started:.1f}s; no active stage reported", kind="waiting")
 
     # Event.wait permits prompt shutdown even when the heartbeat interval is long.
     def _watch(self):
@@ -131,22 +142,31 @@ class Progress:
 
 class Stage:
     # A disabled stage preserves the same call interface for silent library callers.
-    def __init__(self, progress, label, total=None, unit="items"):
+    def __init__(self, progress, label, total=None, unit="items", *, visible=None):
         self.reporter = progress.reporter if isinstance(progress, Stage) else progress
         self.label = label
         self.total = total
         self.unit = unit
+        # Measured dataset operations are useful by default; internal bookkeeping
+        # stays diagnostic unless its owner explicitly identifies a public phase.
+        self.visible = (total is not None or unit != "items") if visible is None else visible
         self.completed = 0
         self.started = 0.0
         self.last_progress = None
+        self.parent = None
+        self.sequence = 0
 
     # Publish the boundary before executing the operation, including blocking calls.
     def __enter__(self):
         if self.reporter is not None:
             with self.reporter._lock:
                 self.started = self.reporter.clock()
+                self.parent = self.reporter.active[-1].label if self.reporter.active else None
+                key = (self.parent, self.label)
+                self.sequence = self.reporter.sequences.get(key, 0) + 1
+                self.reporter.sequences[key] = self.sequence
                 self.reporter.active.append(self)
-                self.reporter._write(self._description())
+                self.reporter._write(self._description(), kind="start", activity=self)
         return self
 
     # A nested stage restores the enclosing operation, including on failure.
@@ -154,7 +174,8 @@ class Stage:
         if self.reporter is not None:
             with self.reporter._lock:
                 outcome = "failed" if exc_type else "finished"
-                self.reporter._write(f"{self._description()}; {outcome} in {self.reporter.clock() - self.started:.1f}s")
+                self.reporter._write(f"{self._description()}; {outcome} in {self.reporter.clock() - self.started:.1f}s",
+                                     kind="end", activity=self)
                 self.reporter.active.remove(self)
 
     # Unknown totals remain unknown; no percentage is inferred from elapsed time.
@@ -178,15 +199,17 @@ class Stage:
                 if completed != self.completed:
                     self.last_progress = self.reporter.clock()
                 self.completed = completed
-                if self.reporter.clock() - self.reporter.last_output >= COUNT_SECONDS:
-                    self.reporter._write(self._description())
+                if (self.reporter.events is not None and self.unit == "steps") or self.reporter.clock() - self.reporter.last_output >= COUNT_SECONDS:
+                    # Structured consumers need each measured step, including steps
+                    # between Trainer.log calls; they own terminal coalescing.
+                    self.reporter._write(self._description(), kind="count", activity=self)
 
     # Retry and diagnostic events bypass counter throttling, without claiming progress.
     def note(self, message):
         if self.reporter is not None:
-            self.reporter._write(f"{self.label}: {message}")
+            self.reporter._write(f"{self.label}: {message}", kind="note", activity=self)
 
 
 # Keep reporter plumbing explicit; importing this module starts no background work.
-def stage(progress, label, total=None, unit="items"):
-    return Stage(progress, label, total, unit)
+def stage(progress, label, total=None, unit="items", *, visible=None):
+    return Stage(progress, label, total, unit, visible=visible)

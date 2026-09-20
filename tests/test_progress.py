@@ -146,5 +146,63 @@ class ProgressTest(unittest.TestCase):
         self.assertFalse(progress._thread.is_alive())
 
 
+class StructuredProgress(unittest.TestCase):
+    # Metadata distinguishes repeated work without relying on rendered stage text.
+    def test_parent_and_sequence_identify_repeated_and_nested_stages(self):
+        events = []
+        clock = Mock(return_value=0.0)
+        progress = Progress("trlx sft", events=events.append, clock=clock)
+        with stage(progress, "trainer running") as training:
+            for _ in range(2):
+                with stage(training, "evaluating", total=3, unit="batches"):
+                    pass
+        for parent in ("checking base behaviour", "checking checkpoint behaviour"):
+            with stage(progress, parent) as checking:
+                with stage(checking, "generating completions", total=8, unit="prompts"):
+                    pass
+        evaluation = [e for e in events if e["kind"] == "start" and e["label"] == "evaluating"]
+        self.assertEqual([(e["parent"], e["sequence"]) for e in evaluation],
+                         [("trainer running", 1), ("trainer running", 2)])
+        generation = [e for e in events if e["kind"] == "start" and e["label"] == "generating completions"]
+        self.assertEqual([(e["parent"], e["sequence"]) for e in generation],
+                         [("checking base behaviour", 1), ("checking checkpoint behaviour", 1)])
+        for event in evaluation + generation:
+            ending = next(e for e in events if e["kind"] == "end"
+                          and (e["label"], e["parent"], e["sequence"]) ==
+                          (event["label"], event["parent"], event["sequence"]))
+            self.assertEqual(ending["total"], event["total"])
+
+    # Every optimizer count must reach supervision even when no wall-clock interval elapses.
+    def test_every_optimizer_step_is_delivered_at_unchanged_clock(self):
+        events = []
+        progress = Progress("trlx sft", events=events.append, clock=Mock(return_value=0.0))
+        with stage(progress, "trainer running", total=5, unit="steps") as activity:
+            for _ in range(5):
+                activity.advance()
+        counts = [e for e in events if e["kind"] == "count"]
+        self.assertEqual([e["completed"] for e in counts], [1, 2, 3, 4, 5])
+        self.assertTrue(all(e["measured"] == 0.0 for e in counts))
+        self.assertEqual(events[-1]["kind"], "end")
+        self.assertEqual(events[-1]["completed"], 5)
+
+    # Per-row preparation cannot flood the transport; its end still carries the exact total.
+    def test_row_counts_are_coalesced_but_final_total_is_delivered(self):
+        events = []
+        clock = Mock(return_value=0.0)
+        progress = Progress("trlx sft", events=events.append, clock=clock)
+        with stage(progress, "preparing dataset", total=100, unit="rows") as activity:
+            for _ in range(50):
+                activity.advance()
+            self.assertEqual([e for e in events if e["kind"] == "count"], [])
+            clock.return_value = 1.0
+            activity.advance()
+            for _ in range(49):
+                activity.advance()
+        self.assertEqual([e["completed"] for e in events if e["kind"] == "count"], [51])
+        self.assertEqual(events[-1]["kind"], "end")
+        self.assertEqual(events[-1]["completed"], 100)
+        self.assertIn("100/100 rows", events[-1]["message"])
+
+
 if __name__ == "__main__":
     unittest.main()
