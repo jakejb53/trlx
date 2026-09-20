@@ -6,6 +6,8 @@ Design rule: do what makes sense, not what the HF/ML ecosystem does.
 
 Design rule: general-purpose. Both tools run on any machine and any model transformers can load. No model family, architecture, module name, path, device, or machine fact is hardcoded in source, in `init` output, or in tests. Such facts come from the run config or the model's own metadata. Section 5 records facts about one test model, not assumptions the tools rely on.
 
+Project-specific exceptions to `PRINCIPLES.md`'s prohibition on runtime defaults for operational settings: absent top-level trainer settings use the TRL config dataclass defaults; `run_name` defaults to the output directory's name; the checkpoint interval defaults to the evaluation interval (§2.2); GPU selection defaults to all visible GPUs (§2.5); and verification uses the built-in prompt set when `[verify].prompts` is absent (§2.7). These five defaults are intentional exceptions; the general rule remains in effect for other operational settings unless an exception is explicitly documented.
+
 ## 1. Repository
 
 ```
@@ -19,7 +21,7 @@ trlx/              repo root
 - Dependencies: trl, transformers, peft, accelerate, datasets. Pinned to exact versions (trl 1.13.0 at time of writing).
 - No other dependencies. CLI: argparse. TUI: curses. Config read: tomllib. Config write: own emitter. HTTP: urllib.
 - `trlx` and `dataset` are console entry points declared in `pyproject.toml`, installed onto PATH by `pip install`. Until the project is installed, both run from the repo root as `python -m trlx.cli` and `python -m dataset.cli`.
-- Secrets: every `api_key` setting names an environment variable and never holds a key. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings, and is not committed.
+- Secrets: every `api_key` setting names an environment variable and never holds a key. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings.
 
 ## 2. trlx
 

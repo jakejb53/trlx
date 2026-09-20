@@ -12,7 +12,7 @@ Current status: Phase 7 complete. All planned phases are done. Work after them i
 
 - Invoke the venv's executables by absolute path; a relative path triggers a site.py prefix warning on every call.
 - Nothing is installed. Both tools run from the repo root as `python -m trlx.cli` and `python -m dataset.cli` (addendum, Packaging).
-- Every subcommand in `trlx/cli.py` is wired to `_not_implemented`, which exits 2. A phase replaces the stub's `func` for its commands; the parser tree is not restructured.
+- All `trlx` subcommands are implemented. The seven training methods are wired to `train.run`.
 - `tests/test_imports.py` enforces the import rule by `ast` scan of source, not by importing.
 - `_BACKOFF_BASE_SECONDS` in `dataset/endpoint.py` is a constant by decision, an accepted exception to the no-runtime-defaults principle.
 - `data.json` and `swap_dataset_fields.py`, once the real-data fixtures for `dataset` checks, are no longer in the repo root.
@@ -256,7 +256,6 @@ written; where this addendum contradicts one, this addendum is current.
 - SPEC and PLAN carry no absolute paths and no `../` paths. Paths inside the
   repo are relative to the repo root; anything outside it is generic (`python`,
   `pip`, `<adapter>`).
-- SPEC and PLAN do not mention git or tracked files.
 
 ### Packaging (supersedes Phase 1)
 
@@ -286,7 +285,7 @@ written; where this addendum contradicts one, this addendum is current.
   `llm_judge` passed its `api_key` value straight to `Endpoint`, which would
   have put a live key in the run config and its snapshot; it now reads the
   named variable and fails when it is unset.
-- `.env` is in `.gitignore`. The file holds secrets only.
+- `.env` holds secrets only.
 - The import rule now admits `dataset.env` alongside `dataset.io` and
   `dataset.endpoint`; `tests/test_imports.py` carries the same list.
 
@@ -367,48 +366,59 @@ written; where this addendum contradicts one, this addendum is current.
 
 Done by three reviewers over `metrics.py`, `ranges.py`, `render_lines.py`,
 `render_tui.py`, `show.py` (Phase 4), `train.py`, `launch.py`,
-`data_load.py`, `rewards.py` and `tests/test_rewards.py` (Phase 5). Every
-finding below was reproduced before being recorded. None is fixed yet.
+`data_load.py`, `rewards.py` and `tests/test_rewards.py` (Phase 5).
+Follow-up source verification used TRL 1.13.0, transformers 5.17.0,
+torch 2.13.0 and datasets 5.0.1. In-memory probes reproduced display failure
+paths, metric reading/writing errors, rendering and resume output defects,
+reward parsing/validation errors, and replay-count arithmetic. No live
+training or GPU failure reproduction was performed in that verification;
+remaining runtime questions are identified below. Findings remain outstanding
+unless marked otherwise; line references are from the original review.
 
 Tier 1, silently wrong training or destroyed work:
 
-1. `train.py:99` `except BaseException: job.terminate()` makes any
-   display-side error kill healthy workers. Piping line output into a command
-   that exits early raises `BrokenPipeError` on the next print and every
-   worker is killed mid-training; SPEC 2.4 calls line output safe to pipe.
-   A mid-write read of `preflight.json` or `verify.json` does the same, since
-   both are written with `path.write_text` while the TUI polls them each
-   second.
-2. `train.py:147` raises on any `job.poll()` result, so a verify that reports
-   a problem (its normal nonzero exit) tears the TUI down. The one screen
-   built to show verify results is never up when they are bad; SPEC 2.4 says
-   the TUI stays until quit.
+1. **Partially complete:** `train.py` isolates display failures from job
+   supervision. A failed display stops and records its error in `log.txt`
+   and usable stderr; training and verification continue with their exit
+   status preserved, including after broken-stream shutdown flushes.
+   Ctrl-C, job polling, verification startup, and authoritative-log failures
+   retain supervisor cleanup. `tests/test_train.py`: 17 CPU-only tests pass
+   with `python -B -m unittest tests.test_train -v`, including real pipe
+   closure in child processes. Independent review found no blocking issues.
+   **Remaining:** `preflight.json` and `verify.json` are still written with
+   `path.write_text`; a mid-write read can stop the TUI, but no longer kills
+   healthy workers. Atomic report publication is not implemented.
+2. `train.py:147` raises on a nonzero verify exit before loading results on
+   that poll, closing the TUI. SPEC 2.4 says the TUI stays until quit.
 3. `rewards.py:30` `_NUMBER` reads a word-internal hyphen as a minus sign, so
    an `llm_judge` reply naming a model scores negative: "As GPT-4, I rate
    this 9" gives -4.0. "Score: .5" gives 5.0. Neither reaches the
-   no-number warning.
+   no-number warning. Selecting the first number is the documented policy;
+   fixing numeric token syntax alone would still select 4 instead of 9.
 4. `rewards.py:140,163` iterate `required`, `forbidden` and `keys` without
    checking they are lists. `required = "hello"` becomes five
-   single-character phrases and scores "h e l l o" 1.0; a non-string element
-   raises `AttributeError` instead of a message.
+   single-character phrases and scores "h e l l o" 1.0. Non-string phrase
+   elements raise `AttributeError`; JSON keys supplied as a string become
+   character keys, while invalid elements can fail membership or raise
+   `TypeError`, depending on their type.
 5. `rewards.py:83` checks that a fuzzy `threshold` is numeric but not that it
    is in [0, 1], which the error message promises. `threshold = 5` starts
    cleanly and returns 0.0 for every completion for the whole run. The same
    argument is accepted and ignored in the other two modes.
 6. `launch.py:110` `_estimate` never reads `cfg.teacher`, while
    `train.py:271` loads a second full model per rank for `distillation`. The
-   estimate under-counts by a whole model, `ddp` is chosen where `fsdp` is
-   needed, and every rank OOMs after loading. SPEC 2.5 and the Multi-GPU
-   design section above state the rule without the teacher, so the contract
-   needs the fix too.
-7. Each built-in factory names its closure after the built-in kind, so two
-   entries of one built-in (two `phrases`, one required and one forbidden)
-   average into a single `rewards/phrases/mean` and neither can be addressed
-   in `[ranges]`. The `rewards.py` docstring claims each entry is named
-   separately.
+   estimate omits the teacher and can choose an unsuitable strategy or
+   permit a run that OOMs; the outcome depends on the workload and hardware.
+   SPEC 2.5 and the Multi-GPU design section above state the rule without
+   the teacher, so the contract needs the fix too.
 
 Tier 2, wrong output, lost information, or a traceback on operator input:
 
+- Each built-in factory names its closure after the built-in kind. TRL's
+  GRPO and RLOO trainers append same-name metrics into one list and average
+  them, so two `phrases` entries share `rewards/phrases/mean` and cannot be
+  addressed separately in `[ranges]`. Training retains separate weighted
+  reward columns. The `rewards.py` docstring incorrectly claims separate names.
 - `render_tui.py:120` sizes value and change columns as minimums, so an
   out-of-range or large value overflows `table_width`, passes the width
   guard, and is clipped at the terminal edge. The module docstring promises
@@ -421,44 +431,49 @@ Tier 2, wrong output, lost information, or a traceback on operator input:
 - `train.py:119` opens the log reader at offset 0 with `printed = 0`, so a
   resumed run replays the whole previous `log.txt` and every previous
   metrics row before the first new line.
-- `rewards.py:307` appends an unresolved bare name as an HF model path with
-  no shape check, so a typo fails later as a hub error naming no config key.
-  `config.py:62` `_HF_ID` already owns what a hub id looks like.
-  `hasattr(trl.rewards, name)` also matches that package's submodules.
+- `rewards.py:312` passes an unresolved bare name to TRL, which calls
+  `AutoModelForSequenceClassification.from_pretrained`; the eventual error
+  depends on the name and lacks trlx's config-entry context. `config.py:62`
+  `_HF_ID` describes dataset references, not a general model-path contract.
+  TRL exposes reward submodules as attributes, so `hasattr(trl.rewards, name)`
+  also accepts modules without checking that they are callable.
 - `data_load.py:75` floors the replay count at 1, so a small `fraction` on a
   small train set can deliver nine times the requested share with no line
   saying so. SPEC 2.9 states the equality without an exception.
 - `data_load.py:100` treats an empty file as fatal but lets an empty hub
   split through.
-- A local path with an unrecognised extension that contains a slash matches
-  `_HF_ID` and is reported as a hub failure, so the message naming the
-  supported extensions is unreachable for most mistyped paths.
+- A local path with an unrecognised extension is treated as a hub reference
+  when it matches `_HF_ID`: `data/input.txt` does, while `./data/input.txt`
+  and `nested/data/input.txt` receive the supported-format error.
 - Tracebacks on operator input: `data_load.py:83` when the train set already
-  has a `replay` column; `rewards.py:116` for a non-integer or negative
+  has a `replay` column (`Dataset.add_column` raises `ValueError` before
+  trlx's handler); `rewards.py:116` for a non-integer or negative
   `group`; `rewards.py:240` for a non-numeric `timeout` or `retries`;
   `train.py:341` when `output_dir` names an existing file;
   `metrics.py:68` when a write or flush fails; and `train.py:187`, where a
-  worker OOM or rendezvous timeout lands in `log.txt` as a traceback while
-  `train.py:253` gives `trlx check` a clear message for the same condition.
+  worker OOM or rendezvous timeout has no corresponding error handler.
+  `train.py:253` handles OOM around standalone preflight, not rendezvous errors.
 - `launch.py:242` kills workers with `SIGKILL` and no process group, so a
   worker's own dataloader children are never signalled and can outlive the
   run holding GPU memory, and surviving ranks cannot tear down NCCL.
+  The direct-worker-only kill path is source-confirmed; retained GPU memory
+  was not reproduced.
 - `train.py:110` returns a negative exit code for a signal-killed worker,
-  which reaches the shell as 247.
+  which wraps at the shell boundary; specifically, SIGKILL's -9 becomes 247.
 
 Tier 3, contract and comment drift:
 
 - SPEC 2.5 says other ranks train silently. `launch.py:142` sets
-  `LOCAL_RANK=0` in every worker and transformers keys `should_log` off the
-  local index, so every rank logs into the shared `log.txt` with no rank
-  prefix. Phase 5 recorded this as observed, so the spec sentence is what is
-  wrong. Checkpoint saving is unaffected.
+  `LOCAL_RANK=0` in every worker. With the default `log_on_each_node = true`,
+  transformers keys `should_log` off the local index, so every rank logs
+  into the shared `log.txt` with no rank prefix. Phase 5 recorded this as
+  observed, so the spec sentence is what is wrong. Checkpoint saving is unaffected.
 - Stale or contradictory comments: `metrics.py:36` states `logs["epoch"]` is
-  a rounded copy, which transformers 5.17 does not do; `render_tui.py:5`
-  promises no silent clipping while three panes truncate; `launch.py:20` and
-  `launch.py:74` disagree about whether the multiplier covers activations;
-  `launch.py:250` describes a port-reuse window of milliseconds that is
-  actually minutes.
+  a rounded copy, but transformers 5.17 assigns `state.epoch` directly;
+  `launch.py:20` and `launch.py:74` disagree about whether the multiplier
+  covers activations. The TUI's size guarantee concerns columns and panes;
+  checkpoint, log and result text is truncated, with result truncation
+  explicitly documented.
 - Functions with no preceding comment: `metrics.py:107`, `metrics.py:60`,
   `metrics.py:71`, `ranges.py:32`, `render_tui.py:49`, `render_tui.py:77`,
   `render_tui.py:138`, `show.py:100`, `rewards.py:70`.
@@ -469,36 +484,51 @@ Tier 3, contract and comment drift:
   checkpoints; one source of truth would serve both.
 - The startup strategy line prints twice in line mode: once to stderr and
   again when `log.txt` is copied from offset 0.
-- `normalise` removes ASCII punctuation only, so a curly quote or a CJK full
-  stop in a reference cell never matches; uncommented.
+- `normalise` removes ASCII punctuation only. Unicode punctuation can make
+  otherwise equivalent punctuated and unpunctuated answers differ; matching
+  punctuation on both sides still matches. The ASCII restriction is undocumented.
 
 Test gaps named by the review:
 
-- No test covers `show.py` at all, nor `render_tui` geometry; the three
-  arithmetic findings above would have been caught by a unit test on
-  `table_width` and `_pair_width`.
+- No test covers `show.py` or `render_tui` geometry. Width checks need to
+  compare rendered cells with `table_width` and `_pair_width`; checkpoint
+  visibility and display lifecycle defects need separate coverage.
 - `llm_judge` number parsing is tested with one reply shape, so both
   parsing defects pass the suite. No unreachable-endpoint, timeout or
   retry-exhaustion test, and no `api_key` test in either direction.
 - No empty-completion test for any built-in reward. `length_window` scores
-  an empty string 0.889 with `low = 1, high = 10`.
+  an empty string 0.889 with `low = 1, high = 10`, consistent with its
+  documented linear falloff; this is a coverage gap, not an established defect.
 - `reference_match` fuzzy has one assertion above one threshold; `regex` has
   no test for group 0, a negative group, a non-participating group or a
   wrongly typed group; `phrases` has no bare-string or all-forbidden case;
-  `length_window` never exercises the `tokens` unit; `resolve` has no
-  unknown-bare-name test.
+  `length_window` tests token-mode validation but not token counting;
+  `resolve` has no unknown-bare-name test.
 
-Suspected, needing a run to settle: `ranges.py:75` `float(raw)` on a
-non-numeric trainer log value; `launch.py:43` device counting before
-`CUDA_VISIBLE_DEVICES` is rewritten on hosts without NVML;
-`difflib.SequenceMatcher` autojunk changing fuzzy scores past 200 characters.
+Additional verification and open decisions:
+
+- `ranges.py:75` raises `ValueError` for a nonnumeric selected metric in an
+  in-memory probe. Whether supported trainers naturally emit such values
+  remains unverified.
+- `launch.py:43` counts devices before `CUDA_VISIBLE_DEVICES` is rewritten.
+  When NVML discovery fails, PyTorch falls back to a CUDA runtime call that
+  initializes the driver. The ordering hazard is source-supported; incorrect
+  mapping on an affected host still needs a controlled GPU reproduction.
+- `SequenceMatcher`'s default autojunk heuristic changes fuzzy scores at
+  length 200: `"x" + "a" * 199` versus `"y" + "a" * 199` yields 0.0,
+  compared with 0.995 when autojunk is disabled. The current reward rejects
+  that pair at threshold 0.8. The effect is reproduced; changing the
+  matching policy requires approval.
+- Changes to the judge's first-number policy, Unicode normalization, or
+  empty-completion length scoring also require separate behavior decisions.
 
 Reviewed and found clean: change-column arithmetic and the TUI row
 geometry; interval boundaries including NaN; empty and absent files in the
 readers; rank-0 ownership of `metrics.jsonl` and the preflight report; the
 logical-to-physical GPU mapping, including under a pre-set
-`CUDA_VISIBLE_DEVICES`; verify gating on every worker exiting 0; zombie
-reaping; `[dataset]` split rules and the eval remainder; reward resolution
+`CUDA_VISIBLE_DEVICES` (subject to the unresolved NVML case above); verify
+gating on every worker exiting 0; zombie reaping; `[dataset]` split rules
+and the eval remainder; reward resolution
 order; `json_valid` key logic; `length_window` falloff arithmetic;
 `llm_judge` concurrency, ordering and retry wiring; and the `api_key`
 change made earlier today.
@@ -512,7 +542,6 @@ change made earlier today.
 
 ### Session notes
 
-- `runs/`, `__pycache__/`, `trlx.egg-info/` and `.env` are not committed.
 - The TUI was not re-run this session; display code is unchanged.
 - Stock vLLM server used for `dataset chat`:
   `CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-0.6B --port 8000

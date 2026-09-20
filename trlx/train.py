@@ -72,7 +72,6 @@ def _supervise(args):
     # check must not leave a half-made run directory behind.
     preflight.check_config(cfg, args.config, strategy)
     startup = f"strategy: {strategy} ({why}); GPUs {','.join(physical)}"
-    print(startup, file=sys.stderr)
 
     run_dir = _create_run_dir(cfg.args)
     _write_snapshot(args.config, run_dir, physical, strategy, cfg.args.run_name)
@@ -80,6 +79,19 @@ def _supervise(args):
     with open(log_path, "ab") as log_file:
         log_file.write((startup + "\n").encode("utf-8"))
         log_file.flush()
+        display_failed = False
+
+        # The log remains authoritative after presentation stops. A failure to
+        # record this notice is a supervisor error, not another display error.
+        def on_display_error(error):
+            nonlocal display_failed
+            display_failed = True
+            _report_display_error(error, log_file, log_path)
+
+        try:
+            print(startup, file=sys.stderr, flush=True)
+        except Exception as error:
+            on_display_error(error)
         workers = launch.spawn(args.command, args.config, strategy, physical, log_file)
         start_verify = None
         if not args.no_verify:
@@ -92,34 +104,82 @@ def _supervise(args):
 
         job = launch.Job(workers, start_verify)
         try:
-            if args.tui:
-                failure = _supervise_tui(run_dir, job)
+            if display_failed:
+                failure = job.wait(lambda: None)
+            elif args.tui:
+                failure = _supervise_tui(run_dir, job, on_display_error)
             else:
-                failure = _supervise_lines(run_dir, cfg.ranges, log_path, job)
+                failure = _supervise_lines(run_dir, cfg.ranges, log_path, job, on_display_error)
+            if failure is not None:
+                label, code = failure
+                # Final diagnostics are display work too: a broken stream or
+                # unreadable report must not replace the job's exit status.
+                try:
+                    if sys.stderr is not None:
+                        print(f"{label} exited with code {code}; see {log_path}", file=sys.stderr, flush=True)
+                    if args.tui and not display_failed:
+                        state = show.load(run_dir, cfg.args.run_name, cfg.ranges, _FAILURE_TAIL_LINES)
+                        for line in state.log_tail:
+                            print(line, file=sys.stderr, flush=True)
+                except Exception as error:
+                    on_display_error(error)
         except BaseException:
+            # Cancellation and supervisor failures still own process cleanup.
+            # Display exceptions have already been handled at their boundary.
             job.terminate()
             raise
-    if failure is None:
-        return 0
-    label, code = failure
-    print(f"{label} exited with code {code}; see {log_path}", file=sys.stderr)
-    if args.tui:
-        state = show.load(run_dir, cfg.args.run_name, cfg.ranges, _FAILURE_TAIL_LINES)
-        for line in state.log_tail:
-            print(line, file=sys.stderr)
-    return code
+    return 0 if failure is None else failure[1]
 
 
-# Line mode: header once, then every metrics.jsonl row not yet printed, on
-# each poll, plus new log.txt bytes copied to stderr.
-def _supervise_lines(run_dir, range_table, log_path, job):
-    print(render_lines.header(range_table), flush=True)
+# Records loss of presentation before disabling unusable standard streams.
+# Log I/O failures propagate: supervision requires the authoritative run log.
+def _report_display_error(error, log_file, log_path):
+    message = (
+        f"display stopped: {type(error).__name__}: {error}; "
+        f"training and verification remain supervised; see {log_path}"
+    )
+    try:
+        log_file.write((message + "\n").encode("utf-8"))
+        log_file.flush()
+    except OSError as exc:
+        raise TrlxError(f"{log_path}: cannot record display failure: {exc}") from exc
+
+    # Python flushes standard streams at shutdown; a retained broken pipe
+    # would replace even a successful job exit with status 120. None disables
+    # that stream without closing a descriptor owned by the caller.
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is not None:
+            try:
+                stream.flush()
+            except Exception:
+                setattr(sys, name, None)
+    if sys.stderr is not None:
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except Exception:
+            sys.stderr = None
+
+
+# Line mode: render failures disable only this callback. Job.wait and its
+# process polling stay outside the presentation exception boundary.
+def _supervise_lines(run_dir, range_table, log_path, job, on_display_error):
+    try:
+        print(render_lines.header(range_table), flush=True)
+        log_reader = open(log_path, "rb")
+    except Exception as error:
+        on_display_error(error)
+        return job.wait(lambda: None)
     metrics_path = run_dir / metrics.FILENAME
     printed = 0
-    with open(log_path, "rb") as log_reader:
+    active = True
 
-        def tick():
-            nonlocal printed
+    # Once a read or render fails, do not retry it on subsequent job polls.
+    def tick():
+        nonlocal printed, active
+        if not active:
+            return
+        try:
             chunk = log_reader.read()
             if chunk:
                 sys.stderr.buffer.write(chunk)
@@ -129,36 +189,59 @@ def _supervise_lines(run_dir, range_table, log_path, job):
                 for row in rows[printed:]:
                     print(render_lines.line(row), flush=True)
                 printed = len(rows)
+        except Exception as error:
+            active = False
+            on_display_error(error)
 
+    try:
         return job.wait(tick)
+    finally:
+        try:
+            log_reader.close()
+        except Exception as error:
+            on_display_error(error)
 
 
 # TUI mode: the same display as `trlx show --tui`, polling the run directory.
 # Process failure is checked on every poll and surfaces as an exception from
 # `load`, which ends the display with the terminal restored. On a normal
 # finish the display stays until quit; if the user quits early the job keeps
-# going and the supervisor waits for it.
-def _supervise_tui(run_dir, job):
-    from trlx import render_tui
+# going and the supervisor waits for it. Display errors also end only the
+# display; process-polling errors retain their supervisor semantics.
+def _supervise_tui(run_dir, job, on_display_error):
+    failure = None
+    poll_error = None
 
-    name, range_table = show.load_config(run_dir)
-    failure = []
-
+    # Polling is embedded in the TUI callback. Remember its error separately
+    # so the outer curses error boundary cannot classify it as presentation.
     def load(log_lines):
-        found = job.poll()
-        if found is not None:
-            failure.append(found)
-            raise TrlxError(f"{found[0]} exited with code {found[1]}")
+        nonlocal failure, poll_error
+        try:
+            failure = job.poll()
+        except Exception as error:
+            poll_error = error
+            raise
+        if failure is not None:
+            raise TrlxError(f"{failure[0]} exited with code {failure[1]}")
         return show.load(run_dir, name, range_table, log_lines)
 
     try:
+        from trlx import render_tui
+
+        name, range_table = show.load_config(run_dir)
         render_tui.run(load)
-    except TrlxError:
-        if not failure:
-            raise
-        return failure[0]
-    if not job.done():
-        print(f"display closed; the job continues, follow with: trlx show {run_dir}", file=sys.stderr)
+    except Exception as error:
+        if poll_error is not None:
+            raise poll_error
+        if failure is not None:
+            return failure
+        on_display_error(error)
+    else:
+        if not job.done():
+            try:
+                print(f"display closed; the job continues, follow with: trlx show {run_dir}", file=sys.stderr, flush=True)
+            except Exception as error:
+                on_display_error(error)
     return job.wait(lambda: None)
 
 
