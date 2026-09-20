@@ -25,6 +25,7 @@ import tomllib
 import torch
 from peft import PeftModel
 
+from dataset.io import DatasetError, validate_output, write_text
 from trlx import TrlxError, adapter_check, config as config_mod, generate, model as model_mod, show
 
 
@@ -52,13 +53,18 @@ class Result:
 
 # Runs the checks and returns the Result. `prompts_ref` is a config.DatasetRef
 # or None for the built-in prompts.
-def run(checkpoint, base, prompts_ref):
+def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False):
     ckpt = pathlib.Path(checkpoint)
     if not ckpt.is_dir():
         raise TrlxError(f"{checkpoint}: not a directory")
+    run_dir = ckpt.parent if (ckpt.parent / show.CONFIG_FILENAME).is_file() else None
+    path = (run_dir if run_dir is not None else ckpt) / show.VERIFY_FILENAME
+    try:
+        validate_output(path, force)
+    except DatasetError as e:
+        raise TrlxError(str(e)) from e
     if not torch.cuda.is_available():
         raise TrlxError("verify needs a CUDA device and none is available")
-    run_dir = ckpt.parent if (ckpt.parent / show.CONFIG_FILENAME).is_file() else None
     spec = _base_spec(run_dir, base)
     prompts = generate.prompts_from(prompts_ref)
     failures = []
@@ -70,6 +76,8 @@ def run(checkpoint, base, prompts_ref):
         print(f"loaded {type(base_model).__name__} from {base}", flush=True)
         try:
             peft_model = PeftModel.from_pretrained(base_model, str(ckpt))
+        except torch.cuda.OutOfMemoryError as e:
+            raise TrlxError(f"{checkpoint}: CUDA memory exhausted loading adapter; free GPU memory") from e
         except (OSError, ValueError) as e:
             raise TrlxError(f"{checkpoint}: cannot load adapter: {e}")
         check = adapter_check.check(ckpt, peft_model)
@@ -117,12 +125,10 @@ def run(checkpoint, base, prompts_ref):
     template_equal = _chat_template_equal(spec, ckpt, processor, failures)
 
     result = Result(str(ckpt), base, adapter, behaviour, template_equal, failures)
-    out_dir = run_dir if run_dir is not None else ckpt
-    path = out_dir / show.VERIFY_FILENAME
     try:
-        path.write_text(json.dumps(result.to_dict(), indent=1) + "\n", encoding="utf-8")
-    except OSError as e:
-        raise TrlxError(f"{path}: cannot write: {e.strerror or e}")
+        write_text(path, json.dumps(result.to_dict(), indent=1) + "\n", force=force, no_staging=no_staging)
+    except DatasetError as e:
+        raise TrlxError(str(e)) from e
     verdict = "verify passed" if result.ok else "verify failed: " + "; ".join(failures)
     print(f"{verdict}; written to {path}", flush=True)
     return result
@@ -139,7 +145,7 @@ def _base_spec(run_dir, base):
     try:
         with open(path, "rb") as f:
             table = tomllib.load(f).get("model")
-    except (OSError, tomllib.TOMLDecodeError) as e:
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as e:
         raise TrlxError(f"{path}: cannot read snapshot: {e}")
     if not isinstance(table, dict):
         raise TrlxError(f"{path}: snapshot has no [model] block")
@@ -171,11 +177,15 @@ def _outputs(model, processor, prompts):
     tokenizer = getattr(processor, "tokenizer", processor)
     device = next(model.parameters()).device
     scores = []
-    with torch.no_grad():
-        for prompt in prompts:
-            text, templated = generate._render(tokenizer, prompt)
-            encoded = tokenizer(text, return_tensors="pt", add_special_tokens=not templated).to(device)
-            scores.append(f"score {model(**encoded).logits[0, 0].item():.6g}")
+    try:
+        with torch.no_grad():
+            for prompt in prompts:
+                text, templated = generate._render(tokenizer, prompt)
+                encoded = tokenizer(text, return_tensors="pt", add_special_tokens=not templated).to(device)
+                scores.append(f"score {model(**encoded).logits[0, 0].item():.6g}")
+    except torch.cuda.OutOfMemoryError as e:
+        raise TrlxError("CUDA memory exhausted comparing reward-model scores; "
+                        "free GPU memory or shorten verification prompts") from e
     return scores
 
 

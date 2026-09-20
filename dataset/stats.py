@@ -91,9 +91,16 @@ def _load(model_path):
     try:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
         model = transformers.AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16)
+        model.to(device).eval()
+    except torch.cuda.OutOfMemoryError as e:
+        raise DatasetError(
+            f"--model {model_path}: out of memory loading model on {device}; "
+            "free device memory or choose a smaller model"
+        ) from e
     except (OSError, ValueError) as e:
-        raise DatasetError(f"--model {model_path}: cannot load: {e}")
-    model.to(device).eval()
+        raise DatasetError(
+            f"--model {model_path}: cannot load: {e}; check the model path/ID, access, and model files"
+        )
     print(f"model loaded on {device}")
     return tokenizer, model, device
 
@@ -106,12 +113,21 @@ def _encode_pair(tokenizer, context, response, index):
         ctx = tokenizer(context, add_special_tokens=True)["input_ids"]
         full = tokenizer(context + response, add_special_tokens=True)["input_ids"]
     elif isinstance(context, list) and isinstance(response, list):
+        from jinja2 import TemplateError
+
         # return_dict=False asks for a plain id list on every transformers
         # version; the default return type changed between major versions.
-        ctx = tokenizer.apply_chat_template(
-            context, add_generation_prompt=True, tokenize=True, return_dict=False
-        )
-        full = tokenizer.apply_chat_template(context + response, tokenize=True, return_dict=False)
+        # These failures belong to the supplied conversation/template boundary.
+        try:
+            ctx = tokenizer.apply_chat_template(
+                context, add_generation_prompt=True, tokenize=True, return_dict=False
+            )
+            full = tokenizer.apply_chat_template(context + response, tokenize=True, return_dict=False)
+        except (TemplateError, ValueError, TypeError, IndexError, KeyError) as e:
+            raise DatasetError(
+                f"row {index}: cannot apply the model chat template: {e}; "
+                "check the messages and the model's chat template"
+            )
     else:
         raise DatasetError(
             f"row {index}: prompt is {type(context).__name__} and response is "
@@ -157,6 +173,8 @@ def _response_pair(row, column, index):
 # with no scoreable response tokens are counted and reported, never dropped
 # silently, so the summary count can be reconciled with the row count.
 def logprobs(rows, tokenizer, model, device):
+    import torch
+
     present = [c for c in RESPONSE_COLUMNS + ("messages",) if c in rows[0]]
     out = {}
     for column in present:
@@ -166,7 +184,14 @@ def logprobs(rows, tokenizer, model, device):
             if "messages" not in row and column == "messages":
                 raise DatasetError(f"row {i} has no column 'messages'")
             ctx, full = _encode_pair(tokenizer, *_response_pair(row, column, i), i)
-            lp = _logprob(model, device, ctx, full)
+            # Resource exhaustion is an operator failure; other model bugs still propagate.
+            try:
+                lp = _logprob(model, device, ctx, full)
+            except torch.cuda.OutOfMemoryError as e:
+                raise DatasetError(
+                    f"row {i}, column '{column}': out of memory scoring {len(full)} tokens on {device}; "
+                    "free device memory, shorten the input, or choose a smaller model"
+                ) from e
             if lp is None:
                 empty += 1
             else:

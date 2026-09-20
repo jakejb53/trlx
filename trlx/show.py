@@ -61,8 +61,8 @@ def load_config(run_dir):
             doc = tomllib.load(f)
     except FileNotFoundError:
         raise TrlxError(f"{path}: no such file; not a run directory")
-    except OSError as e:
-        raise TrlxError(f"{path}: cannot read: {e.strerror or e}")
+    except (OSError, UnicodeError) as e:
+        raise TrlxError(f"{path}: cannot read: {e}")
     except tomllib.TOMLDecodeError as e:
         raise TrlxError(f"{path}: invalid TOML: {e}")
     if "ranges" not in doc or not isinstance(doc["ranges"], dict):
@@ -115,7 +115,11 @@ def _checkpoints(run_dir, records):
         if rec["eval"] and rec["log"].get("eval_loss") is not None:
             eval_loss[rec["step"]] = float(rec["log"]["eval_loss"])
     steps = []
-    for entry in run_dir.iterdir():
+    try:
+        entries = list(run_dir.iterdir())
+    except OSError as e:
+        raise TrlxError(f"{run_dir}: cannot list checkpoints: {e}; select a readable run directory") from e
+    for entry in entries:
         m = CHECKPOINT_DIR.match(entry.name)
         if m and entry.is_dir():
             steps.append(int(m.group(1)))
@@ -153,8 +157,8 @@ def _read_json(path):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as e:
-        raise TrlxError(f"{path}: cannot read: {e.strerror or e}")
+    except (OSError, UnicodeError) as e:
+        raise TrlxError(f"{path}: cannot read: {e}")
     try:
         doc = json.loads(text)
     except json.JSONDecodeError as e:

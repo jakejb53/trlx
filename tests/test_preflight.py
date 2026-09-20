@@ -9,10 +9,11 @@ import io
 import pathlib
 from types import SimpleNamespace
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from trlx import TrlxError, run_dirs, toml_write
-from trlx.preflight import _check_resume, compare_snapshot
+from trlx.preflight import _check_resume, _check_vllm, compare_snapshot
 
 # Effective inputs after method selection and CLI overrides, and their snapshot:
 # run_name resolved, [launch] appended.
@@ -136,6 +137,20 @@ class ResumeCheck(unittest.TestCase):
             with self.assertRaisesRegex(TrlxError, "invalid checkpoint"):
                 _check_resume(self.config(CURRENT), "operator.toml", "ddp")
         opening.assert_not_called()
+
+
+class VllmDiagnostics(unittest.TestCase):
+    # The URL and a network-library error can both contain credentials.
+    def test_probe_error_omits_url_credentials_and_echoed_reason(self):
+        cfg = SimpleNamespace(rewards=["reward"], args=SimpleNamespace(
+            vllm_server_base_url="https://user:secret@example.test/v1?token=private",
+        ))
+        with patch("trlx.preflight.urllib.request.urlopen", side_effect=urllib.error.URLError("secret private")):
+            with self.assertRaises(TrlxError) as caught:
+                _check_vllm(cfg)
+        self.assertIn("example.test/v1/get_world_size", str(caught.exception))
+        for secret in ("user", "secret", "private", "token="):
+            self.assertNotIn(secret, str(caught.exception))
 
 
 if __name__ == "__main__":

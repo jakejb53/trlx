@@ -15,7 +15,7 @@ import json
 import math
 import pathlib
 
-from safetensors import safe_open
+from safetensors import SafetensorError, safe_open
 
 from trlx import TrlxError
 
@@ -67,12 +67,18 @@ def file_stats(adapter_dir):
     if not path.is_file():
         raise TrlxError(f"{adapter_dir}: no {ADAPTER_FILE}; not an adapter directory")
     count, biggest = 0, 0.0
-    with safe_open(str(path), framework="pt") as f:
-        for key in f.keys():
-            if "lora_B" not in key:
-                continue
-            count += 1
-            biggest = max(biggest, f.get_tensor(key).abs().max().item())
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            for key in f.keys():
+                if "lora_B" not in key:
+                    continue
+                tensor = f.get_tensor(key)
+                if tensor.numel() == 0:
+                    raise TrlxError(f"{path}: adapter tensor {key} is empty; select a complete adapter")
+                count += 1
+                biggest = max(biggest, tensor.abs().max().item())
+    except (OSError, SafetensorError) as e:
+        raise TrlxError(f"{path}: cannot read adapter weights: {e}; select a readable, complete adapter") from e
     return count, biggest
 
 
@@ -101,8 +107,11 @@ def task_type(adapter):
     path = pathlib.Path(adapter) / "adapter_config.json"
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f).get("task_type")
+            document = json.load(f)
     except FileNotFoundError:
         raise TrlxError(f"{adapter}: no adapter_config.json; not an adapter directory")
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
         raise TrlxError(f"{path}: cannot read: {e}")
+    if not isinstance(document, dict):
+        raise TrlxError(f"{path}: expected a JSON object; select a valid adapter directory")
+    return document.get("task_type")

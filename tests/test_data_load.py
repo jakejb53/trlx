@@ -8,6 +8,13 @@ from trlx import TrlxError, config, data_load
 
 
 class FractionalSplit(unittest.TestCase):
+    # Dataset conversion failures retain the operator's source path and a concrete remedy.
+    def test_incompatible_column_values_name_dataset(self):
+        ref = config.DatasetRef("mixed.jsonl", True, None)
+        with patch("trlx.data_load.read_rows", return_value=[{"text": "hello"}, {"text": [1]}]):
+            with self.assertRaisesRegex(TrlxError, "mixed.jsonl.*consistent value types"):
+                data_load.load_ref(ref)
+
     # In-memory datasets exercise the same slicing path as local and Hub sources.
     def split(self, count, fraction):
         whole = Dataset.from_dict({"text": [str(index) for index in range(count)]})

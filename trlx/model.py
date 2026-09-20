@@ -37,7 +37,7 @@ def _pretrained_kwargs(spec):
 def load_config(spec):
     try:
         return AutoConfig.from_pretrained(spec.path, **_pretrained_kwargs(spec))
-    except OSError as e:
+    except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load model config: {e}")
 
 
@@ -99,7 +99,10 @@ def load_model(spec, kind, device_map=None):
         kwargs["num_labels"] = 1
     try:
         return cls.from_pretrained(spec.path, **kwargs)
-    except OSError as e:
+    except torch.cuda.OutOfMemoryError as e:
+        raise TrlxError(f"[model].path '{spec.path}': CUDA memory exhausted while loading weights; "
+                        "free GPU memory or select a smaller model") from e
+    except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load weights: {e}")
 
 
@@ -108,5 +111,5 @@ def load_model(spec, kind, device_map=None):
 def load_processor(spec):
     try:
         return AutoProcessor.from_pretrained(spec.path, **_pretrained_kwargs(spec))
-    except OSError as e:
+    except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load tokenizer or processor: {e}")

@@ -16,7 +16,7 @@ import json
 import pathlib
 import re
 
-from dataset.io import DatasetError
+from dataset.io import DatasetError, validate_output, write_text
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PY_LITERALS = {"True": "true", "False": "false", "None": "null"}
@@ -310,21 +310,22 @@ def heal_json(text):
 
 # Reads, heals by extension, writes. Returns (repairs, errors); the caller
 # prints them and sets the exit code.
-def heal_file(src, dst):
+def heal_file(src, dst, *, force=False, no_staging=False):
     suffix = pathlib.Path(src).suffix.lower()
     if suffix not in (".jsonl", ".json"):
         raise DatasetError(f"{src}: heal handles .jsonl and .json, not '{suffix}'")
     if pathlib.Path(dst).suffix.lower() != suffix:
         raise DatasetError(f"{dst}: output extension must match input '{suffix}'")
-    if pathlib.Path(src).resolve() == pathlib.Path(dst).resolve():
-        raise DatasetError(f"{dst}: output would overwrite input; the tool never writes in place")
+    # Healing repairs the selected target, preserving any symlink used to name it.
+    validate_output(dst, force=force, follow_symlinks=True)
     try:
         with open(src, encoding="utf-8") as f:
             text = f.read()
     except OSError as e:
-        raise DatasetError(f"{src}: {e.strerror}")
+        raise DatasetError(f"{src}: cannot read: {e.strerror or e}; check the path and permissions")
+    except UnicodeError:
+        raise DatasetError(f"{src}: input is not valid UTF-8; convert it to UTF-8 before healing")
     heal = heal_jsonl if suffix == ".jsonl" else heal_json
     result, repairs, errors = heal(text)
-    with open(dst, "w", encoding="utf-8") as f:
-        f.write(result)
+    write_text(dst, result, force=force, no_staging=no_staging, follow_symlinks=True)
     return repairs, errors

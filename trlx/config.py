@@ -355,12 +355,17 @@ def _read_toml(path):
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
-    except FileNotFoundError:
-        raise TrlxError(f"{path}: no such file")
+    except FileNotFoundError as e:
+        raise TrlxError(
+            f"{path}: no such config file; check --config or create defaults with trlx init. "
+            "For resume, restore the run's original config.toml snapshot."
+        ) from e
     except OSError as e:
-        raise TrlxError(f"{path}: cannot read: {e.strerror or e}")
+        raise TrlxError(f"{path}: cannot read config: {e.strerror or e}") from e
+    except UnicodeDecodeError as e:
+        raise TrlxError(f"{path}: config is not valid UTF-8; save the TOML file as UTF-8") from e
     except tomllib.TOMLDecodeError as e:
-        raise TrlxError(f"{path}: invalid TOML: {e}")
+        raise TrlxError(f"{path}: invalid TOML: {e}") from e
 
 
 # True when a type hint admits None: Optional, X | None, or Any.
@@ -407,8 +412,10 @@ def _build_args(path, method, top, eval_enabled, fsdp, replay):
                 raise TrlxError(f"{path}: '{key}' does not accept \"None\" (type {_type_name(hints[key])})")
             value = None
         elif not _matches(value, hints[key]):
+            # Even malformed credential values stay out of operator diagnostics.
+            detail = "" if key in ("hub_token", "push_to_hub_token") else f" {value!r}"
             raise TrlxError(
-                f"{path}: '{key}' must be {_type_name(hints[key])}, got {type(value).__name__} {value!r}"
+                f"{path}: '{key}' must be {_type_name(hints[key])}, got {type(value).__name__}{detail}"
             )
         kwargs[key] = value
 

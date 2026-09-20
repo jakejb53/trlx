@@ -23,6 +23,28 @@ trlx/              repo root
 - `trlx` and `dataset` are console entry points declared in `pyproject.toml`, installed onto PATH by `pip install`. Until the project is installed, both run from the repo root as `python -m trlx.cli` and `python -m dataset.cli`.
 - Secrets: every `api_key` setting names an environment variable and never holds a key. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings.
 
+### 1.1 Destructive operations and --force
+
+Every command accepts `--force`. `--force` authorizes the requested destructive operation, including
+replacing inputs or directories containing other files. Without it, refuse, explain the consequences,
+and offer `--force`. With it, perform the operation without further confirmation. Destructive operations
+replace symlinks themselves; healing follows them to repair their targets.
+
+`init`, `merge`, `replay-build`, standalone `verify`, and dataset writers stage complete outputs
+before publication by default. `--no-staging` writes directly after reading required inputs;
+it saves staging space but a failure can lose the original and leave incomplete output.
+It does not authorize replacement: existing destinations still require `--force`.
+Merge requires disk staging when its output replaces the base, adapter, or a directory containing
+either, including input path aliases. Such a request with `--no-staging` is rejected before loading
+or modifying anything, with guidance to omit the option. Separate merge outputs support direct writing.
+Merge replacement covers the entire output directory, including base/adapter inputs or their
+ancestors and unrelated contents. Nonempty directory replacement and split's two publications
+are not atomic transactions; failures identify changed destinations and any recovery paths.
+Split validates both destinations before either write and, when staging, prepares both before publication.
+Fresh training allocates a new run; checkpoint resume retains its automatic rewind behavior (§2.3).
+Training's `--no-staging` controls config snapshots, resume metric rewrites, preflight reports, and
+verification reports. Trainer checkpoints are saved directly in either mode.
+
 ## 2. trlx
 
 ### 2.1 Commands
@@ -148,6 +170,7 @@ Runs after training on the final checkpoint unless `--no-verify`, as its own pro
 - Chat template in checkpoint equals the base's.
 
 Result written to `verify.json` in the run directory, or in the checkpoint directory when it is not in a run, and shown as the last output of the job. Nonzero exit on failure.
+Standalone verification requires `--force` to replace an existing report and supports `--no-staging` (§1.1).
 
 ### 2.8 Rewards
 
@@ -173,7 +196,9 @@ Only `grpo` and `rloo` policy generation requires the TRL vLLM server (per-step 
 
 ## 3. dataset
 
-Each subcommand reads one input and writes one output. Formats: JSONL, JSON array, CSV, Parquet, by extension; a path without a recognised extension is an error. Never writes in place.
+Dataset transforms read inputs and write output files; `split` writes two and `stats` only reports.
+Formats: JSONL, JSON array, CSV, Parquet, by extension; a path without a recognised extension is an error.
+Replacing an existing output or input requires `--force`; writers support `--no-staging` (§1.1).
 
 | Subcommand | Does |
 |---|---|

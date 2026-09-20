@@ -41,6 +41,13 @@ class ReferenceMatchTest(unittest.TestCase):
 
 
 class RegexTest(unittest.TestCase):
+    # Invalid config argument types fail during reward construction with domain errors.
+    def test_invalid_argument_types_are_contextual_errors(self):
+        for args in ({"pattern": 1}, {"pattern": "(.)", "group": "one", "column": "a"},
+                     {"pattern": "(.)", "group": 1, "column": []}):
+            with self.subTest(args=args), self.assertRaises(TrlxError):
+                rewards.regex(WHERE, args)
+
     def test_match_and_group(self):
         plain = rewards.regex(WHERE, {"pattern": r"\d+"})
         self.assertEqual(plain(["abc 12", "abc"]), [1.0, 0.0])
@@ -57,6 +64,12 @@ class RegexTest(unittest.TestCase):
 
 
 class PhrasesTest(unittest.TestCase):
+    # Phrase lists reject non-text values before any scoring begins.
+    def test_invalid_phrase_types_are_contextual_errors(self):
+        for values in ("hello", [1], None):
+            with self.subTest(values=values), self.assertRaisesRegex(TrlxError, "required.*list of strings"):
+                rewards.phrases(WHERE, {"required": values})
+
     def test_scores(self):
         fn = rewards.phrases(WHERE, {"required": ["Hello", "world"], "forbidden": ["oops"]})
         self.assertEqual(fn(["hello WORLD", "hello oops", "nothing"]), [1.0, -0.5, 0.0])

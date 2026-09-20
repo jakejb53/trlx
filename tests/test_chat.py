@@ -4,9 +4,11 @@ No network: StubEndpoint stands in for Endpoint and returns canned Reply
 objects in request order, which is the order build() relies on.
 """
 
+import pathlib
+import tempfile
 import unittest
 
-from dataset.chat import ANSWERS_PROMPT, QUESTIONS_PROMPT, build, strip_inline_reasoning
+from dataset.chat import ANSWERS_PROMPT, QUESTIONS_PROMPT, build, load_prompt, strip_inline_reasoning
 from dataset.endpoint import Reply
 from dataset.io import DatasetError
 
@@ -79,6 +81,17 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual(rows[0]["messages"][0]["content"], "What falls?")
         self.assertEqual(rows[0]["messages"][1]["content"], "Rain falls.")
+
+
+class PromptErrors(unittest.TestCase):
+    # Invalid prompt encodings identify the file before any generation request.
+    def test_invalid_utf8_prompt(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parent) as d:
+            path = pathlib.Path(d) / "prompt.txt"
+            path.write_bytes(b"\xff")
+            with self.assertRaisesRegex(DatasetError, "prompt is not valid UTF-8") as result:
+                load_prompt(path, QUESTIONS_PROMPT)
+            self.assertIn(str(path), str(result.exception))
 
 
 if __name__ == "__main__":

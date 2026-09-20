@@ -5,7 +5,7 @@ import pathlib
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import mock_open, patch
+from unittest.mock import patch
 
 from trlx import TrlxError, init_cmd, trainers
 from trlx.hardware import Gpu, Hardware
@@ -96,33 +96,40 @@ class InitDefaults(unittest.TestCase):
 
     # Existing operator settings must be rejected before CUDA inspection or writing.
     def test_write_refuses_existing_file(self):
-        with patch("trlx.init_cmd.pathlib.Path.exists", return_value=True):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
+            path = pathlib.Path(folder) / "run.toml"
+            path.write_text("operator settings", encoding="utf-8")
             with patch("trlx.init_cmd.hardware.inspect") as inspect:
-                with patch("trlx.init_cmd.pathlib.Path.open") as opening:
-                    with self.assertRaises(TrlxError) as caught:
-                        init_cmd.write()
-                    self.assertEqual(str(caught.exception), "run.toml already exists. Use --force to overwrite it.")
+                with self.assertRaisesRegex(TrlxError, "--force"):
+                    init_cmd.write(path)
+            self.assertEqual(path.read_text(), "operator settings")
         inspect.assert_not_called()
-        opening.assert_not_called()
 
-    # Exclusive creation also refuses a competing writer that wins after inspection.
+    # A destination created during hardware inspection must not be silently replaced.
     def test_write_refuses_creation_race(self):
-        with patch("trlx.init_cmd.pathlib.Path.exists", return_value=False):
-            with patch("trlx.init_cmd.hardware.inspect", return_value=Hardware(8, ())):
-                with patch("trlx.init_cmd.pathlib.Path.open", side_effect=FileExistsError):
-                    with self.assertRaisesRegex(TrlxError, "Use --force to overwrite it"):
-                        init_cmd.write()
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
+            path = pathlib.Path(folder) / "run.toml"
+
+            # Simulate another writer claiming the destination after initial validation.
+            def inspect():
+                path.write_text("competing settings", encoding="utf-8")
+                return Hardware(8, ())
+
+            with patch("trlx.init_cmd.hardware.inspect", side_effect=inspect):
+                with self.assertRaisesRegex(TrlxError, "--force"):
+                    init_cmd.write(path)
+            self.assertEqual(path.read_text(), "competing settings")
 
     # The CLI receives the same measured system used to produce the persisted defaults.
     def test_write_returns_snapshot_and_defaults_to_run_toml(self):
         system = Hardware(8, ())
-        opening = mock_open()
-        with patch("trlx.init_cmd.pathlib.Path.exists", return_value=False):
+        with patch("trlx.init_cmd.validate_output"):
             with patch("trlx.init_cmd.hardware.inspect", return_value=system):
-                with patch("trlx.init_cmd.pathlib.Path.open", opening):
+                with patch("trlx.init_cmd.write_text") as write:
                     self.assertIs(init_cmd.write(), system)
-        opening.assert_called_once_with("x", encoding="utf-8")
-        self.assertEqual(tomllib.loads(opening().write.call_args.args[0]), self.document(system))
+        self.assertEqual(write.call_args.args[0], "run.toml")
+        self.assertEqual(tomllib.loads(write.call_args.args[1]), self.document(system))
+        self.assertEqual(write.call_args.kwargs, {"force": False, "no_staging": False})
 
     # Forced generation replaces settings explicitly, also permitting a new path.
     def test_force_writes_fresh_defaults(self):
@@ -157,10 +164,45 @@ class InitDefaults(unittest.TestCase):
             path.write_text("operator settings", encoding="utf-8")
             with patch("trlx.init_cmd.hardware.inspect", return_value=Hardware(8, ())):
                 with patch.object(pathlib.Path, "replace", side_effect=OSError("replace failed")):
-                    with self.assertRaisesRegex(TrlxError, "cannot write: replace failed"):
+                    with self.assertRaisesRegex(TrlxError, "replace failed"):
                         init_cmd.write(str(path), force=True)
             self.assertEqual(path.read_text(), "operator settings")
             self.assertEqual(list(path.parent.iterdir()), [path])
+
+    # Force replaces the named symlink, including dangling links, without touching its target.
+    def test_force_replaces_symlink_in_both_write_modes(self):
+        for no_staging in (False, True):
+            for dangling in (False, True):
+                with self.subTest(no_staging=no_staging, dangling=dangling), \
+                     tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
+                    target = pathlib.Path(folder) / "saved.toml"
+                    if not dangling:
+                        target.write_text("saved settings", encoding="utf-8")
+                    path = pathlib.Path(folder) / "run.toml"
+                    path.symlink_to(target.name)
+                    with patch("trlx.init_cmd.hardware.inspect", return_value=Hardware(8, ())):
+                        with self.assertRaisesRegex(TrlxError, "--force"):
+                            init_cmd.write(path, no_staging=no_staging)
+                        init_cmd.write(path, force=True, no_staging=no_staging)
+                    self.assertFalse(path.is_symlink())
+                    self.assertIn("model", tomllib.loads(path.read_text()))
+                    if dangling:
+                        self.assertFalse(target.exists())
+                    else:
+                        self.assertEqual(target.read_text(), "saved settings")
+
+    # The output name authorizes replacing the entire old directory, not just config files.
+    def test_force_replaces_directory_in_both_write_modes(self):
+        for no_staging in (False, True):
+            with self.subTest(no_staging=no_staging), \
+                 tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
+                path = pathlib.Path(folder) / "run.toml"
+                path.mkdir()
+                (path / "unrelated").write_text("old contents", encoding="utf-8")
+                with patch("trlx.init_cmd.hardware.inspect", return_value=Hardware(8, ())):
+                    init_cmd.write(path, force=True, no_staging=no_staging)
+                self.assertTrue(path.is_file())
+                self.assertIn("model", tomllib.loads(path.read_text()))
 
 
 if __name__ == "__main__":

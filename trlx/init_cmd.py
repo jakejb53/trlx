@@ -6,9 +6,8 @@ distinguishes those measured capabilities from conservative starting settings.
 """
 
 import dataclasses
-import pathlib
-import tempfile
 
+from dataset.io import DatasetError, validate_output, write_text
 from trlx import TrlxError, config, hardware, trainers
 from trlx.hardware import Hardware
 from trlx.toml_write import Writer
@@ -166,43 +165,13 @@ def _default(field):
 
 
 # Existing settings require explicit replacement. Detect and render first so a
-# failed inspection cannot damage them; ordinary creation remains race-safe.
-def write(out="run.toml", force=False) -> Hardware:
-    path = pathlib.Path(out)
-    exists_message = f"{out} already exists. Use --force to overwrite it."
-    if path.exists() and not force:
-        raise TrlxError(exists_message)
-    system = hardware.inspect()
-    text = render(system)
+# failed inspection cannot damage them, including with direct publication.
+def write(out="run.toml", force=False, no_staging=False) -> Hardware:
     try:
-        if force:
-            _replace(path, text)
-        else:
-            with path.open("x", encoding="utf-8") as handle:
-                handle.write(text)
-    except FileExistsError as exc:
-        raise TrlxError(exists_message) from exc
-    except OSError as exc:
-        raise TrlxError(f"{out}: cannot write: {exc.strerror or exc}") from exc
+        validate_output(out, force=force)
+        system = hardware.inspect()
+        text = render(system)
+        write_text(out, text, force=force, no_staging=no_staging)
+    except DatasetError as exc:
+        raise TrlxError(str(exc)) from exc
     return system
-
-
-# Publish a forced replacement only after the complete file is written. A failed
-# write or replace leaves the original intact; temporary files stay beside it.
-def _replace(path, text):
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=f".{path.name}.", delete=False) as handle:
-            temporary = pathlib.Path(handle.name)
-            handle.write(text)
-        try:
-            mode = path.stat().st_mode & 0o777
-        except FileNotFoundError:
-            pass  # --force also permits first-time creation.
-        else:
-            temporary.chmod(mode)
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)

@@ -59,6 +59,8 @@ def normalise(text):
 # Argument check shared by the factories. `spec` maps each accepted name to
 # True when required. Values are validated by the factory itself.
 def _args(where, args, spec):
+    if not isinstance(args, dict):
+        raise TrlxError(f"{where}: args must be a table")
     unknown = sorted(set(args) - set(spec))
     if unknown:
         raise TrlxError(f"{where}: unknown args {', '.join(unknown)}; accepted: {', '.join(spec)}")
@@ -78,6 +80,8 @@ def _column(where, kwargs, column):
 def reference_match(where, args):
     _args(where, args, {"column": True, "mode": True, "threshold": False})
     column, mode = args["column"], args["mode"]
+    if not isinstance(column, str):
+        raise TrlxError(f"{where}: column must be a dataset column name")
     if mode not in ("equals", "contains", "fuzzy"):
         raise TrlxError(f"{where}: mode must be equals, contains, or fuzzy, got {mode!r}")
     threshold = args.get("threshold")
@@ -108,11 +112,15 @@ def regex(where, args):
     _args(where, args, {"pattern": True, "group": False, "column": False})
     try:
         pattern = re.compile(args["pattern"], re.DOTALL)
-    except re.error as e:
+    except (re.error, TypeError) as e:
         raise TrlxError(f"{where}: invalid pattern: {e}")
     group, column = args.get("group"), args.get("column")
     if (group is None) != (column is None):
         raise TrlxError(f"{where}: group and column go together")
+    if group is not None and (type(group) is not int or group < 0):
+        raise TrlxError(f"{where}: group must be a nonnegative integer")
+    if column is not None and not isinstance(column, str):
+        raise TrlxError(f"{where}: column must be a dataset column name")
     if group is not None and group > pattern.groups:
         raise TrlxError(f"{where}: pattern has {pattern.groups} groups, group {group} does not exist")
 
@@ -137,6 +145,10 @@ def regex(where, args):
 # present, case-insensitive; in [-1, 1]. An empty list contributes 0.
 def phrases(where, args):
     _args(where, args, {"required": False, "forbidden": False})
+    for key in ("required", "forbidden"):
+        values = args.get(key, [])
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise TrlxError(f"{where}: {key} must be a list of strings")
     required = [p.lower() for p in args.get("required", [])]
     forbidden = [p.lower() for p in args.get("forbidden", [])]
     if not required and not forbidden:
@@ -232,6 +244,10 @@ def llm_judge(where, args):
     # commit. The variable may come from .env (dataset/env.py) or the real
     # environment.
     api_key = None
+    if "api_key" in args and not isinstance(args["api_key"], str):
+        raise TrlxError(f"{where}: api_key must name an environment variable")
+    if not isinstance(args["rubric"], str):
+        raise TrlxError(f"{where}: rubric must be text")
     if args.get("api_key"):
         api_key = os.environ.get(args["api_key"])
         if not api_key:

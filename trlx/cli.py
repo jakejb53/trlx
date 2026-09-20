@@ -18,7 +18,7 @@ STRATEGIES = ["ddp", "fsdp"]
 def _cmd_init(args):
     from trlx import init_cmd
 
-    system = init_cmd.write(args.out, force=args.force)
+    system = init_cmd.write(args.out, force=args.force, no_staging=args.no_staging)
     print(f"wrote {args.out} for {len(system.gpus)} visible GPU(s), {system.cpu_count} logical processor(s)")
     return 0
 
@@ -27,7 +27,7 @@ def _cmd_init(args):
 def _cmd_merge(args):
     from trlx import merge
 
-    merge.merge(args.base, args.adapter, args.out)
+    merge.merge(args.base, args.adapter, args.out, force=args.force, no_staging=args.no_staging)
     return 0
 
 
@@ -64,7 +64,8 @@ def _cmd_verify(args):
     from trlx import config, verify
 
     prompts = config.dataset_ref("trlx verify", "--prompts", args.prompts) if args.prompts else None
-    return 0 if verify.run(args.checkpoint, args.base, prompts).ok else 1
+    return 0 if verify.run(args.checkpoint, args.base, prompts,
+                          force=args.force, no_staging=args.no_staging).ok else 1
 
 
 # Generate replay rows locally or through a configured endpoint.
@@ -99,6 +100,10 @@ def _training_examples(method):
 
 # Launch options have no argparse defaults that could overwrite saved settings.
 def _run_options(parser, training):
+    parser.add_argument("--force", action="store_true", help="authorize destructive output replacement")
+    if training:
+        parser.add_argument("--no-staging", action="store_true",
+                            help="write outputs directly; failures can leave incomplete outputs")
     parser.add_argument("--config", default="run.toml",
                         help="fresh-run settings (default: run.toml); resume loads the selected run's saved config")
     parser.add_argument("--gpus", dest="override:run.gpus", default=argparse.SUPPRESS,
@@ -136,6 +141,7 @@ def build_parser(method=None):
     p.add_argument("--out", default="run.toml", help="config file to create (default: run.toml)")
     p.add_argument("--force", action="store_true",
                    help="overwrite the config with fresh environment defaults, discarding saved edits")
+    p.add_argument("--no-staging", action="store_true", help="write directly; failure can discard saved settings")
     p.set_defaults(func=_cmd_init)
 
     # One subparser per method; all share the run flag set.
@@ -170,6 +176,7 @@ def build_parser(method=None):
                               "Line mode prints once. The TUI refreshes until q and includes logs/reports.")
     p.add_argument("run", help="run directory containing config.toml and metrics.jsonl")
     p.add_argument("--tui", action="store_true", help="full-screen view (default: print metric lines)")
+    p.add_argument("--force", action="store_true", help="accepted for consistency; show only reads files")
     p.set_defaults(func=_cmd_show)
 
     p = sub.add_parser("check", help="check a training setup without training", formatter_class=HelpFormatter,
@@ -195,14 +202,19 @@ def build_parser(method=None):
     p.add_argument("checkpoint", help="checkpoint directory")
     p.add_argument("--base", required=True, help="base model path")
     p.add_argument("--prompts", help="prompt/messages dataset for comparison (default: built-in prompts)")
+    p.add_argument("--force", action="store_true", help="replace an existing verify.json report")
+    p.add_argument("--no-staging", action="store_true", help="write the report directly; failure can discard the old report")
     p.set_defaults(func=_cmd_verify)
 
     p = sub.add_parser("merge", help="merge a LoRA adapter into its base model", formatter_class=HelpFormatter,
-                       description="Validate adapter loading, then save merged model and processor. Output must not exist.",
+                       description="Validate adapter loading, then save merged model and processor. Existing output requires --force.",
                        epilog="Example:\n  trlx merge --base BASE --adapter ADAPTER --out merged-model")
     p.add_argument("--base", required=True, help="base model path")
     p.add_argument("--adapter", required=True, help="adapter directory")
     p.add_argument("--out", required=True, help="output directory")
+    p.add_argument("--force", action="store_true", help="replace the output directory and all its contents, including inputs")
+    p.add_argument("--no-staging", action="store_true",
+                   help="write directly; failure can destroy old output; unavailable when replacing an input or its ancestor")
     p.set_defaults(func=_cmd_merge)
 
     # --model is always the model identifier: a path or HF id locally, the
@@ -210,7 +222,7 @@ def build_parser(method=None):
     # brings the connection flags dataset chat uses (SPEC 2.1, 2.10).
     p = sub.add_parser("replay-build", help="generate a messages dataset for replay", formatter_class=HelpFormatter,
                        description="Generate one completion per prompt. Output format follows its extension; "
-                                   "never writes over the input. Local generation uses the model's dtype.",
+                                   "existing outputs or inputs require --force. Local generation uses the model's dtype.",
                        epilog="Examples:\n"
                               "  trlx replay-build --model MODEL --prompts prompts.jsonl --out replay.jsonl --max-tokens 256\n"
                               "  trlx replay-build --model MODEL --endpoint URL --prompts prompts.jsonl --out replay.jsonl \\\n"
@@ -227,6 +239,8 @@ def build_parser(method=None):
     p.add_argument("--retries", type=int, help="nonnegative retry count after first attempt; required with --endpoint")
     p.add_argument("--concurrency", type=int, help="positive parallel request count; required with --endpoint")
     p.add_argument("--api-key", metavar="ENVVAR", help="endpoint only; environment variable holding the key")
+    p.add_argument("--force", action="store_true", help="replace existing output, including the prompts input")
+    p.add_argument("--no-staging", action="store_true", help="write directly; failure can discard the old output")
     p.set_defaults(func=_cmd_replay_build)
 
     return parser

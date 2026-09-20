@@ -129,7 +129,7 @@ def _total_memory(physical):
 # Starts one worker per selected device over the supervisor's resolved snapshot.
 # stdout and stderr go to log.txt (`log_file`, an open handle). With one
 # device no distributed variables are set, so accelerate runs single-process.
-def spawn(method, config_path, strategy, physical, log_file):
+def spawn(method, config_path, strategy, physical, log_file, *, force=False, no_staging=False):
     world = len(physical)
     port = _free_port() if world > 1 else None
     procs = []
@@ -146,6 +146,10 @@ def spawn(method, config_path, strategy, physical, log_file):
         # Internal launch facts are separate from user configuration overrides.
         cmd = [sys.executable, "-m", "trlx.cli", method, "--config", str(config_path),
                "--_rank", str(rank), "--_strategy", strategy]
+        if force:
+            cmd.append("--force")
+        if no_staging:
+            cmd.append("--no-staging")
         try:
             procs.append(subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT))
         except OSError as e:
@@ -175,11 +179,15 @@ def running(procs):
 # command on the run's final checkpoint, with every selected device visible
 # so a model larger than one GPU can spread across them. Output joins
 # log.txt like the workers'.
-def spawn_verify(checkpoint, base, prompts, physical, log_file):
+def spawn_verify(checkpoint, base, prompts, physical, log_file, *, force=False, no_staging=False):
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(physical))
     cmd = [sys.executable, "-m", "trlx.cli", "verify", str(checkpoint), "--base", base]
     if prompts is not None:
         cmd += ["--prompts", prompts]
+    if force:
+        cmd.append("--force")
+    if no_staging:
+        cmd.append("--no-staging")
     try:
         return subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
     except OSError as e:

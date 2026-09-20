@@ -28,10 +28,12 @@ import pathlib
 import sys
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import torch
 
+from dataset.io import DatasetError, write_text
 from trlx import TrlxError, run_dirs, show
 
 # Seconds allowed for the vLLM server health probe. A connection that takes
@@ -73,12 +75,13 @@ class Report:
         self.lines.clear()
 
     # Writes preflight.json, replacing an earlier write from a previous stage.
-    def write(self, run_dir):
+    def write(self, run_dir, *, no_staging=False):
         path = pathlib.Path(run_dir) / show.PREFLIGHT_FILENAME
         try:
-            path.write_text(json.dumps(self.to_dict(), indent=1) + "\n", encoding="utf-8")
-        except OSError as e:
-            raise TrlxError(f"{path}: cannot write: {e.strerror or e}")
+            # Both stages belong to the same run; updating its report is already authorized.
+            write_text(path, json.dumps(self.to_dict(), indent=1) + "\n", force=True, no_staging=no_staging)
+        except DatasetError as e:
+            raise TrlxError(str(e)) from e
 
 
 # Config-only fatal checks. `config_path` is the operator's file and
@@ -122,7 +125,7 @@ def _check_resume(cfg, config_path, strategy):
             snapshot = tomllib.load(f)
     except FileNotFoundError as e:
         raise TrlxError(f"resume_from_checkpoint is set but {e.filename} does not exist")
-    except (OSError, tomllib.TOMLDecodeError) as e:
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as e:
         raise TrlxError(f"{snapshot_path}: cannot read snapshot: {e}")
     saved_method = snapshot.get("launch", {}).get("method")
     if saved_method != cfg.method.name:
@@ -190,19 +193,30 @@ def _check_vllm(cfg):
     base = cfg.args.vllm_server_base_url or f"http://{cfg.args.vllm_server_host}:{cfg.args.vllm_server_port}"
     url = base.rstrip("/") + VLLM_PROBE_PATH
     try:
+        parsed = urllib.parse.urlsplit(base)
+    except ValueError as e:
+        raise TrlxError("vllm_server_base_url: invalid URL; supply the TRL vLLM server's HTTP(S) address") from e
+    # Network exceptions can echo credentials as well as the URL itself.
+    display_base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
+    display_url = display_base.rstrip("/") + VLLM_PROBE_PATH
+    try:
         with urllib.request.urlopen(url, timeout=VLLM_PROBE_SECONDS) as response:
             status = response.status
     except urllib.error.HTTPError as e:
         raise TrlxError(
-            f"{base} answered {e.code} on {VLLM_PROBE_PATH}: a server is listening but it is not the TRL vLLM "
+            f"{display_base} answered {e.code} on {VLLM_PROBE_PATH}: a server is listening but it is not the TRL vLLM "
             "server (start it with `trl vllm-serve`)"
         )
     except urllib.error.URLError as e:
-        raise TrlxError(f"TRL vLLM server unreachable at {url}: {e.reason}")
+        raise TrlxError(f"TRL vLLM server unreachable at {display_url}; check its address, network access, "
+                        "and that `trl vllm-serve` is running") from e
     except OSError as e:
-        raise TrlxError(f"TRL vLLM server unreachable at {url}: {e}")
+        raise TrlxError(f"TRL vLLM server unreachable at {display_url} ({type(e).__name__}); "
+                        "check network access and that `trl vllm-serve` is running") from e
+    except (ValueError, UnicodeError) as e:
+        raise TrlxError("vllm_server_base_url: invalid request URL; check the address and credentials") from e
     if status != 200:
-        raise TrlxError(f"TRL vLLM server at {url} answered {status}, not 200")
+        raise TrlxError(f"TRL vLLM server at {display_url} answered {status}, not 200")
 
 
 # Checks on the built trainer, before training. Fatal ones raise; the rest
@@ -480,18 +494,19 @@ def callback_class():
     from transformers import TrainerCallback
 
     class PreflightCallback(TrainerCallback):
-        def __init__(self, cfg, processor, train_set, report, run_dir, rank):
+        def __init__(self, cfg, processor, train_set, report, run_dir, rank, *, no_staging=False):
             self.cfg = cfg
             self.processor = processor
             self.train_set = train_set
             self.report = report
             self.run_dir = run_dir
             self.rank = rank
+            self.no_staging = no_staging
 
         def on_train_begin(self, args, state, control, model=None, **kwargs):
             check_offpolicy(self.cfg, model, self.processor, self.train_set, self.report)
             if self.rank == 0:
                 self.report.flush()
-                self.report.write(self.run_dir)
+                self.report.write(self.run_dir, no_staging=self.no_staging)
 
     return PreflightCallback

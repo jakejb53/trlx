@@ -8,6 +8,7 @@ import dataclasses
 import pathlib
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from trlx import TrlxError, config, init_cmd, trainers
 from trlx.hardware import Hardware
@@ -49,6 +50,41 @@ class ConfigCase(unittest.TestCase):
         with self.assertRaises(TrlxError) as ctx:
             self.load(top, method, text)
         self.assertIn(fragment, str(ctx.exception))
+
+
+class CredentialErrors(unittest.TestCase):
+    # Credential diagnostics retain the field/type without exposing a malformed secret value.
+    def test_wrong_credential_type_omits_value(self):
+        fields = ("hub_token", "push_to_hub_token")
+        args = dataclasses.make_dataclass("CredentialArguments", [(key, str) for key in fields])
+        method = SimpleNamespace(config_cls=args, blocks=())
+        for key in fields:
+            with self.subTest(key=key), self.assertRaises(TrlxError) as caught:
+                config._build_args("private.toml", method, {key: ["private-token-value"]}, True, None, None)
+            message = str(caught.exception)
+            self.assertIn(key, message)
+            self.assertIn("got list", message)
+            self.assertNotIn("private-token-value", message)
+
+
+class ConfigReadErrors(ConfigCase):
+    # Missing snapshots need restoration; newly initialized defaults cannot resume an old run.
+    def test_missing_file_names_path_and_recovery(self):
+        path = self.dir / "missing.toml"
+        with self.assertRaises(TrlxError) as caught:
+            config._read_toml(path)
+        message = str(caught.exception)
+        for fragment in (str(path), "--config", "trlx init", "original config.toml snapshot"):
+            self.assertIn(fragment, message)
+
+    # TOML decoding failures must identify the input instead of escaping as Unicode tracebacks.
+    def test_invalid_utf8_names_path_and_encoding(self):
+        path = self.dir / "run.toml"
+        path.write_bytes(b"key = '\xff'\n")
+        with self.assertRaises(TrlxError) as caught:
+            config._read_toml(path)
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIn("UTF-8", str(caught.exception))
 
 
 class TopLevelKeys(ConfigCase):

@@ -14,6 +14,8 @@ import os
 import pathlib
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 # Outside a distributed run, transformers' Trainer multiplies the per-device
 # batch size by the visible device count (nn.DataParallel), which changes both
@@ -41,6 +43,15 @@ REPLAY = [_row(f"Name a colour number {i}.", f"Colour {i} is blue.") for i in ra
 
 
 class MixReplayTest(unittest.TestCase):
+    # The KL row marker must not silently replace a column supplied by either input.
+    def test_reserved_replay_column_is_contextual_error(self):
+        train = datasets.Dataset.from_list([{"text": "train", "replay": "operator value"}])
+        replay = datasets.Dataset.from_list([{"text": "replay", "replay": "operator value"}])
+        spec = SimpleNamespace(dataset=SimpleNamespace(source="replay.jsonl"), fraction=0.5)
+        with patch("trlx.data_load.load_ref", return_value=replay):
+            with self.assertRaisesRegex(TrlxError, "replay.*reserved.*rename"):
+                data_load.mix_replay(train, spec, flag=True)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = pathlib.Path(self._tmp.name)

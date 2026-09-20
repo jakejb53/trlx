@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from dataset.heal import heal_file, heal_json, heal_jsonl
+from dataset.io import DatasetError
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -107,3 +108,28 @@ class HealFile(unittest.TestCase):
             self.assertEqual(len(repairs), 1)
             self.assertEqual(errors, [])
             self.assertEqual(dst.read_text(), '{"a": 1}\n{"b": 2}\n')
+
+    # Healing follows the named symlink but reads all input before modifying its target.
+    def test_in_place_symlink_repair_preserves_link(self):
+        for no_staging in (False, True):
+            with self.subTest(no_staging=no_staging), tempfile.TemporaryDirectory(dir=ROOT) as d:
+                src = pathlib.Path(d) / "in.jsonl"
+                link = pathlib.Path(d) / "link.jsonl"
+                src.write_text('{"a": 1,}\n', encoding="utf-8")
+                link.symlink_to(src)
+                with self.assertRaisesRegex(DatasetError, "--force"):
+                    heal_file(link, link)
+                repairs, errors = heal_file(link, link, force=True, no_staging=no_staging)
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(src.read_text(), '{"a": 1}\n')
+                self.assertEqual((len(repairs), errors), (1, []))
+
+    # Decode failures never damage a pre-existing forced destination.
+    def test_invalid_utf8_preserves_output(self):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            src, dst = pathlib.Path(d) / "in.jsonl", pathlib.Path(d) / "out.jsonl"
+            src.write_bytes(b"\xff")
+            dst.write_text("original", encoding="utf-8")
+            with self.assertRaisesRegex(DatasetError, "UTF-8"):
+                heal_file(src, dst, force=True)
+            self.assertEqual(dst.read_text(), "original")

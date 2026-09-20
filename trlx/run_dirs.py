@@ -11,6 +11,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 
+from dataset.io import DatasetError, write_text
 from trlx import TrlxError, metrics, show
 
 
@@ -137,9 +138,15 @@ def inspect_checkpoint(checkpoint):
     return Resume(checkpoint, step)
 
 
-# Publish complete metadata without truncating the previous snapshot or metric history.
-def write_atomic(path, text):
+# Run-owned metadata stages by default; direct writes explicitly accept partial history.
+def write_atomic(path, text, *, no_staging=False):
     path = pathlib.Path(path)
+    if no_staging:
+        try:
+            write_text(path, text, force=True, no_staging=True)
+        except DatasetError as e:
+            raise TrlxError(str(e)) from e
+        return
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -157,7 +164,7 @@ def write_atomic(path, text):
 # A checkpoint selection authorizes discarding its abandoned continuation, not its logs.
 # Validate all metric records before changing anything. Multi-file cleanup is not atomic;
 # failures name the affected path and leave the selected checkpoint available for retry.
-def rewind(resume):
+def rewind(resume, *, no_staging=False):
     directory = resume.directory
     metric_path = directory / metrics.FILENAME
     records = metrics.read(metric_path) if metric_path.exists() else []
@@ -186,7 +193,7 @@ def rewind(resume):
             path.unlink(missing_ok=True)
         path = metric_path
         if metric_path.exists():
-            write_atomic(metric_path, text)
+            write_atomic(metric_path, text, no_staging=no_staging)
     except OSError as error:
         raise TrlxError(
             f"{path}: resume cleanup failed: {error}; cleanup may be partial; "

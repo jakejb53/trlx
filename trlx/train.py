@@ -85,7 +85,11 @@ def _supervise(args):
     # Retain exclusive ownership through verification; another supervisor must not
     # rewind files while this job's workers or verification are still using them.
     with run_dirs.locked(run_dir):
-        return _run_job(args, cfg, run_dir, physical, strategy, startup)
+        try:
+            return _run_job(args, cfg, run_dir, physical, strategy, startup)
+        except OSError as e:
+            raise TrlxError(f"{e.filename or run_dir}: training supervisor I/O failed: {e}; "
+                            "check available space and permissions") from e
 
 
 # The directory is owned and config preflight has passed before history is changed.
@@ -96,11 +100,15 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
         startup = f"run directory: {run_dir}\n{startup}"
         if cfg.args.resume_from_checkpoint:
             resume = run_dirs.inspect_checkpoint(cfg.args.resume_from_checkpoint)
-            retained, marker = run_dirs.rewind(resume)
+            retained, marker = run_dirs.rewind(resume, no_staging=getattr(args, "no_staging", False))
             startup = f"{marker}\n{startup}"
-        snapshot = _write_snapshot(cfg, run_dir, physical, strategy)
-        log_file.write((startup + "\n").encode("utf-8"))
-        log_file.flush()
+        snapshot = _write_snapshot(cfg, run_dir, physical, strategy,
+                                   no_staging=getattr(args, "no_staging", False))
+        try:
+            log_file.write((startup + "\n").encode("utf-8"))
+            log_file.flush()
+        except OSError as e:
+            raise TrlxError(f"{log_path}: cannot write startup log: {e}; check available space and permissions") from e
         # Capture the boundary before workers start, including fast first writes.
         # Startup is printed below; only subsequent log bytes need mirroring.
         log_offset = log_file.tell()
@@ -117,7 +125,8 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
             print(startup, file=sys.stderr, flush=True)
         except Exception as error:
             on_display_error(error)
-        workers = launch.spawn(args.command, str(snapshot), strategy, physical, log_file)
+        workers = launch.spawn(args.command, str(snapshot), strategy, physical, log_file,
+                               force=getattr(args, "force", False), no_staging=getattr(args, "no_staging", False))
         start_verify = None
         if not args.no_verify:
             # Called by the Job once the workers are done: the checkpoint to
@@ -125,7 +134,9 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
             def start_verify():
                 checkpoint = _final_checkpoint(run_dir)
                 prompts = _dataset_arg(cfg.verify_prompts)
-                return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, log_file)
+                return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, log_file,
+                                           force=getattr(args, "force", False),
+                                           no_staging=getattr(args, "no_staging", False))
 
         job = launch.Job(workers, start_verify)
         try:
@@ -294,6 +305,8 @@ def _dataset_arg(ref):
 
 # Worker side. Everything printed here lands in log.txt.
 def _worker(args):
+    import torch
+
     rank = args._rank
     fsdp = "full_shard" if args._strategy == "fsdp" else None
     cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
@@ -310,7 +323,8 @@ def _worker(args):
     # callback because the forward-pass check is a collective under FSDP.
     # Other ranks' reports are discarded.
     report = preflight.Report()
-    callbacks = [preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank)]
+    callbacks = [preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
+                                            no_staging=getattr(args, "no_staging", False))]
     if rank == 0:
         callbacks.append(metrics.callback_class()(run_dir))
     trainer = build_trainer(cfg, model, processor, train_set, eval_set, callbacks)
@@ -321,8 +335,15 @@ def _worker(args):
             preflight.check_trainer(cfg, trainer, train_set, report)
         finally:
             report.flush()
-        report.write(run_dir)
-    trainer.train(resume_from_checkpoint=cfg.args.resume_from_checkpoint)
+        report.write(run_dir, no_staging=getattr(args, "no_staging", False))
+    try:
+        trainer.train(resume_from_checkpoint=cfg.args.resume_from_checkpoint)
+    except torch.cuda.OutOfMemoryError as e:
+        raise TrlxError("CUDA memory exhausted during training; reduce batch size or sequence length, "
+                        "or use more GPU memory") from e
+    except OSError as e:
+        raise TrlxError(f"{e.filename or run_dir}: training I/O failed: {e}; "
+                        "check available space and permissions") from e
     return 0
 
 
@@ -465,13 +486,13 @@ def _create_run_dir(cfg):
 # Snapshot the selected method and CLI values once, before spawning workers.
 # The operator's file is untouched; workers consume this exact hand-off instead.
 # Atomic publication preserves a readable resume source if writing fails.
-def _write_snapshot(cfg, run_dir, physical, strategy):
+def _write_snapshot(cfg, run_dir, physical, strategy, *, no_staging=False):
     dest = run_dir / show.CONFIG_FILENAME
     document = dict(cfg.document)
     document["run_name"] = cfg.args.run_name
     document["launch"] = {"method": cfg.method.name, "strategy": strategy, "gpus": list(physical)}
     try:
-        run_dirs.write_atomic(dest, toml_write.dumps(document))
+        run_dirs.write_atomic(dest, toml_write.dumps(document), no_staging=no_staging)
     except OSError as e:
         raise TrlxError(f"{dest}: cannot write snapshot: {e.strerror or e}")
     return dest

@@ -18,11 +18,38 @@ class Interface(unittest.TestCase):
 
     # Explicit overwrite reaches the writer for the selected output path only.
     def test_init_force_is_forwarded(self):
-        with patch.object(cli, "load_env"), \
-             patch("trlx.init_cmd.write", return_value=hardware.Hardware(8, ())) as write, \
-             contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["init", "--force", "--out", "alternate.toml"]), 0)
-        write.assert_called_once_with("alternate.toml", force=True)
+        for flags, no_staging in (([], False), (["--no-staging"], True)):
+            with self.subTest(no_staging=no_staging), patch.object(cli, "load_env"), \
+                 patch("trlx.init_cmd.write", return_value=hardware.Hardware(8, ())) as write, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["init", "--force", "--out", "alternate.toml", *flags]), 0)
+            write.assert_called_once_with("alternate.toml", force=True, no_staging=no_staging)
+
+    # Force is an execution control even on commands with no destructive output work.
+    def test_force_is_accepted_without_becoming_a_config_override(self):
+        commands = [[method] for method in cli.METHODS]
+        commands += [["check", method] for method in cli.METHODS]
+        commands += [["init"], ["show", "runs/example"], ["verify", "checkpoint", "--base", "base"],
+                     ["merge", "--base", "base", "--adapter", "adapter", "--out", "merged"],
+                     ["replay-build", "--model", "model", "--prompts", "prompts.jsonl",
+                      "--out", "replay.jsonl", "--max-tokens", "10"]]
+        for command in commands:
+            with self.subTest(command=command):
+                args = cli.parse_args([*command, "--force"])
+                self.assertTrue(args.force)
+                self.assertNotIn("force", options.overrides(args))
+
+    # Direct publication is independently selectable and never implies replacement permission.
+    def test_no_staging_does_not_imply_force(self):
+        for command in (["init"], ["verify", "checkpoint", "--base", "base"],
+                        ["merge", "--base", "base", "--adapter", "adapter", "--out", "merged"],
+                        ["replay-build", "--model", "model", "--prompts", "prompts.jsonl",
+                         "--out", "replay.jsonl", "--max-tokens", "10"]):
+            with self.subTest(command=command):
+                args = cli.parse_args([*command, "--no-staging"])
+                self.assertTrue(args.no_staging)
+                self.assertFalse(args.force)
+                self.assertNotIn("no_staging", options.overrides(args))
 
     # Every method supports the same minimal model/data invocation.
     def test_minimal_training_inputs(self):

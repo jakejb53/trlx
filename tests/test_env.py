@@ -15,7 +15,7 @@ from dataset.io import DatasetError
 
 class EnvLoadTest(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parent)
         self.dir = pathlib.Path(self._tmp.name)
         self._environ = dict(os.environ)
 
@@ -61,6 +61,21 @@ class EnvLoadTest(unittest.TestCase):
         path = self.write("TRLX_TEST_A=one\nnot a pair\n")
         with self.assertRaisesRegex(DatasetError, "line 2: expected KEY=value"):
             load(path)
+
+    # Credential errors identify a line without disclosing its contents.
+    def test_nul_reports_line_without_secret(self):
+        path = self.write("TRLX_TEST_SECRET=private-value\0suffix\n")
+        with self.assertRaisesRegex(DatasetError, "line 1.*NUL") as result:
+            load(path)
+        self.assertNotIn("private-value", str(result.exception))
+
+    # Decode errors also omit the raw environment bytes.
+    def test_invalid_utf8(self):
+        path = self.dir / ".env"
+        path.write_bytes(b"TRLX_TEST_SECRET=private\xff")
+        with self.assertRaisesRegex(DatasetError, "UTF-8") as result:
+            load(path)
+        self.assertNotIn("private", str(result.exception))
 
 
 if __name__ == "__main__":

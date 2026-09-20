@@ -82,6 +82,21 @@ class AdapterCheck(unittest.TestCase):
             adapter_check.file_stats(self._tmp.name)
         self.assertIn("not an adapter directory", str(ctx.exception))
 
+    # Deserialization errors identify the adapter file instead of exposing a library traceback.
+    def test_corrupt_adapter_weights_name_file(self):
+        (self.dir / adapter_check.ADAPTER_FILE).write_bytes(b"not safetensors")
+        with self.assertRaisesRegex(TrlxError, "adapter_model.safetensors.*cannot read"):
+            adapter_check.file_stats(self.dir)
+
+    # Valid JSON with the wrong shape and invalid text encoding are both input errors.
+    def test_invalid_adapter_metadata_names_file(self):
+        metadata = self.dir / "adapter_config.json"
+        for content in (b"[]", b"null", b"\xff"):
+            with self.subTest(content=content):
+                metadata.write_bytes(content)
+                with self.assertRaisesRegex(TrlxError, "adapter_config.json"):
+                    adapter_check.task_type(self.dir)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,9 @@ def load(path=FILENAME):
     except FileNotFoundError:
         return []
     except OSError as e:
-        raise DatasetError(f"{path}: {e.strerror}")
+        raise DatasetError(f"{path}: cannot read: {e.strerror or e}; check the path and permissions")
+    except UnicodeError:
+        raise DatasetError(f"{path}: environment file is not valid UTF-8; save it as UTF-8")
 
     assigned = []
     for number, line in enumerate(lines, 1):
@@ -42,6 +44,9 @@ def load(path=FILENAME):
         # "\"literal\"" rather than losing its outer characters by accident.
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        # Name only the line: either side may contain credential material.
+        if "\0" in key or "\0" in value:
+            raise DatasetError(f"{path}: line {number}: environment entry contains NUL; remove the NUL character")
         if key not in os.environ:
             os.environ[key] = value
             assigned.append(key)

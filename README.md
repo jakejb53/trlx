@@ -114,15 +114,46 @@ trlx replay-build --help
 ```
 
 Uppercase names are placeholders; replace them with your own inputs. Paths are
-relative to the working directory. Fresh runs allocate a new subdirectory;
-`init` requires `--force` to replace an existing config; `merge` refuses an existing output directory.
+relative to the working directory. Every command accepts `--force`. Without it,
+destructive operations are refused with their consequences and the flag needed to proceed.
+With it, the requested replacement proceeds without another confirmation, including replacing
+inputs or directories containing unrelated files. Destructive replacement replaces symlinks
+themselves and leaves their targets alone; healing follows symlinks to repair their targets.
+
+| Command                  | Replacement authorized by --force                         |
+| ------------------------ | --------------------------------------------------------- |
+| trlx init                | Existing config path, replaced with fresh defaults        |
+| trlx merge               | Entire output path, including base/adapter input paths    |
+| trlx replay-build        | Existing output dataset, including an input path          |
+| trlx verify              | Existing verify.json report                               |
+| dataset writers          | Existing outputs, including inputs; heal repairs them     |
+| Training                 | Auto verify report; new runs and resume rewind unchanged  |
+| check/show/dataset stats | No destructive output                                     |
+
+`init`, `merge`, `replay-build`, `verify`, and dataset writers prepare complete outputs in
+staging space by default. Add `--no-staging` to write directly after required inputs are read.
+It saves staging disk space but a write failure can lose the original and leave incomplete output.
+Existing destinations still require `--force`; `--no-staging` does not grant replacement permission.
+Merge requires disk staging when replacing its base, adapter, or a directory containing either.
+For those in-place merges, omit `--no-staging`; an incompatible request is rejected before loading inputs.
+Directory replacement and publishing both split outputs are not atomic transactions.
+Training also accepts `--no-staging` for its config snapshot, resume metric rewrite, preflight reports,
+and verification report. Trainer checkpoints are saved directly in either mode.
+
+```sh
+# Replace a separate old merge directly; MERGED must not contain BASE or ADAPTER.
+trlx merge --base BASE --adapter ADAPTER --out MERGED --force --no-staging
+
+# Replace the base model using default disk staging.
+trlx merge --base BASE --adapter ADAPTER --out BASE --force
+```
 
 ## Dataset cheat sheet
 
 `dataset` works independently of TRL. Files may be JSONL (one object per line), JSON
 (an array of objects), CSV, or Parquet. The output extension selects the file format.
-CSV cells are strings; use JSONL or Parquet for nested messages. Outputs must differ
-from inputs; existing output files can be replaced.
+CSV cells are strings; use JSONL or Parquet for nested messages. Replacing an existing
+output or input requires `--force`. All writers support `--no-staging` for direct writes.
 
 ```sh
 # Convert the file format, or reshape prompt/completion rows into messages.

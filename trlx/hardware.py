@@ -27,8 +27,11 @@ class Hardware:
 def inspect() -> Hardware:
     try:
         import torch
-    except ImportError as exc:
-        raise TrlxError(f"cannot inspect hardware: importing PyTorch failed: {exc}") from exc
+    except (ImportError, OSError) as exc:
+        raise TrlxError(
+            f"cannot inspect hardware: importing PyTorch failed: {exc}; "
+            "check the PyTorch installation and its shared-library dependencies"
+        ) from exc
 
     try:
         cpu_count = os.cpu_count()

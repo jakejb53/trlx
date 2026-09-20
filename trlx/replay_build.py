@@ -14,7 +14,7 @@ operational config, so it has no default.
 import os
 
 from dataset.endpoint import DatasetError, Endpoint
-from dataset.io import write_rows
+from dataset.io import validate_rows_output, write_rows
 from trlx import TrlxError, config as config_mod, generate, model as model_mod
 
 # Flags that only mean something with --endpoint; the first three are
@@ -26,6 +26,10 @@ ENDPOINT_FLAGS = ENDPOINT_REQUIRED + ("api_key",)
 # Entry point for the subcommand. `args` is the argparse namespace.
 def run(args):
     _check_flags(args)
+    try:
+        validate_rows_output(args.out, args.force)
+    except DatasetError as e:
+        raise TrlxError(str(e)) from e
     ref = config_mod.dataset_ref("trlx replay-build", "--prompts", args.prompts)
     prompts = generate.prompts_from(ref)
     if args.endpoint is not None:
@@ -33,11 +37,10 @@ def run(args):
     else:
         replies = _from_local(args, prompts)
     rows = [{"messages": _turns(p) + [{"role": "assistant", "content": r}]} for p, r in zip(prompts, replies)]
-    # Never in place: the prompts file is the one input that could be named
-    # as the output.
+    # Prompts and completions are fully materialized before replacing either input.
     inputs = [args.prompts] if ref.is_file else ()
     try:
-        write_rows(args.out, rows, inputs)
+        write_rows(args.out, rows, inputs, force=args.force, no_staging=args.no_staging)
     except DatasetError as e:
         raise TrlxError(str(e))
     empty = sum(not r for r in replies)
@@ -92,7 +95,7 @@ def _from_endpoint(args, prompts):
             raise TrlxError(f"--api-key: environment variable {args.api_key} is not set")
     try:
         endpoint = Endpoint(args.endpoint, args.model, api_key, args.timeout, args.retries)
-        print(f"sampling {len(prompts)} prompts from {args.model} at {args.endpoint}", flush=True)
+        print(f"sampling {len(prompts)} prompts from {args.model} at {endpoint.display_url}", flush=True)
         return endpoint.complete_many([_turns(p) for p in prompts], args.concurrency, args.max_tokens)
     except DatasetError as e:
         raise TrlxError(str(e))

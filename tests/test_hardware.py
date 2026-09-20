@@ -120,6 +120,12 @@ class InspectHardware(unittest.TestCase):
                 with self.assertRaisesRegex(TrlxError, "CPU count.*CPU unavailable"):
                     inspect()
 
+    # Dynamic-library import failures are installation errors, not Python implementation bugs.
+    def test_torch_shared_library_failure(self):
+        with patch("builtins.__import__", side_effect=OSError("missing shared library")):
+            with self.assertRaisesRegex(TrlxError, "importing PyTorch failed.*shared-library dependencies"):
+                inspect()
+
 
 if __name__ == "__main__":
     unittest.main()

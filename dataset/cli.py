@@ -14,7 +14,7 @@ import sys
 
 from dataset import chat, convert, cpt, env, fields, heal, pairs, rows, stats
 from dataset.endpoint import Endpoint
-from dataset.io import DatasetError, read_rows, write_rows
+from dataset.io import DatasetError, read_rows, validate_rows_output, write_many_rows, write_rows
 
 
 # File format follows --out's extension; --to additionally reshapes rows.
@@ -22,21 +22,26 @@ def _cmd_convert(args):
     data = read_rows(args.input)
     if args.to:
         data = convert.convert(data, args.to)
-    write_rows(args.out, data, [args.input])
+    write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging)
     return 0
 
 
 # Seeded reorder.
 def _cmd_shuffle(args):
-    write_rows(args.out, rows.shuffle(read_rows(args.input), args.seed), [args.input])
+    write_rows(args.out, rows.shuffle(read_rows(args.input), args.seed), [args.input],
+               force=args.force, no_staging=args.no_staging)
     return 0
 
 
-# Two outputs; --rest is also protected from overwriting --out.
+# Validate both destinations before reading inputs; prepare both before publication.
 def _cmd_split(args):
+    first_path = validate_rows_output(args.out, force=args.force)
+    rest_path = validate_rows_output(args.rest, force=args.force)
+    if first_path == rest_path:
+        raise DatasetError("--out and --rest name the same destination; choose two distinct output paths")
     first, rest = rows.split(read_rows(args.input), args.n, args.fraction, args.key)
-    write_rows(args.out, first, [args.input])
-    write_rows(args.rest, rest, [args.input, args.out])
+    write_many_rows([(args.out, first), (args.rest, rest)], [args.input],
+                    force=args.force, no_staging=args.no_staging)
     print(f"{len(first)} rows to {args.out}, {len(rest)} rows to {args.rest}")
     return 0
 
@@ -50,7 +55,8 @@ def _cmd_mix(args):
     if len(fractions) != len(args.input):
         raise DatasetError(f"--fractions has {len(fractions)} values for {len(args.input)} inputs")
     sources = [(read_rows(p), f) for p, f in zip(args.input, fractions)]
-    write_rows(args.out, rows.mix(sources, args.seed), args.input)
+    write_rows(args.out, rows.mix(sources, args.seed), args.input,
+               force=args.force, no_staging=args.no_staging)
     return 0
 
 
@@ -60,7 +66,7 @@ def _cmd_fields(args):
     renames = [fields.split_assignment(a, "--rename") for a in args.rename]
     swaps = [fields.split_assignment(a, "--swap") for a in args.swap]
     data = fields.apply(read_rows(args.input), adds, args.remove, renames, swaps)
-    write_rows(args.out, data, [args.input])
+    write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging)
     return 0
 
 
@@ -75,21 +81,22 @@ def _cmd_filter(args):
             raise DatasetError(f"--max-length expects COLUMN=INT, got '{arg}'")
     data = read_rows(args.input)
     kept = rows.filter_rows(data, args.where, max_lengths)
-    write_rows(args.out, kept, [args.input])
+    write_rows(args.out, kept, [args.input], force=args.force, no_staging=args.no_staging)
     print(f"kept {len(kept)} of {len(data)} rows")
     return 0
 
 
 # Random with --seed or first N with --head; rows.sample enforces exactly one.
 def _cmd_sample(args):
-    write_rows(args.out, rows.sample(read_rows(args.input), args.n, args.seed, args.head), [args.input])
+    write_rows(args.out, rows.sample(read_rows(args.input), args.n, args.seed, args.head), [args.input],
+               force=args.force, no_staging=args.no_staging)
     return 0
 
 
 # Input is a plain text file, not a dataset, so it bypasses read_rows.
 def _cmd_cpt(args):
     data = cpt.cpt_rows(args.input, args.max_tokens)
-    write_rows(args.out, data, [args.input])
+    write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging)
     print(f"{len(data)} chunks")
     return 0
 
@@ -98,7 +105,8 @@ def _cmd_cpt(args):
 # Unmatched rows go to stderr so stdout stays a clean summary.
 def _cmd_pairs(args):
     if len(args.input) == 1:
-        write_rows(args.out, pairs.single(read_rows(args.input[0])), args.input)
+        write_rows(args.out, pairs.single(read_rows(args.input[0])), args.input,
+                   force=args.force, no_staging=args.no_staging)
         return 0
     if len(args.input) != 2:
         raise DatasetError("pairs takes one messages dataset or two (chosen then rejected)")
@@ -107,14 +115,14 @@ def _cmd_pairs(args):
         print(f"unmatched: {u}", file=sys.stderr)
     if unmatched and args.strict:
         raise DatasetError(f"{len(unmatched)} unmatched rows with --strict")
-    write_rows(args.out, paired, args.input)
+    write_rows(args.out, paired, args.input, force=args.force, no_staging=args.no_staging)
     print(f"{len(paired)} pairs, {len(unmatched)} unmatched")
     return 0
 
 
 # Always writes the output; exit 1 when any unit was left unrepaired.
 def _cmd_heal(args):
-    repairs, errors = heal.heal_file(args.input, args.out)
+    repairs, errors = heal.heal_file(args.input, args.out, force=args.force, no_staging=args.no_staging)
     for r in repairs:
         print(f"repaired {r}")
     for e in errors:
@@ -136,15 +144,18 @@ def _cmd_chat(args):
     q_url, q_model = args.questions_endpoint, args.questions_model
     a_url = args.answers_endpoint if args.answers_endpoint else q_url
     a_model = args.answers_model if args.answers_model else q_model
-    print(f"questions: {q_model} at {q_url}")
-    print(f"answers:   {a_model} at {a_url}")
     q_ep = Endpoint(q_url, q_model, api_key, args.timeout, args.retries)
     a_ep = Endpoint(a_url, a_model, api_key, args.timeout, args.retries)
+    # Endpoint owns credential-safe URL display as well as request construction.
+    print(f"questions: {q_model} at {q_ep.display_url}")
+    print(f"answers:   {a_model} at {a_ep.display_url}")
     try:
         with open(args.input, encoding="utf-8") as f:
             text = f.read()
     except OSError as e:
-        raise DatasetError(f"{args.input}: {e.strerror}")
+        raise DatasetError(f"{args.input}: cannot read: {e.strerror or e}; check the path and permissions")
+    except UnicodeError:
+        raise DatasetError(f"{args.input}: input is not valid UTF-8; convert the text to UTF-8")
     data, skipped = chat.build(
         text, args.max_tokens, args.n, q_ep, a_ep,
         chat.load_prompt(args.questions_prompt, chat.QUESTIONS_PROMPT),
@@ -153,7 +164,7 @@ def _cmd_chat(args):
     )
     for s in skipped:
         print(f"skipped {s}", file=sys.stderr)
-    write_rows(args.out, data, [args.input])
+    write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging)
     print(f"{len(data)} rows, {len(skipped)} skipped")
     return 0
 
@@ -176,7 +187,8 @@ def build_parser():
             "Files: .jsonl (one object per line), .json (array of objects),\n"
             ".csv (header row; cells read as strings), or .parquet.\n"
             "cpt/chat read plain text; heal accepts JSON/JSONL only.\n"
-            "Outputs may replace existing files, but never an input file."
+            "Replacing an existing output or input requires --force.\n"
+            "Replacement acts on symlinks themselves; heal repairs their targets."
         ),
         epilog=(
             "Start here:\n"
@@ -203,11 +215,19 @@ def build_parser():
             p.add_argument("input", help=input_help)
         else:
             p.add_argument("input", nargs="+", help=input_help)
+        p.add_argument("--force", action="store_true", help=(
+            "authorize replacing existing outputs, including inputs; no additional confirmation"
+            if out else "accepted for consistency; stats has no destructive output operation"
+        ))
         if out:
             p.add_argument("--out", required=True, metavar="FILE", help=(
-                "output file: .jsonl, .json, .csv, or .parquet; replaces existing output, never an input"
+                "output file: .jsonl, .json, .csv, or .parquet; existing paths require --force"
                 if name != "heal" else
-                "output file with the same extension as input; replaces existing output, never the input"
+                "same extension as input; existing paths require --force; symlink targets are repaired"
+            ))
+            p.add_argument("--no-staging", action="store_true", help=(
+                "write directly without preparing a temporary output; failure may leave partial output; "
+                "does not imply --force"
             ))
         p.set_defaults(func=func)
         return p
@@ -239,7 +259,7 @@ def build_parser():
     p.add_argument("--fraction", type=float, metavar="FRACTION",
                    help="share of input to --out, 0..1; count = round(rows * fraction); excludes --n")
     p.add_argument("--rest", required=True, metavar="FILE",
-                   help="remainder file; format by extension; must differ from input and --out")
+                   help="remainder file; format by extension; must differ from --out; existing paths require --force")
     p.add_argument("--key", metavar="COLUMN",
                    help="group by equal scalar column values; default: split individual rows")
 
@@ -394,6 +414,10 @@ def main(argv=None):
     try:
         # Before any handler runs, so an --api-key variable can come from .env.
         env.load()
+        # Refuse unusable output paths before model loads or endpoint requests.
+        # Split and heal validate their coupled paths in their own handlers.
+        if hasattr(args, "out") and args.command not in ("split", "heal"):
+            validate_rows_output(args.out, force=args.force)
         return args.func(args)
     except DatasetError as e:
         print(f"dataset {args.command}: {e}", file=sys.stderr)

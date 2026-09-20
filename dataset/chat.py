@@ -45,7 +45,9 @@ def load_prompt(path, builtin):
         with open(path, encoding="utf-8") as f:
             return f.read()
     except OSError as e:
-        raise DatasetError(f"{path}: {e.strerror}")
+        raise DatasetError(f"{path}: cannot read prompt: {e.strerror or e}; check the path and permissions")
+    except UnicodeError:
+        raise DatasetError(f"{path}: prompt is not valid UTF-8; save the prompt as UTF-8")
 
 
 # Single-pass placeholder substitution. Unknown {names} are left as written.

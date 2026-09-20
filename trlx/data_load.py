@@ -13,6 +13,7 @@ import math
 from fractions import Fraction
 
 import datasets
+from pyarrow import ArrowInvalid, ArrowTypeError
 
 from dataset.io import DatasetError, read_rows
 from trlx import TrlxError
@@ -68,7 +69,7 @@ REPLAY_COLUMN = "replay"
 # The train set with [replay].dataset mixed in (SPEC 2.9). `fraction` is the
 # replay share of the result, so R replay rows join N train rows where
 # R / (N + R) = fraction; R is rounded and at least 1. The first R rows of the
-# replay dataset in file order are used, as [dataset].train cuts its file.
+# replay dataset in file order are used, matching the ordered train/eval split.
 # The two sets must have the same columns: concatenation needs equal
 # features, and the trainer decides the row shape from the first example.
 # `flag` adds REPLAY_COLUMN; without it the result is plain mixing.
@@ -87,6 +88,9 @@ def mix_replay(train, spec, flag):
         )
     replay = replay.select(range(count))
     if flag:
+        if REPLAY_COLUMN in train.column_names:
+            raise TrlxError(f"[replay]: column '{REPLAY_COLUMN}' is reserved for replay KL row markers; "
+                            "rename that column in both inputs before enabling replay KL")
         train = train.add_column(REPLAY_COLUMN, [False] * train.num_rows)
         replay = replay.add_column(REPLAY_COLUMN, [True] * count)
     try:
@@ -106,7 +110,11 @@ def load_ref(ref):
             raise TrlxError(str(e))
         if not rows:
             raise TrlxError(f"{ref.source}: dataset is empty")
-        return datasets.Dataset.from_list(rows)
+        try:
+            return datasets.Dataset.from_list(rows)
+        except (ArrowInvalid, ArrowTypeError) as e:
+            raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {e}; "
+                            "use consistent value types within each column") from e
     return _load_hub(ref)
 
 

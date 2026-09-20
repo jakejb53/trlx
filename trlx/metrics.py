@@ -53,10 +53,12 @@ def callback_class():
     # flushed as written so a concurrent `show` sees complete lines plus at
     # most one partial line, which the reader skips.
     class MetricsCallback(TrainerCallback):
+        # Delay opening until the first record; rank zero owns this run's metric stream.
         def __init__(self, run_dir):
             self.path = pathlib.Path(run_dir) / FILENAME
             self._file = None
 
+        # Persist and flush each trainer record so live readers see progress immediately.
         def on_log(self, args, state, control, logs=None, **kwargs):
             if logs is None:
                 return
@@ -65,12 +67,19 @@ def callback_class():
                     self._file = open(self.path, "a", encoding="utf-8")
                 except OSError as e:
                     raise TrlxError(f"{self.path}: cannot open for writing: {e.strerror or e}")
-            self._file.write(json.dumps(record(state, logs, time.time())) + "\n")
-            self._file.flush()
+            try:
+                self._file.write(json.dumps(record(state, logs, time.time())) + "\n")
+                self._file.flush()
+            except OSError as e:
+                raise TrlxError(f"{self.path}: cannot append metrics: {e}; check available space and permissions") from e
 
+        # Surface final flush/close failures before reporting a completed metrics stream.
         def on_train_end(self, args, state, control, **kwargs):
             if self._file is not None:
-                self._file.close()
+                try:
+                    self._file.close()
+                except OSError as e:
+                    raise TrlxError(f"{self.path}: cannot finish metrics: {e}; check available space") from e
                 self._file = None
 
     return MetricsCallback

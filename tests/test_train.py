@@ -122,6 +122,15 @@ class Supervisor(unittest.TestCase):
         self.assertEqual((self.worker.kills, self.verify.kills), (0, 0))
         self.assertEqual(self.verify.poll(), expected)
 
+    # Runtime publication controls cross process boundaries without entering snapshots.
+    def test_output_controls_reach_workers_and_verify(self):
+        self.args.force = True
+        self.args.no_staging = True
+        self._assert_completed()
+        self.assertEqual(self.spawn.call_args.kwargs, {"force": True, "no_staging": True})
+        self.assertEqual(self.spawn_verify.call_args.kwargs, {"force": True, "no_staging": True})
+        self.assertEqual(self.snapshot.call_args.kwargs, {"no_staging": True})
+
     # A closed pipe at the header cannot abort workers already launched.
     def test_broken_stdout_continues_through_verification(self):
         self.enterContext(patch.object(sys, "stdout", BrokenStream()))
@@ -310,7 +319,7 @@ class Supervisor(unittest.TestCase):
         self._assert_completed()
         self.assertEqual([call[0] for call in calls.mock_calls],
                          ["inspect", "rewind", "snapshot", "spawn"])
-        rewind.assert_called_once_with(resume)
+        rewind.assert_called_once_with(resume, no_staging=False)
         self.assertIn(b"resume marker", self.log.getvalue())
 
     # Live output skips retained rows and bytes but derives changes from full history.

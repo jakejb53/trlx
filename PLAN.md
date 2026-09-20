@@ -6,8 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-7 complete. Phase 8 is in progress: run directories and resume are complete;
-the remaining error-message and `--force` implementation awaits plan approval.
+Current status: Phases 1-8 complete. Optional acceleration recommendations remain planned, awaiting approval.
 Phase 8 records current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -245,10 +244,10 @@ Verify:
 - Not run: a full fine-tune with `kl_coef > 0` under fsdp; verify on a full fine-tune replay checkpoint.
 - Second-pass review of Phase 7 done; the KL scaling bug and the `padding_free` gap are fixed.
 
-### Phase 8: actionable errors and consistent --force (in progress)
+### Phase 8: actionable errors and consistent --force (complete)
 
 Make both tools explain failures and offer direct recovery without requiring source-code inspection.
-The remaining error-message and `--force` work requires an implementation plan and approval.
+Run directories, resume, output replacement, and the error audit are complete.
 
 Completed: run directories and resume (2026-09-20)
 
@@ -264,7 +263,7 @@ Completed: run directories and resume (2026-09-20)
   the selected checkpoint, earlier metrics, and logs; a resume marker precedes new log output. No force
   is required. Live lines print the continuation; `show` and the TUI retain historical metrics.
 - `trlx check` validates without rewinding. Existing method, effective-training-setting, and sharding
-  checks remain. Snapshot and metrics replacement is staged; complete malformed metric records are errors.
+  checks remain. Snapshot and metrics replacement is staged by default; complete malformed metric records are errors.
 - Files: new `trlx/run_dirs.py`; `trlx/train.py`, `trlx/config.py`, `trlx/preflight.py`, `trlx/metrics.py`,
   `trlx/cli.py`, `trlx/options.py`; new `tests/test_run_dirs.py` and updated resolution, preflight, train,
   and metrics tests. `README.md`, `SPEC.md`, and command help describe the contract.
@@ -277,80 +276,46 @@ Completed: run directories and resume (2026-09-20)
   PYTHONDONTWRITEBYTECODE=1 python -B -m unittest tests.test_run_dirs
   ```
 
-Remaining implementation starting points:
+Completed: output replacement and actionable errors (2026-09-20)
 
-- The command/error inventory is complete: 25 subcommands; only `trlx init` currently accepts `--force`.
-  Its staged config replacement remains the existing implementation.
-- `trlx/merge.py` refuses an existing output directory. Training and merge do not yet support `--force`.
-- `dataset/io.py:write_rows` overwrites existing outputs but refuses resolved input/output path aliases.
-  It writes directly to the destination; serialization or write failure can leave a truncated file.
-  `dataset/heal.py` has its own input-overwrite guard and writer.
-- `dataset/cli.py:_cmd_split` writes the first output before validating the second destination.
-  Conflicting destinations can therefore fail after the first output has already changed.
+- All 25 subcommands accept `--force`; output writers support `--no-staging` per SPEC 1.1.
+  `dataset/io.py` owns destination validation, staged publication, and direct writing for both packages.
+  Destructive replacement replaces symlinks themselves; healing repairs their targets. Replacing a
+  hard link leaves its other names unchanged. Directory failures report retained recovery paths;
+  split validates both destinations, stages both by default, and reports partial publication.
+- `trlx merge --force` supports replacing the base, adapter, or their containing directory using disk
+  staging. `--no-staging` rejects these overlaps before loading or mutation, including chained input
+  symlink aliases. Separate outputs retain direct writing.
+- Fresh-run allocation and automatic resume rewind remain intact. Execution flags stay outside saved
+  training settings. Training forwards output controls to workers and verification; run-owned metadata
+  is staged by default, while trainer checkpoints remain direct writes.
+- Expanded contextual errors for config/encoding, dataset formats and serialization, model/adapter
+  loading, scoring, reward arguments, replay-column conflicts, logs/metrics, and endpoint failures.
+  Endpoint diagnostics redact credentials; malformed credential-valued config fields do not echo values.
+  Expected failures retain nonzero exits; programming errors remain distinguishable.
+- Command help, `README.md`, and `SPEC.md` describe the implemented contract. New suites:
+  `tests/test_io.py`, `tests/test_endpoint.py`, `tests/test_merge.py`, `tests/test_verify.py`,
+  `tests/test_replay_build.py`; existing CLI, config, dataset, and runtime suites were extended.
+- Verification: the 299-test focused run and 14 reward tests passed. After the final merge restriction,
+  56 targeted tests passed. Independent reviews completed; reported findings were fixed and re-reviewed.
+  Training/merge lifecycle tests mocked model/GPU work; live GPU training/merging and custom FSDP layouts
+  remain unverified. The full replay-trainer loss suite was not rerun. Reward tests use a local mock
+  HTTP server and passed outside the socket-restricted sandbox. Runtime configs and existing runs
+  were not changed; tests used repository-local scratch. Installation remains the operator's task.
 
-Agreed direction for the remaining work:
+Verification commands, from the repo root with the project Python environment:
 
-- All error messages must provide useful failure context and direct recovery guidance where known;
-  checkpoint recovery is one example, not the scope limit.
-- Every command must accept `--force`. Destructive operations that could be mistakes refuse with an
-  explanation and offer `--force`; supplying it authorizes the requested operation without further prompts.
-- Dataset commands and `trlx replay-build` may replace an input with `--force` after preparing the complete
-  result. Existing dataset outputs must require `--force` rather than being overwritten silently.
-- Fresh training uses the completed run-directory allocation. Resume's automatic rewind requires no
-  `--force`.
-
-Remaining implementation order and files:
-
-1. Use the completed command/error inventory to define each command's force effect. Resolve remaining
-   ambiguous behavior with the user before proposing implementation. Resolve destructive path boundaries before
-   implementing replacement: input/output overlap, symlinks, hard links, ancestor directories, and
-   an output directory being used by another process. Keep the dataset package independent of trlx.
-2. Integrate the agreed `--force` behavior through `trlx/cli.py`, `trlx/options.py`, `dataset/cli.py`,
-   and command handlers, retaining the completed run-directory and resume behavior.
-3. Wire replacement through `trlx/cli.py`, `trlx/merge.py`, `trlx/replay_build.py`, `dataset/cli.py`,
-   `dataset/io.py`, and `dataset/heal.py`. Validate destinations before expensive generation or writes.
-   Prepare replacement files before publishing them. For split, validate both destinations and prepare
-   both results before changing either output; `--out` and `--rest` must remain distinct, even with force.
-   Do not claim a two-file replacement is atomic; report which destination changed if publication fails.
-4. Audit and correct expected errors across both packages, including config, dataset loading, model
-   loading, launch, preflight, rewards, replay, metrics/display, verification, merge, and endpoint calls.
-   Each message identifies the operation, relevant path/key/row/value, and a concrete corrective action
-   where known. Use public CLI spellings for CLI recovery, config keys for config edits, and quote paths
-   containing spaces in command examples. Keep model/dataset identifiers distinct from local paths;
-   never expose credentials. Catch expected failures at the boundary that can provide context, retain
-   nonzero exits, and leave genuine programming errors distinguishable.
-5. Update `README.md` and `SPEC.md` with the approved contract and every command's `--help` with its
-   replacement behavior. README remains a comprehensive cheat sheet with aligned text tables and a
-   maximum line width of 120 characters. Explain fresh runs, retaining old runs, and actual checkpoint
-   resume briefly; the first page must still permit immediate use.
-
-Error audit cases already identified:
-
-- Missing paths versus directories, malformed JSON/JSONL with filename and line plus applicable
-  `dataset heal` guidance, decoding failures, missing dataset columns, and incompatible output formats.
-- CSV nested values and Parquet schema errors need destination context and an applicable format remedy.
-- Strict pair alignment, mix fractions, reward definitions, resume config differences, and invalid GPU
-  selections need the relevant inputs or values and an explicit correction.
-- Missing credential variables need the variable name and environment/`.env` guidance; endpoint failures
-  need service/request context and applicable URL, authentication, timeout, or availability guidance.
-- Expected model, scoring, serialization, and heal output failures must not escape as unexplained tracebacks.
-  Do not report malformed reasoning output as proven token-limit truncation without evidence.
-
-Verification and completion:
-
-- Extend `tests/test_cli.py`, `tests/test_dataset_cli.py`, `tests/test_init.py`, `tests/test_train.py`,
-  `tests/test_preflight.py`, and `tests/test_heal.py`; add focused replacement/error tests where needed.
-  Use repository-local scratch inputs and outputs. Do not replace the operator's run or config to test force.
-- Cover all subcommand help/parsers; existing-output refusal and replacement; force with resume;
-  fresh-run artifact isolation; available, absent, and incomplete checkpoints; paths containing spaces;
-  input aliases; split destination conflicts; and preparation/publication failures preserving originals
-  or accurately reporting partial publication. Mock model and GPU work for lifecycle tests.
-- Exercise representative errors from every audited boundary, checking useful context, corrective action,
-  nonzero status, and absence of expected-error tracebacks. Run the affected suites and `tests/test_imports.py`.
-- Obtain an independent second-pass review of the substantial implementation. Report any live-training
-  validation still unperformed. Installation remains the operator's task, using README instructions.
-- This phase does not authorize editing runtime TOML files, deleting existing runs, or fixing unrelated
-  review backlog items. Any necessary configuration-file change needs separate, exact-path approval.
+```sh
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_io tests.test_dataset_cli tests.test_heal tests.test_env tests.test_chat \
+  tests.test_endpoint tests.test_cli tests.test_init tests.test_config tests.test_resolution \
+  tests.test_hardware tests.test_merge tests.test_verify tests.test_replay_build tests.test_train \
+  tests.test_run_dirs tests.test_preflight tests.test_metrics tests.test_data_load \
+  tests.test_adapter_check tests.test_imports tests.test_pairs tests.test_replay.MixReplayTest -q
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest tests.test_rewards -v
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_merge tests.test_cli tests.test_io tests.test_imports -q
+```
 
 ### Additional TODO: optional acceleration recommendations (planned)
 
@@ -502,7 +467,7 @@ unless marked otherwise; line references are from the original review.
 
 Tier 1, silently wrong training or destroyed work:
 
-1. **Partially complete:** `train.py` isolates display failures from job
+1. **Complete:** `train.py` isolates display failures from job
    supervision. A failed display stops and records its error in `log.txt`
    and usable stderr; training and verification continue with their exit
    status preserved, including after broken-stream shutdown flushes.
@@ -510,9 +475,8 @@ Tier 1, silently wrong training or destroyed work:
    retain supervisor cleanup. `tests/test_train.py`: 17 CPU-only tests pass
    with `python -B -m unittest tests.test_train -v`, including real pipe
    closure in child processes. Independent review found no blocking issues.
-   **Remaining:** `preflight.json` and `verify.json` are still written with
-   `path.write_text`; a mid-write read can stop the TUI, but no longer kills
-   healthy workers. Atomic report publication is not implemented.
+   **Completed in Phase 8:** `preflight.json` and `verify.json` use staged publication
+   by default; explicit `--no-staging` selects direct writing.
 2. `train.py:147` raises on a nonzero verify exit before loading results on
    that poll, closing the TUI. SPEC 2.4 says the TUI stays until quit.
 3. `rewards.py:30` `_NUMBER` reads a word-internal hyphen as a minus sign, so

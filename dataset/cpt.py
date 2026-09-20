@@ -77,5 +77,7 @@ def cpt_rows(path, max_tokens):
         with open(path, encoding="utf-8") as f:
             text = f.read()
     except OSError as e:
-        raise DatasetError(f"{path}: {e.strerror}")
+        raise DatasetError(f"{path}: cannot read: {e.strerror or e}; check the path and permissions")
+    except UnicodeError:
+        raise DatasetError(f"{path}: input is not valid UTF-8; convert the text to UTF-8")
     return [{"text": chunk} for chunk in chunk_text(text, max_tokens)]

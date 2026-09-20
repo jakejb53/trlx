@@ -10,6 +10,7 @@ import pathlib
 import tempfile
 import types
 import unittest
+from unittest.mock import Mock
 
 from trlx import TrlxError, metrics, ranges, render_lines
 
@@ -100,6 +101,14 @@ class Record(MetricsCase):
         cb.on_train_end(None, self.state(step=2), None)
         records = metrics.read(self.path)
         self.assertEqual([(r["step"], r["eval"]) for r in records], [(1, False), (2, True)])
+
+    # A full disk after opening the log is still an actionable metrics-path error.
+    def test_callback_write_failure_names_metrics(self):
+        cb = metrics.callback_class()(self.dir)
+        cb._file = Mock()
+        cb._file.write.side_effect = OSError("disk full")
+        with self.assertRaisesRegex(TrlxError, "metrics.jsonl.*disk full"):
+            cb.on_log(None, self.state(step=1), None, logs={"loss": 2.0})
 
 
 class Evaluate(unittest.TestCase):

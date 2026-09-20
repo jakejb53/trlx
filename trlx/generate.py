@@ -40,10 +40,12 @@ def prompts_from(ref):
         return list(dataset["prompt"])
     if "messages" in dataset.column_names:
         prompts = []
-        for messages in dataset["messages"]:
+        for row, messages in enumerate(dataset["messages"], 1):
+            if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+                raise TrlxError(f"{ref.source}: row {row}: messages must be a list of message objects")
             last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=None)
             if last_user is None:
-                raise TrlxError(f"{ref.source}: a messages row has no user turn to prompt with")
+                raise TrlxError(f"{ref.source}: row {row}: messages has no user turn to prompt with")
             prompts.append(messages[: last_user + 1])
         return prompts
     raise TrlxError(
@@ -80,6 +82,9 @@ def generate(model, processor, prompts, max_new_tokens=MAX_NEW_TOKENS):
                     **encoded, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=pad_id
                 )
                 outputs.append(tokenizer.decode(generated[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True))
+    except torch.cuda.OutOfMemoryError as e:
+        raise TrlxError("CUDA memory exhausted during generation; free GPU memory, shorten prompts, "
+                        "or reduce the completion token limit") from e
     finally:
         model.train(was_training)
     return outputs

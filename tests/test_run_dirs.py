@@ -276,6 +276,22 @@ class Rewind(RunDirsCase):
 
 
 class AtomicPublication(RunDirsCase):
+    # Direct replacement must not mutate other names sharing the original contents.
+    def test_direct_write_replaces_links_without_changing_their_targets(self):
+        target = self.directory / "old.txt"
+        target.write_text("old")
+        for kind in ("symbolic", "hard"):
+            with self.subTest(kind=kind):
+                destination = self.directory / kind
+                if kind == "symbolic":
+                    destination.symlink_to(target)
+                else:
+                    destination.hardlink_to(target)
+                run_dirs.write_atomic(destination, "new", no_staging=True)
+                self.assertEqual(destination.read_text(), "new")
+                self.assertEqual(target.read_text(), "old")
+                self.assertFalse(destination.is_symlink())
+
     # Replacing text preserves the prior permissions and does not leave staging files.
     def test_atomic_replacement_preserves_mode(self):
         destination = self.directory / "history.txt"
