@@ -147,7 +147,7 @@ class RunConfig:
 # __post_init__, not on attribute assignment.
 def load(path, method_name, fsdp=None, overrides=None, resolved=False):
     doc = resolve(path, method_name, overrides, resolved)
-    return from_document(doc, method_name, fsdp=fsdp, path=path)
+    return from_document(doc, method_name, fsdp=fsdp, path=path if resolved else source_path(doc, path))
 
 
 # Instantiate once the supervisor has applied the resolved GPU visibility.
@@ -229,17 +229,58 @@ def _merge(shared, selected):
     return result
 
 
-# Resolve persistent settings, then apply only explicitly supplied CLI values.
-# A worker reads the already resolved snapshot; it never reopens the source config.
+# Resolve persistent settings or the selected checkpoint's snapshot, then CLI values.
+# An explicit resume never reads today's run.toml; workers cannot resolve inputs again.
 def resolve(path, method_name, overrides=None, resolved=False):
-    doc = copy.deepcopy(_read_toml(path))
+    overrides = dict(overrides or {})
     if resolved:
-        launch = doc.pop("launch", None)
-        if not isinstance(launch, dict) or launch.get("method") != method_name:
-            raise TrlxError(f"{path}: resolved snapshot does not describe method '{method_name}'")
         if overrides:
             raise TrlxError(f"{path}: workers cannot override a resolved snapshot")
-        return doc
+        return _snapshot(path, method_name)
+    resume = overrides.get("resume_from_checkpoint")
+    if resume not in (None, "None", ""):
+        doc = {}
+    else:
+        doc = _method_document(path, method_name)
+        resume = overrides.get("resume_from_checkpoint", doc.get("resume_from_checkpoint"))
+    if resume not in (None, "None", ""):
+        if not isinstance(resume, str):
+            raise TrlxError(f"{path}: resume_from_checkpoint must be a checkpoint path, got {resume!r}")
+        checkpoint = pathlib.Path(resume).resolve()
+        path = checkpoint.parent / "config.toml"
+        doc = _snapshot(path, method_name)
+        # output_dir in operator inputs is a parent; a snapshot names the actual run.
+        parent = overrides.pop("output_dir", None)
+        if parent is not None and pathlib.Path(parent).resolve() != checkpoint.parent.parent:
+            raise TrlxError(
+                f"--output-dir {parent}: resume continues in {checkpoint.parent}; "
+                "omit --output-dir when using --resume-from-checkpoint"
+            )
+        doc["output_dir"] = str(checkpoint.parent)
+        overrides["resume_from_checkpoint"] = str(checkpoint)
+    return _apply_overrides(doc, overrides, path)
+
+
+# The snapshot's method is mandatory; historical schemas receive no implicit conversion.
+def _snapshot(path, method_name):
+    doc = copy.deepcopy(_read_toml(path))
+    launch = doc.pop("launch", None)
+    if not isinstance(launch, dict) or launch.get("method") != method_name:
+        raise TrlxError(f"{path}: resolved snapshot does not describe method '{method_name}'")
+    return doc
+
+
+# Diagnostics name the snapshot that supplied resume settings, not an unused source file.
+def source_path(document, default):
+    resume = document.get("resume_from_checkpoint")
+    if resume not in (None, "None", ""):
+        return pathlib.Path(resume).resolve().parent / "config.toml"
+    return default
+
+
+# Select method settings before looking for a resume configured in the operator's file.
+def _method_document(path, method_name):
+    doc = copy.deepcopy(_read_toml(path))
     methods = doc.pop("methods", {})
     if not isinstance(methods, dict):
         raise TrlxError(f"{path}: [methods] must be a table")
@@ -251,8 +292,11 @@ def resolve(path, method_name, overrides=None, resolved=False):
             raise TrlxError(f"{path}: [methods.{name}] must be a table")
         if "methods" in settings or "launch" in settings:
             raise TrlxError(f"{path}: [methods.{name}] cannot contain methods or launch")
-    doc = _merge(doc, methods.get(method_name, {}))
-    overrides = dict(overrides or {})
+    return _merge(doc, methods.get(method_name, {}))
+
+
+# One override path serves fresh runs and resumes; absent CLI values change nothing.
+def _apply_overrides(doc, overrides, path):
     source = overrides.pop("dataset.source", None)
     if source is not None and any(key in overrides for key in ("dataset.dataset", "dataset.dataset_train")):
         raise TrlxError(f"{path}: --dataset cannot be combined with another explicit training source")

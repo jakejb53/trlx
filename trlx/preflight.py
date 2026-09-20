@@ -32,7 +32,7 @@ import urllib.request
 
 import torch
 
-from trlx import TrlxError, show
+from trlx import TrlxError, run_dirs, show
 
 # Seconds allowed for the vLLM server health probe. A connection that takes
 # longer is treated as unreachable; the same accepted display-constant
@@ -115,7 +115,8 @@ def _check_replay(cfg):
 def _check_resume(cfg, config_path, strategy):
     if not cfg.args.resume_from_checkpoint:
         return
-    snapshot_path = pathlib.Path(cfg.args.output_dir) / show.CONFIG_FILENAME
+    resume = run_dirs.inspect_checkpoint(cfg.args.resume_from_checkpoint)
+    snapshot_path = resume.directory / show.CONFIG_FILENAME
     try:
         with open(snapshot_path, "rb") as f:
             snapshot = tomllib.load(f)
@@ -124,7 +125,7 @@ def _check_resume(cfg, config_path, strategy):
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise TrlxError(f"{snapshot_path}: cannot read snapshot: {e}")
     saved_method = snapshot.get("launch", {}).get("method")
-    if saved_method is not None and saved_method != cfg.method.name:
+    if saved_method != cfg.method.name:
         raise TrlxError(f"resume refused: {snapshot_path} is for {saved_method}, not {cfg.method.name}")
     diffs = compare_snapshot(cfg.document, snapshot, strategy)
     if diffs:
@@ -136,7 +137,8 @@ def _check_resume(cfg, config_path, strategy):
 # Differences between the current config document and the run snapshot, as
 # human-readable lines; empty means the same run. Set aside before comparing:
 # `resume_from_checkpoint` on both sides (the operator must set it to resume
-# at all), `[run]` display/launch controls, the snapshot's `[launch]` table (compared on
+# at all), `output_dir` (the checkpoint selects the actual run), `[run]` controls,
+# the snapshot's `[launch]` table (compared on
 # sharding: an FSDP checkpoint and an unsharded one differ in format, while
 # single and ddp are both unsharded and a different GPU set resumes fine),
 # and the snapshot's `run_name` when the current file has none (trlx
@@ -147,6 +149,8 @@ def compare_snapshot(current, snapshot, strategy):
     snapshot = dict(snapshot)
     current.pop("resume_from_checkpoint", None)
     snapshot.pop("resume_from_checkpoint", None)
+    current.pop("output_dir", None)
+    snapshot.pop("output_dir", None)
     current.pop("run", None)
     snapshot.pop("run", None)
     launch = snapshot.pop("launch", None) or {}

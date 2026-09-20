@@ -152,12 +152,20 @@ def add_training_options(parser, method_name):
     owned = set(config.MODEL_LOADING_FIELDS) | config.STRATEGY_FIELDS
     if "rewards" in method.blocks:
         owned |= set(config.VLLM_FORCED)
+    # These fields are resolved by the supervisor before TRL sees their values.
+    run_help = {
+        "output_dir": "Parent for fresh run directories YYYYMMDD-N--model--dataset; resume keeps its existing run.",
+        "run_name": "Display label; defaults to the generated run-directory name. Does not select a directory.",
+        "resume_from_checkpoint": "Checkpoint directory: load saved settings and resume in place, automatically "
+                                  "discarding later metrics/checkpoints and stale reports. Logs are preserved. "
+                                  "None disables a configured resume.",
+    }
     for field in dataclasses.fields(method.config_cls):
         if not field.init or field.name.startswith("_") or field.name in owned:
             continue
         group = common if field.name in shared_names else specific
         _option(group, "--" + field.name.replace("_", "-"), field.name,
-                hints.get(field.name, typing.Any), _field_help(field))
+                hints.get(field.name, typing.Any), run_help.get(field.name, _field_help(field)))
 
     peft = parser.add_argument_group("LoRA adapters")
     peft.add_argument("--no-lora", action="store_true", help="Full fine-tuning for this run; remove the effective [peft] block.")

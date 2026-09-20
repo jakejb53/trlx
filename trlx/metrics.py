@@ -85,8 +85,8 @@ def read(path):
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         raise TrlxError(f"{path}: no such file")
-    except OSError as e:
-        raise TrlxError(f"{path}: cannot read: {e.strerror or e}")
+    except (OSError, UnicodeError) as e:
+        raise TrlxError(f"{path}: cannot read: {e}")
 
     lines = text.split("\n")
     # split leaves "" after a trailing newline; a non-empty tail is partial.
@@ -98,12 +98,15 @@ def read(path):
         records.append(_parse(path, number, line))
     if tail.strip():
         try:
+            json.loads(tail)
+        except json.JSONDecodeError:
+            pass  # Only unfinished JSON can be a writer's partial last record.
+        else:
             records.append(_parse(path, len(lines) + 1, tail))
-        except TrlxError:
-            pass
     return records
 
 
+# Validate complete records even at EOF; resume must not silently erase corrupt data.
 def _parse(path, number, line):
     try:
         rec = json.loads(line)

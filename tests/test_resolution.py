@@ -125,11 +125,11 @@ class Resolution(unittest.TestCase):
     # Snapshot writing serializes effective inputs and does not mutate their owner.
     def snapshot(self, cfg):
         before = copy.deepcopy(cfg.document)
-        with patch.object(pathlib.Path, "write_text") as write:
+        with patch.object(train.run_dirs, "write_atomic") as write:
             path = train._write_snapshot(cfg, pathlib.Path("memory-run"), ["device"], "single")
         self.assertEqual(path, pathlib.Path("memory-run/config.toml"))
         self.assertEqual(cfg.document, before)
-        return tomllib.loads(write.call_args.args[0])
+        return tomllib.loads(write.call_args.args[1])
 
     # A worker must obtain the override from the snapshot after the source changes.
     def test_snapshot_reloads_exact_effective_inputs(self):
@@ -173,6 +173,109 @@ class Resolution(unittest.TestCase):
         read.assert_called_once_with(args.config)
         self.assertEqual(build.call_args.args[0].args.learning_rate, 0.001)
         trainer.train.assert_called_once_with(resume_from_checkpoint=None)
+
+    # All trainers snapshot the allocated directory so workers cannot allocate again.
+    def test_all_methods_snapshot_actual_run_directory(self):
+        for method in cli.METHODS:
+            with self.subTest(method=method):
+                extra = ["--teacher", "chosen-teacher"] if method == "distillation" else []
+                if method in ("grpo", "rloo"):
+                    extra = ["--reward", "json_valid"]
+                cfg = self.load(method, extra)
+                parent = cfg.args.output_dir
+                actual = pathlib.Path(parent) / "20260920-1--chosen-model--data"
+                with patch.object(train.run_dirs, "allocate", return_value=actual) as allocate:
+                    self.assertEqual(train._create_run_dir(cfg), actual)
+                allocate.assert_called_once_with(parent, cfg.model.path, cfg.dataset.source)
+                self.assertEqual(cfg.args.run_name, actual.name)
+                self.assertEqual(cfg.document["output_dir"], str(actual))
+                snapshot = self.snapshot(cfg)
+                with patch.object(config, "_read_toml", return_value=snapshot):
+                    worker = config.load("snapshot", method, resolved=True)
+                self.assertEqual(worker.args.output_dir, str(actual))
+                self.assertEqual(worker.args.run_name, actual.name)
+
+    # Explicit run labels remain display metadata rather than choosing directory names.
+    def test_allocation_preserves_explicit_run_name(self):
+        cfg = self.load(extra=["--run-name", "experiment"])
+        actual = pathlib.Path("runs/sft/20260920-1--chosen-model--data")
+        with patch.object(train.run_dirs, "allocate", return_value=actual):
+            train._create_run_dir(cfg)
+        self.assertEqual(cfg.args.run_name, "experiment")
+        self.assertEqual(cfg.args.output_dir, str(actual))
+
+    # Explicit resume needs only its saved settings; today's source is never read.
+    def test_minimal_resume_uses_snapshot_without_source(self):
+        snapshot = self.snapshot(self.load())
+        checkpoint = pathlib.Path("memory-run/checkpoint-20").resolve()
+        args = cli.parse_args(["sft", "--resume-from-checkpoint", str(checkpoint)])
+        with patch.object(config, "_read_toml", return_value=snapshot) as read:
+            cfg = config.load(args.config, "sft", overrides=options.overrides(args))
+        read.assert_called_once_with(checkpoint.parent / "config.toml")
+        self.assertEqual(cfg.model.path, "chosen-model")
+        self.assertEqual(cfg.dataset.source.source, "data.jsonl")
+        self.assertEqual(cfg.args.resume_from_checkpoint, str(checkpoint))
+        self.assertEqual(cfg.args.output_dir, str(checkpoint.parent))
+        with patch.object(train.run_dirs, "allocate") as allocate:
+            self.assertEqual(train._create_run_dir(cfg), checkpoint.parent)
+        allocate.assert_not_called()
+
+    # Resume CLI controls override the snapshot without reviving source-file settings.
+    def test_resume_applies_explicit_controls_and_training_overrides(self):
+        snapshot = self.snapshot(self.load())
+        checkpoint = pathlib.Path("memory-run/checkpoint-20").resolve()
+        args = cli.parse_args(["sft", "--resume-from-checkpoint", str(checkpoint),
+                               "--gpus", "0", "--tui", "--no-verify", "--learning-rate", "0.007"])
+        with patch.object(config, "_read_toml", return_value=snapshot) as read:
+            cfg = config.load(args.config, "sft", overrides=options.overrides(args))
+        read.assert_called_once_with(checkpoint.parent / "config.toml")
+        self.assertEqual(cfg.args.learning_rate, 0.007)
+        self.assertEqual(config.run_settings(cfg.document),
+                         {"gpus": "0", "strategy": "auto", "tui": True, "verify": False})
+
+    # A configured checkpoint is discovered from source, then its snapshot owns inputs.
+    def test_configured_resume_reads_source_then_snapshot(self):
+        snapshot = self.snapshot(self.load())
+        checkpoint = pathlib.Path("memory-run/checkpoint-20").resolve()
+        source = copy.deepcopy(self.source)
+        source["resume_from_checkpoint"] = str(checkpoint)
+        source["model"] = {"path": "changed-source-model"}
+        with patch.object(config, "_read_toml", side_effect=[source, snapshot]) as read:
+            cfg = config.load("operator.toml", "sft")
+        self.assertEqual([call.args[0] for call in read.call_args_list],
+                         ["operator.toml", checkpoint.parent / "config.toml"])
+        self.assertEqual(cfg.model.path, "chosen-model")
+
+    # Output overrides cannot relocate a continuation away from the selected checkpoint.
+    def test_resume_output_override_names_parent_only(self):
+        snapshot = self.snapshot(self.load())
+        checkpoint = pathlib.Path("memory-run/checkpoint-20").resolve()
+        overrides = {"resume_from_checkpoint": str(checkpoint),
+                     "output_dir": str(checkpoint.parent.parent)}
+        with patch.object(config, "_read_toml", return_value=snapshot):
+            cfg = config.load("unused.toml", "sft", overrides=overrides)
+            self.assertEqual(cfg.args.output_dir, str(checkpoint.parent))
+            overrides["output_dir"] = str(checkpoint.parent)
+            with self.assertRaisesRegex(TrlxError, "omit --output-dir"):
+                config.load("unused.toml", "sft", overrides=overrides)
+
+    # Historical schemas are rejected at the snapshot path rather than converted.
+    def test_resume_rejects_legacy_dataset_schema(self):
+        snapshot = self.snapshot(self.load())
+        snapshot["dataset"]["train"] = 60
+        snapshot["dataset"].pop("eval_fraction")
+        checkpoint = pathlib.Path("memory-run/checkpoint-20").resolve()
+        with patch.object(config, "_read_toml", return_value=snapshot):
+            with self.assertRaisesRegex(TrlxError, "config.toml.*train"):
+                config.load("unused.toml", "sft", overrides={"resume_from_checkpoint": str(checkpoint)})
+
+    # Without method metadata a snapshot cannot safely select a trainer on resume.
+    def test_resume_requires_snapshot_method(self):
+        snapshot = self.snapshot(self.load())
+        snapshot.pop("launch")
+        with patch.object(config, "_read_toml", return_value=snapshot):
+            with self.assertRaisesRegex(TrlxError, "does not describe method"):
+                config.load("unused.toml", "sft", overrides={"resume_from_checkpoint": "memory-run/checkpoint-20"})
 
     # Every launched worker receives the immutable resolved path and internal strategy.
     def test_spawn_worker_arguments(self):

@@ -26,14 +26,17 @@ The default split requires at least two rows. See the method/data cheat sheet be
 `init` writes `run.toml` once for your environment and all seven training methods.
 It enables LoRA, holds out 10% of the data for evaluation, and supplies training
 defaults. No config editing is required. Training reads `./run.toml` automatically,
-runs one epoch by default, and saves SFT results to `runs/sft`.
+runs one epoch by default, and saves each run in its own directory under `runs/METHOD`.
+For example: `runs/sft/20260920-1--qwen-qwen3.8-27b--chunks/`. Training prints the actual
+directory at startup; use that path wherever `RUN_DIR` appears below.
 
 **CLI options change one run. Editing `run.toml` changes future runs.**
 For example, add `--learning-rate 5e-5` for one run or edit `learning_rate` under
-`[methods.sft]` to keep that value. Use `--output-dir runs/experiment` for a new run.
+`[methods.sft]` to keep that value. Use `--output-dir runs/experiment` to change the parent
+directory for new runs.
 
 ```sh
-trlx show runs/sft
+trlx show RUN_DIR
 trlx --help
 trlx sft --help
 dataset --help
@@ -87,7 +90,7 @@ trlx distillation --model MODEL --dataset DATA --teacher TEACHER
 ```
 
 GRPO and RLOO also need an explicit reward and a running generation server;
-see "Rewards" below. Each method uses `runs/METHOD` unless overridden.
+see "Rewards" below. Each method creates run subdirectories under `runs/METHOD` unless overridden.
 
 ```sh
 # Check the setup without training; accepts the same model/data/trainer overrides.
@@ -95,7 +98,7 @@ trlx check sft --model MODEL --dataset DATA
 
 # Live full-screen training, or inspect an existing run.
 trlx sft --model MODEL --dataset DATA --tui
-trlx show runs/sft --tui
+trlx show RUN_DIR --tui
 
 # Verify a checkpoint or produce a merged model from an adapter.
 trlx verify CHECKPOINT --base BASE
@@ -111,7 +114,7 @@ trlx replay-build --help
 ```
 
 Uppercase names are placeholders; replace them with your own inputs. Paths are
-relative to the working directory. New runs refuse nonempty output directories;
+relative to the working directory. Fresh runs allocate a new subdirectory;
 `init` requires `--force` to replace an existing config; `merge` refuses an existing output directory.
 
 ## Dataset cheat sheet
@@ -289,17 +292,30 @@ every optimizer update. Use `--eval-strategy steps --eval-steps N` and
 `--save-strategy steps --save-steps N` for intermediate evaluation/checkpoints.
 `save_strategy = "no"` is rejected.
 
+Every fresh run uses `output_dir/YYYYMMDD-N--model--dataset/`. The number advances across
+all models and datasets under that parent for the local date, starting above existing numbers.
+Model IDs are lowercased with `/` replaced by `-`; local models use their directory name.
+Dataset files use their filename stem. `run_name` changes only the display label.
+
 ```sh
-# Repeat your original command, adding the checkpoint to resume.
-trlx sft --model MODEL --dataset DATA --resume-from-checkpoint runs/sft/checkpoint-100
+# RUN_DIR is the generated directory printed at startup; select an existing checkpoint.
+trlx sft --resume-from-checkpoint RUN_DIR/checkpoint-100
 
 # Compare a trained checkpoint with the base, or merge its LoRA adapter.
-trlx verify runs/sft/checkpoint-100 --base MODEL
-trlx merge --base MODEL --adapter runs/sft/checkpoint-100 --out merged-model
+trlx verify RUN_DIR/checkpoint-100 --base MODEL
+trlx merge --base MODEL --adapter RUN_DIR/checkpoint-100 --out merged-model
 ```
 
-Resume requires the same effective training settings. GPU selection may change,
-but switching between sharded and unsharded training is rejected.
+Resume loads the run's saved `config.toml`, not today's `run.toml`; model and dataset
+arguments need not be repeated. Explicit CLI overrides still apply. Only the current
+snapshot schema is supported. Training settings must match; GPU selection and display
+controls may change, but switching between sharded and unsharded training is rejected.
+
+Resume continues in the original directory. After validation it automatically removes
+metrics and checkpoints beyond the selected saved step and clears stale preflight/verify
+reports. No `--force` is needed. Earlier metrics remain; logs append a resume marker and
+new output. The live line display prints the continuation; `trlx show RUN_DIR` includes
+the retained history. `trlx check` validates resume inputs without performing cleanup.
 
 Run artifacts include `config.toml` (resolved settings), `metrics.jsonl`, `log.txt`,
 `preflight.json`, `checkpoint-N` directories, and `verify.json` when verification runs.

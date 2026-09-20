@@ -7,9 +7,9 @@ import subprocess
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from trlx import TrlxError, launch, render_tui, train
+from trlx import TrlxError, launch, render_tui, run_dirs, train
 
 
 # A process that finishes after several polls, so the real Job exercises its
@@ -68,19 +68,21 @@ class Supervisor(unittest.TestCase):
             command="sft", config="memory.toml", gpus=None, strategy=None,
             no_verify=False, tui=False, _rank=None,
         )
-        cfg = types.SimpleNamespace(
-            args=types.SimpleNamespace(run_name="memory"), ranges={"loss": (0, 2)},
+        cfg = self.cfg = types.SimpleNamespace(
+            args=types.SimpleNamespace(run_name="memory", resume_from_checkpoint=None),
+            ranges={"loss": (0, 2)}, document={}, method=types.SimpleNamespace(name="sft"),
             model=types.SimpleNamespace(path="memory-model"), verify_prompts=None,
         )
         self._patch("trlx.train.config_mod.resolve", side_effect=self._resolved)
         self._patch("trlx.train.config_mod.from_document", return_value=cfg)
-        self._patch("trlx.train.preflight.check_config")
+        self.check_config = self._patch("trlx.train.preflight.check_config")
         self._patch("trlx.launch.select_gpus", return_value=([0], 1))
         self._patch("trlx.launch.physical_ids", return_value=["synthetic-device"])
         self._patch("trlx.launch.choose_strategy", return_value=("single", "test"))
-        self._patch("trlx.train._create_run_dir", return_value=pathlib.Path("memory-run"))
+        self.create_run = self._patch("trlx.train._create_run_dir", return_value=pathlib.Path("memory-run"))
+        self._patch("trlx.train.run_dirs.locked", return_value=contextlib.nullcontext())
         self.snapshot_path = pathlib.Path("memory-run/config.toml")
-        self._patch("trlx.train._write_snapshot", return_value=self.snapshot_path)
+        self.snapshot = self._patch("trlx.train._write_snapshot", return_value=self.snapshot_path)
         self._patch("trlx.train._final_checkpoint", return_value=pathlib.Path("memory-run/checkpoint-1"))
         self.spawn = self._patch("trlx.launch.spawn", return_value=[self.worker])
         self.spawn_verify = self._patch("trlx.launch.spawn_verify", return_value=self.verify)
@@ -110,7 +112,7 @@ class Supervisor(unittest.TestCase):
         if mode == "ab":
             return contextlib.nullcontext(self.log)
         self.assertEqual(mode, "rb")
-        return io.BytesIO(b"worker log\n")
+        return io.BytesIO(self.log.getvalue() + b"worker log\n")
 
     # Display failure must retain ownership through verification and reaping.
     def _assert_completed(self, expected=0):
@@ -266,6 +268,71 @@ class Supervisor(unittest.TestCase):
         self.spawn_verify.assert_not_called()
         self.assertGreater(self.worker.waits, 0)
         self.assertNotIn(b"display stopped", self.log.getvalue())
+
+
+    # Invalid checkpoint metadata must fail preflight before any run mutation.
+    def test_invalid_checkpoint_prevents_rewind_and_worker_spawn(self):
+        self.cfg.args.resume_from_checkpoint = "memory-run/checkpoint-20"
+        self.check_config.side_effect = train.preflight._check_resume
+        self._patch("trlx.run_dirs.inspect_checkpoint", side_effect=TrlxError("invalid trainer_state.json"))
+        rewind = self._patch("trlx.run_dirs.rewind")
+        with self.assertRaisesRegex(TrlxError, "invalid trainer_state.json"):
+            train.run(self.args)
+        self.create_run.assert_not_called()
+        rewind.assert_not_called()
+        self.snapshot.assert_not_called()
+        self.spawn.assert_not_called()
+        self.assertEqual(self.log.getvalue(), b"")
+
+    # Reinspection under the directory lock still precedes destructive cleanup.
+    def test_checkpoint_reinspection_failure_preserves_history(self):
+        self.cfg.args.resume_from_checkpoint = "memory-run/checkpoint-20"
+        self.log.write(b"old history\n")
+        self._patch("trlx.run_dirs.inspect_checkpoint", side_effect=TrlxError("checkpoint disappeared"))
+        rewind = self._patch("trlx.run_dirs.rewind")
+        with self.assertRaisesRegex(TrlxError, "checkpoint disappeared"):
+            train.run(self.args)
+        rewind.assert_not_called()
+        self.snapshot.assert_not_called()
+        self.spawn.assert_not_called()
+        self.assertEqual(self.log.getvalue(), b"old history\n")
+
+    # Workers cannot append progress until cleanup and the replacement snapshot finish.
+    def test_resume_cleanup_precedes_snapshot_and_worker_spawn(self):
+        self.cfg.args.resume_from_checkpoint = "memory-run/checkpoint-20"
+        resume = run_dirs.Resume(pathlib.Path(self.cfg.args.resume_from_checkpoint), 20)
+        inspect = self._patch("trlx.run_dirs.inspect_checkpoint", return_value=resume)
+        rewind = self._patch("trlx.run_dirs.rewind", return_value=(0, "resume marker"))
+        calls = Mock()
+        for name, mocked in (("inspect", inspect), ("rewind", rewind),
+                             ("snapshot", self.snapshot), ("spawn", self.spawn)):
+            calls.attach_mock(mocked, name)
+        self._assert_completed()
+        self.assertEqual([call[0] for call in calls.mock_calls],
+                         ["inspect", "rewind", "snapshot", "spawn"])
+        rewind.assert_called_once_with(resume)
+        self.assertIn(b"resume marker", self.log.getvalue())
+
+    # Live output skips retained rows and bytes but derives changes from full history.
+    def test_resume_display_uses_history_without_reprinting_it(self):
+        self.cfg.args.resume_from_checkpoint = "memory-run/checkpoint-20"
+        resume = run_dirs.Resume(pathlib.Path(self.cfg.args.resume_from_checkpoint), 20)
+        self._patch("trlx.run_dirs.inspect_checkpoint", return_value=resume)
+        self._patch("trlx.run_dirs.rewind", return_value=(1, "resume marker"))
+        self.log.write(b"old history\n")
+        retained = dict(self.records.return_value[0], step=20)
+        continued = dict(retained, step=21, log={"loss": 0.75})
+        self.records.return_value = [retained, continued]
+        line = self._patch("trlx.render_lines.line", wraps=train.render_lines.line)
+        self._assert_completed()
+        line.assert_called_once()
+        row = line.call_args.args[0]
+        self.assertEqual(row.step, 21)
+        self.assertEqual(row.cells["loss"].change, -0.25)
+        shown_log = self.stderr.buffer.getvalue()
+        self.assertNotIn(b"old history", shown_log)
+        self.assertIn(b"worker log", shown_log)
+        self.assertTrue(self.log.getvalue().startswith(b"old history\nresume marker\n"))
 
 
 class Shutdown(unittest.TestCase):

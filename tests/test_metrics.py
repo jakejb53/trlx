@@ -21,8 +21,9 @@ def rec(step, log, eval=False, max_steps=100):
 
 
 class MetricsCase(unittest.TestCase):
+    # Keep file verification in repository-local scratch rather than real runs.
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent)
         self.dir = pathlib.Path(self._tmp.name)
         self.path = self.dir / metrics.FILENAME
 
@@ -58,6 +59,11 @@ class Reader(MetricsCase):
         with self.assertRaises(TrlxError) as ctx:
             metrics.read(self.write(json.dumps(r) + "\n"))
         self.assertIn("missing max_steps", str(ctx.exception))
+
+    # A complete but invalid final object must not disappear during resume cleanup.
+    def test_malformed_complete_tail_is_error(self):
+        with self.assertRaisesRegex(TrlxError, "missing"):
+            metrics.read(self.write('{}'))
 
     def test_missing_file_is_error(self):
         with self.assertRaises(TrlxError):

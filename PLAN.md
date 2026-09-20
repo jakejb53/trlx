@@ -6,7 +6,9 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phase 7 complete. All planned phases are done. Work after them is logged in the addendum at the end of this file, which is current where it and a phase section disagree.
+Current status: Phases 1-7 complete. Phase 8 is in progress: run directories and resume are complete;
+the remaining error-message and `--force` implementation awaits plan approval.
+Phase 8 records current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
 
@@ -243,10 +245,133 @@ Verify:
 - Not run: a full fine-tune with `kl_coef > 0` under fsdp; verify on a full fine-tune replay checkpoint.
 - Second-pass review of Phase 7 done; the KL scaling bug and the `padding_free` gap are fixed.
 
+### Phase 8: actionable errors and consistent --force (in progress)
+
+Make both tools explain failures and offer direct recovery without requiring source-code inspection.
+The remaining error-message and `--force` work requires an implementation plan and approval.
+
+Completed: run directories and resume (2026-09-20)
+
+- All seven trainers create `output_dir/YYYYMMDD-N--model--dataset/`. `output_dir` is the parent;
+  allocation serializes one daily counter across that parent's existing runs. Model IDs are normalized,
+  local models use their directory basename, and dataset files use their stem. `run_name` is a display
+  label, defaulting to the generated directory name. Startup prints the actual path.
+- The snapshot and workers use the actual run directory. Resume loads the selected run's saved snapshot
+  and applies explicit CLI overrides, without needing today's source config for explicit CLI resume.
+  Current schema only: existing runs are disposable; no legacy conversion is required or implemented.
+- Resume validates checkpoint metadata and saved weights' presence, then automatically removes metrics
+  and checkpoints beyond the saved `global_step` and clears stale preflight/verify reports. It preserves
+  the selected checkpoint, earlier metrics, and logs; a resume marker precedes new log output. No force
+  is required. Live lines print the continuation; `show` and the TUI retain historical metrics.
+- `trlx check` validates without rewinding. Existing method, effective-training-setting, and sharding
+  checks remain. Snapshot and metrics replacement is staged; complete malformed metric records are errors.
+- Files: new `trlx/run_dirs.py`; `trlx/train.py`, `trlx/config.py`, `trlx/preflight.py`, `trlx/metrics.py`,
+  `trlx/cli.py`, `trlx/options.py`; new `tests/test_run_dirs.py` and updated resolution, preflight, train,
+  and metrics tests. `README.md`, `SPEC.md`, and command help describe the contract.
+- Verification: 108 distinct focused tests passed with mocked training and repository-local scratch.
+  Independent review found no confirmed blockers. Live GPU training and custom FSDP checkpoint layouts
+  remain unverified. From the repo root with the project environment:
+
+  ```sh
+  PYTHONDONTWRITEBYTECODE=1 python -B -m unittest tests.test_run_dirs tests.test_resolution tests.test_preflight tests.test_train tests.test_cli tests.test_metrics tests.test_imports
+  PYTHONDONTWRITEBYTECODE=1 python -B -m unittest tests.test_run_dirs
+  ```
+
+Remaining implementation starting points:
+
+- The command/error inventory is complete: 25 subcommands; only `trlx init` currently accepts `--force`.
+  Its staged config replacement remains the existing implementation.
+- `trlx/merge.py` refuses an existing output directory. Training and merge do not yet support `--force`.
+- `dataset/io.py:write_rows` overwrites existing outputs but refuses resolved input/output path aliases.
+  It writes directly to the destination; serialization or write failure can leave a truncated file.
+  `dataset/heal.py` has its own input-overwrite guard and writer.
+- `dataset/cli.py:_cmd_split` writes the first output before validating the second destination.
+  Conflicting destinations can therefore fail after the first output has already changed.
+
+Agreed direction for the remaining work:
+
+- All error messages must provide useful failure context and direct recovery guidance where known;
+  checkpoint recovery is one example, not the scope limit.
+- Every command must accept `--force`. Destructive operations that could be mistakes refuse with an
+  explanation and offer `--force`; supplying it authorizes the requested operation without further prompts.
+- Dataset commands and `trlx replay-build` may replace an input with `--force` after preparing the complete
+  result. Existing dataset outputs must require `--force` rather than being overwritten silently.
+- Fresh training uses the completed run-directory allocation. Resume's automatic rewind requires no
+  `--force`.
+
+Remaining implementation order and files:
+
+1. Use the completed command/error inventory to define each command's force effect. Resolve remaining
+   ambiguous behavior with the user before proposing implementation. Resolve destructive path boundaries before
+   implementing replacement: input/output overlap, symlinks, hard links, ancestor directories, and
+   an output directory being used by another process. Keep the dataset package independent of trlx.
+2. Integrate the agreed `--force` behavior through `trlx/cli.py`, `trlx/options.py`, `dataset/cli.py`,
+   and command handlers, retaining the completed run-directory and resume behavior.
+3. Wire replacement through `trlx/cli.py`, `trlx/merge.py`, `trlx/replay_build.py`, `dataset/cli.py`,
+   `dataset/io.py`, and `dataset/heal.py`. Validate destinations before expensive generation or writes.
+   Prepare replacement files before publishing them. For split, validate both destinations and prepare
+   both results before changing either output; `--out` and `--rest` must remain distinct, even with force.
+   Do not claim a two-file replacement is atomic; report which destination changed if publication fails.
+4. Audit and correct expected errors across both packages, including config, dataset loading, model
+   loading, launch, preflight, rewards, replay, metrics/display, verification, merge, and endpoint calls.
+   Each message identifies the operation, relevant path/key/row/value, and a concrete corrective action
+   where known. Use public CLI spellings for CLI recovery, config keys for config edits, and quote paths
+   containing spaces in command examples. Keep model/dataset identifiers distinct from local paths;
+   never expose credentials. Catch expected failures at the boundary that can provide context, retain
+   nonzero exits, and leave genuine programming errors distinguishable.
+5. Update `README.md` and `SPEC.md` with the approved contract and every command's `--help` with its
+   replacement behavior. README remains a comprehensive cheat sheet with aligned text tables and a
+   maximum line width of 120 characters. Explain fresh runs, retaining old runs, and actual checkpoint
+   resume briefly; the first page must still permit immediate use.
+
+Error audit cases already identified:
+
+- Missing paths versus directories, malformed JSON/JSONL with filename and line plus applicable
+  `dataset heal` guidance, decoding failures, missing dataset columns, and incompatible output formats.
+- CSV nested values and Parquet schema errors need destination context and an applicable format remedy.
+- Strict pair alignment, mix fractions, reward definitions, resume config differences, and invalid GPU
+  selections need the relevant inputs or values and an explicit correction.
+- Missing credential variables need the variable name and environment/`.env` guidance; endpoint failures
+  need service/request context and applicable URL, authentication, timeout, or availability guidance.
+- Expected model, scoring, serialization, and heal output failures must not escape as unexplained tracebacks.
+  Do not report malformed reasoning output as proven token-limit truncation without evidence.
+
+Verification and completion:
+
+- Extend `tests/test_cli.py`, `tests/test_dataset_cli.py`, `tests/test_init.py`, `tests/test_train.py`,
+  `tests/test_preflight.py`, and `tests/test_heal.py`; add focused replacement/error tests where needed.
+  Use repository-local scratch inputs and outputs. Do not replace the operator's run or config to test force.
+- Cover all subcommand help/parsers; existing-output refusal and replacement; force with resume;
+  fresh-run artifact isolation; available, absent, and incomplete checkpoints; paths containing spaces;
+  input aliases; split destination conflicts; and preparation/publication failures preserving originals
+  or accurately reporting partial publication. Mock model and GPU work for lifecycle tests.
+- Exercise representative errors from every audited boundary, checking useful context, corrective action,
+  nonzero status, and absence of expected-error tracebacks. Run the affected suites and `tests/test_imports.py`.
+- Obtain an independent second-pass review of the substantial implementation. Report any live-training
+  validation still unperformed. Installation remains the operator's task, using README instructions.
+- This phase does not authorize editing runtime TOML files, deleting existing runs, or fixing unrelated
+  review backlog items. Any necessary configuration-file change needs separate, exact-path approval.
+
+### Additional TODO: optional acceleration recommendations (planned)
+
+- During `trlx init`, use GPU architecture and installed Python, PyTorch, and CUDA versions to recommend
+  applicable optional acceleration packages, including `causal-conv1d` and `flash-linear-attention`.
+  No model selection, model weights, or dataset is required. Explain which model architectures benefit;
+  distinguish verified compatibility from unknown compatibility rather than promising installability.
+- During `trlx check` and training, inspect the selected model's configuration before loading weights
+  to identify applicable accelerators. Distinguish missing packages from installed packages that fail
+  to import, and provide actionable guidance for either condition.
+- Recommendations are advisory: no automatic installation, blocking prompt, or suppression of failures.
+  Document optional accelerators and their purpose concisely in `README.md` and command help.
+- Expected files: `trlx/hardware.py`, `trlx/init_cmd.py`, `trlx/cli.py`, `trlx/preflight.py`,
+  `tests/test_hardware.py`, `tests/test_init.py`, `tests/test_preflight.py`, `README.md`, and `SPEC.md`.
+  Verify recommendations with mocked environments and model configurations, without loading weights
+  or installing packages. Implementation awaits approval.
+
 ## Addendum: post-Phase-7 session (2026-09-19)
 
-Work after all seven phases were complete. Phase sections above are left as
-written; where this addendum contradicts one, this addendum is current.
+Work after Phases 1-7 were complete; this addendum supersedes their historical descriptions.
+Phase 8 above records subsequent work.
 
 ### Document corrections
 
@@ -423,14 +548,12 @@ Tier 2, wrong output, lost information, or a traceback on operator input:
   out-of-range or large value overflows `table_width`, passes the width
   guard, and is clipped at the terminal edge. The module docstring promises
   a size message instead of silent clipping.
-- `metrics.py:100` catches `TrlxError` around the last line, which also
-  swallows a complete but malformed final record; only invalid JSON can come
-  from a partial write.
+- **Complete in Phase 8:** `metrics.py` rejects complete malformed final records;
+  only an invalid JSON tail without a newline is skipped as a partial write.
 - `render_tui.py:131` shows three checkpoint rows while `best` is computed
   over all of them, so the best checkpoint can be off-screen and unmarked.
-- `train.py:119` opens the log reader at offset 0 with `printed = 0`, so a
-  resumed run replays the whole previous `log.txt` and every previous
-  metrics row before the first new line.
+- **Complete in Phase 8:** resumed line output skips historical log bytes and metric rows,
+  while retaining earlier metrics for change-column calculations.
 - `rewards.py:312` passes an unresolved bare name to TRL, which calls
   `AutoModelForSequenceClassification.from_pretrained`; the eventual error
   depends on the name and lacks trlx's config-entry context. `config.py:62`
@@ -482,8 +605,8 @@ Tier 3, contract and comment drift:
   exceptions, unlike the four that are.
 - `train.py:168` and `show.py:112` each scan the run directory for
   checkpoints; one source of truth would serve both.
-- The startup strategy line prints twice in line mode: once to stderr and
-  again when `log.txt` is copied from offset 0.
+- **Complete in Phase 8:** the line-mode log reader starts after the already-printed
+  startup notice, so the strategy line is not duplicated.
 - `normalise` removes ASCII punctuation only. Unicode punctuation can make
   otherwise equivalent punctuated and unpunctuated answers differ; matching
   punctuation on both sides still matches. The ASCII restriction is undocumented.

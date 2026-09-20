@@ -50,7 +50,7 @@ Both CLIs provide top-level command descriptions and command-level help with inp
 TOML. One file holds persistent defaults for all methods. Precedence is explicit CLI values, then the selected `[methods.<name>]` section, then shared top-level settings. Nested method tables are merged by key. Unselected method settings are not passed to TRL. A flat per-run config remains supported.
 
 - Top-level keys map onto the method's TRL config dataclass. Unknown key: error. Absent key: dataclass default. Nullable trainer and LoRA fields accept the string `"None"`; nullable CLI booleans also accept an explicit `None` value.
-- `output_dir` required after resolution; init writes `runs/<method>` in each method section. `run_name` defaults to the directory name. For step evaluation, an omitted checkpoint interval follows the eval interval.
+- `output_dir` is the parent for fresh runs; init writes `runs/<method>` in each method section. Each run gets its own subdirectory (§2.3). `run_name` is a display label, defaulting to that generated directory name. For step evaluation, an omitted checkpoint interval follows the eval interval.
 - `[run]`: `gpus` (`all` or comma-separated visible indices), `strategy` (`auto`, `ddp`, `fsdp`), `tui` and `verify` (booleans). CLI forms are `--gpus`, `--strategy`, `--tui`/`--no-tui`, `--verify`/`--no-verify`.
 - `[model]`: `path`, `dtype`, `trust_remote_code`, `attn_implementation`. Class is read from the model's own config, never hardcoded. `reward` resolves the sequence-classification variant of that architecture.
 - `[teacher]`: `distillation` only. Same keys as `[model]`.
@@ -71,6 +71,13 @@ Dataset files: JSONL, JSON array, CSV, Parquet, by extension. Applies everywhere
 
 ### 2.3 Run directory
 
+All methods allocate `<output_dir>/YYYYMMDD-N--model--dataset/` and print its path at startup.
+The local date and parent share one counter: N is one above the highest existing number for that date,
+regardless of model or dataset. Allocation is serialized across concurrent launches.
+Model labels use the model ID or local directory basename; dataset labels use the primary file's stem or
+hub ID. Labels are lowercase, with characters outside letters, digits, `.`, `_`, and `-` replaced
+by `-`; leading/trailing punctuation is removed. Exact inputs remain in the snapshot.
+
 ```
 <run>/
   config.toml      resolved method + CLI settings, including chosen strategy and GPUs
@@ -81,7 +88,18 @@ Dataset files: JSONL, JSON array, CSV, Parquet, by extension. Applies everywhere
   checkpoint-N/    TRL checkpoint
 ```
 
-The supervisor resolves inputs once and writes the snapshot before spawning workers. Workers read that snapshot, not the operator's source file. The source config is never rewritten by training. `[launch]` records method, actual strategy, and physical GPU identifiers; it is reserved for snapshots.
+The supervisor resolves inputs once and writes the snapshot before spawning workers. Its `output_dir`
+is the actual run directory. Workers read that snapshot, not the operator's source file. The source config
+is never rewritten by training. `[launch]` records method, actual strategy, and physical GPU identifiers;
+it is reserved for snapshots. One supervisor owns the run through verification.
+
+`resume_from_checkpoint` selects an existing run and loads its saved snapshot, then applies explicit CLI
+overrides. Explicit CLI resume does not read the operator's config. Only the current snapshot schema is
+supported. After config and checkpoint metadata validation, resume automatically removes metrics and
+checkpoint directories beyond the saved `trainer_state.json` global_step, and clears stale preflight and
+verification reports. Records through that step remain. Logs are preserved with an appended resume marker.
+The selected checkpoint is preserved; no `--force` is required for this rewind. Live line output starts
+at the continuation; `show` and the TUI retain access to historical metrics. Check-only execution never rewinds.
 
 ### 2.4 Display
 
@@ -108,7 +126,7 @@ Fatal:
 - `grpo`/`rloo`: TRL vLLM server unreachable, or the server answering is not the TRL server.
 - `[replay]` with `kl_coef > 0` alongside `use_liger_kernel`, `packing`, or `padding_free`.
 - `save_strategy = "no"`: nothing would be left to verify or merge.
-- Resume from a different method or changed effective training settings, including CLI overrides. `resume_from_checkpoint`, display/launch controls, and the GPU list are excluded; actual sharding is compared except under `trlx check`, which chooses no strategy.
+- Resume from a different method or changed effective training settings, including CLI overrides. `resume_from_checkpoint`, `output_dir`, display/launch controls, and the GPU list are excluded; actual sharding is compared except under `trlx check`, which chooses no strategy.
 
 Warnings:
 - Preference methods: mean per-token log-prob of chosen and rejected (`completion` for `kto`) under the starting model below the threshold in `[preflight]` (off-policy data), over the first `[preflight].rows` train rows.

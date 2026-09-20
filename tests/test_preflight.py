@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from trlx import TrlxError, toml_write
+from trlx import TrlxError, run_dirs, toml_write
 from trlx.preflight import _check_resume, compare_snapshot
 
 # Effective inputs after method selection and CLI overrides, and their snapshot:
@@ -49,6 +49,11 @@ class CompareSnapshot(unittest.TestCase):
         current = dict(CURRENT, run={"gpus": "1", "strategy": "auto", "tui": True, "verify": False})
         snapshot = dict(SNAPSHOT, run={"gpus": "all", "strategy": "ddp", "tui": False, "verify": True})
         self.assertEqual(compare_snapshot(current, snapshot, "ddp"), [])
+
+    # The checkpoint owns its directory even if the saved path was relative or moved.
+    def test_output_directory_is_not_a_training_input_difference(self):
+        current = dict(CURRENT, output_dir="runs/relocated")
+        self.assertEqual(compare_snapshot(current, SNAPSHOT, "ddp"), [])
 
     def test_no_strategy_skips_sharding(self):
         # `trlx check` chooses no strategy and passes None.
@@ -93,6 +98,13 @@ class CompareSnapshot(unittest.TestCase):
 
 
 class ResumeCheck(unittest.TestCase):
+    # Comparison tests isolate metadata validation without creating checkpoint files.
+    def setUp(self):
+        self.inspect = self.enterContext(patch(
+            "trlx.preflight.run_dirs.inspect_checkpoint",
+            return_value=run_dirs.Resume(pathlib.Path("runs/a/checkpoint-20"), 20),
+        ))
+
     # Resume needs the already resolved inputs, never a second read of the operator config.
     def config(self, document):
         return SimpleNamespace(
@@ -116,6 +128,14 @@ class ResumeCheck(unittest.TestCase):
         with patch("trlx.preflight.open", return_value=io.BytesIO(toml_write.dumps(saved).encode())):
             with self.assertRaisesRegex(TrlxError, "is for dpo, not sft"):
                 _check_resume(self.config(CURRENT), "operator.toml", "ddp")
+
+    # Incomplete checkpoints fail before their snapshot can approve a continuation.
+    def test_invalid_checkpoint_stops_snapshot_read(self):
+        self.inspect.side_effect = TrlxError("trainer_state.json: invalid checkpoint")
+        with patch("trlx.preflight.open") as opening:
+            with self.assertRaisesRegex(TrlxError, "invalid checkpoint"):
+                _check_resume(self.config(CURRENT), "operator.toml", "ddp")
+        opening.assert_not_called()
 
 
 if __name__ == "__main__":

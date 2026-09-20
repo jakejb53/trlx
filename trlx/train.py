@@ -1,8 +1,9 @@
-"""`trlx <method> <config>`: supervisor and worker sides of a training run.
+"""`trlx <method> [options]`: supervisor and worker sides of a training run.
 
 Supervisor (no --_rank): select GPUs -> validate the config -> choose the
-strategy -> create the run directory and config.toml -> open log.txt ->
-spawn one worker per GPU (launch.py) -> display -> wait and propagate exit.
+strategy -> allocate a fresh run or rewind the selected checkpoint's run ->
+write config.toml -> spawn workers (launch.py) -> display and propagate exit.
+The supervisor owns the directory through verification; workers never allocate it.
 It never loads a model. It does hold a CUDA context on the first selected
 device, because transformers validates bf16 against a real device when the
 config is instantiated.
@@ -37,6 +38,7 @@ from trlx import (
     preflight,
     ranges,
     render_lines,
+    run_dirs,
     show,
     toml_write,
 )
@@ -61,7 +63,8 @@ def run(args):
 # Supervisor side.
 def _supervise(args):
     document = config_mod.resolve(args.config, args.command, getattr(args, "overrides", None))
-    controls = config_mod.run_settings(document, args.config)
+    source = config_mod.source_path(document, args.config)
+    controls = config_mod.run_settings(document, source)
     args.tui = controls["tui"]
     args.no_verify = not controls["verify"]
     gpu_flag = None if controls["gpus"] == "all" else controls["gpus"]
@@ -71,19 +74,36 @@ def _supervise(args):
     # From here the supervisor sees only the selected devices: config.load
     # initializes CUDA, and the memory query in choose_strategy indexes them.
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
-    cfg = config_mod.from_document(document, args.command, path=args.config)
+    cfg = config_mod.from_document(document, args.command, path=source)
     strategy, why = launch.choose_strategy(strategy_flag, cfg, physical)
     # Config-only preflight (SPEC 2.6) before anything is written: a fatal
     # check must not leave a half-made run directory behind.
-    preflight.check_config(cfg, args.config, strategy)
+    preflight.check_config(cfg, source, strategy)
     startup = f"strategy: {strategy} ({why}); GPUs {','.join(physical)}"
 
-    run_dir = _create_run_dir(cfg.args)
-    snapshot = _write_snapshot(cfg, run_dir, physical, strategy)
+    run_dir = _create_run_dir(cfg)
+    # Retain exclusive ownership through verification; another supervisor must not
+    # rewind files while this job's workers or verification are still using them.
+    with run_dirs.locked(run_dir):
+        return _run_job(args, cfg, run_dir, physical, strategy, startup)
+
+
+# The directory is owned and config preflight has passed before history is changed.
+def _run_job(args, cfg, run_dir, physical, strategy, startup):
     log_path = run_dir / show.LOG_FILENAME
     with open(log_path, "ab") as log_file:
+        retained = 0
+        startup = f"run directory: {run_dir}\n{startup}"
+        if cfg.args.resume_from_checkpoint:
+            resume = run_dirs.inspect_checkpoint(cfg.args.resume_from_checkpoint)
+            retained, marker = run_dirs.rewind(resume)
+            startup = f"{marker}\n{startup}"
+        snapshot = _write_snapshot(cfg, run_dir, physical, strategy)
         log_file.write((startup + "\n").encode("utf-8"))
         log_file.flush()
+        # Capture the boundary before workers start, including fast first writes.
+        # Startup is printed below; only subsequent log bytes need mirroring.
+        log_offset = log_file.tell()
         display_failed = False
 
         # The log remains authoritative after presentation stops. A failure to
@@ -114,7 +134,8 @@ def _supervise(args):
             elif args.tui:
                 failure = _supervise_tui(run_dir, job, on_display_error)
             else:
-                failure = _supervise_lines(run_dir, cfg.ranges, log_path, job, on_display_error)
+                failure = _supervise_lines(run_dir, cfg.ranges, log_path, job, on_display_error,
+                                           printed=retained, log_offset=log_offset)
             if failure is not None:
                 label, code = failure
                 # Final diagnostics are display work too: a broken stream or
@@ -167,16 +188,17 @@ def _report_display_error(error, log_file, log_path):
 
 
 # Line mode: render failures disable only this callback. Job.wait and its
-# process polling stay outside the presentation exception boundary.
-def _supervise_lines(run_dir, range_table, log_path, job, on_display_error):
+# process polling stay outside the presentation exception boundary. Resume offsets
+# suppress old output, while evaluating all retained metrics preserves change columns.
+def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, printed=0, log_offset=0):
     try:
         print(render_lines.header(range_table), flush=True)
         log_reader = open(log_path, "rb")
+        log_reader.seek(log_offset)
     except Exception as error:
         on_display_error(error)
         return job.wait(lambda: None)
     metrics_path = run_dir / metrics.FILENAME
-    printed = 0
     active = True
 
     # Once a read or render fails, do not retry it on subsequent job polls.
@@ -317,14 +339,15 @@ def check(args):
     import torch
 
     document = config_mod.resolve(args.config, args.method, getattr(args, "overrides", None))
-    controls = config_mod.run_settings(document, args.config)
+    source = config_mod.source_path(document, args.config)
+    controls = config_mod.run_settings(document, source)
     gpu_flag = None if controls["gpus"] == "all" else controls["gpus"]
     gpus, count = launch.select_gpus(gpu_flag)
     physical = launch.physical_ids(gpus[:1], count)
     os.environ["CUDA_VISIBLE_DEVICES"] = physical[0]
-    cfg = config_mod.from_document(document, args.method, path=args.config)
+    cfg = config_mod.from_document(document, args.method, path=source)
     print(f"check: one process on GPU {physical[0]}", file=sys.stderr)
-    preflight.check_config(cfg, args.config, None)
+    preflight.check_config(cfg, source, None)
     print("preflight: config checks passed", file=sys.stderr)
     _attach_logging()
 
@@ -425,28 +448,30 @@ def _remove_stock_reporters(trainer):
         trainer.remove_callback(cls)
 
 
-# Creates output_dir. An existing non-empty directory is refused unless the
-# run resumes from a checkpoint, so two runs never write into one directory.
-def _create_run_dir(args):
-    run_dir = pathlib.Path(args.output_dir)
-    if run_dir.exists() and any(run_dir.iterdir()) and not args.resume_from_checkpoint:
-        raise TrlxError(f"{run_dir}: output_dir exists and is not empty; set resume_from_checkpoint to continue it")
-    try:
-        run_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        raise TrlxError(f"{run_dir}: cannot create output_dir: {e.strerror or e}")
+# Only the supervisor allocates runs. Replace the operator's parent with the actual
+# directory in both trainer args and the document before workers see the snapshot.
+def _create_run_dir(cfg):
+    if cfg.args.resume_from_checkpoint:
+        run_dir = pathlib.Path(cfg.args.resume_from_checkpoint).resolve().parent
+    else:
+        run_dir = run_dirs.allocate(cfg.args.output_dir, cfg.model.path, cfg.dataset.source)
+        if cfg.document.get("run_name") in (None, "None"):
+            cfg.args.run_name = run_dir.name
+    cfg.args.output_dir = str(run_dir)
+    cfg.document["output_dir"] = str(run_dir)
     return run_dir
 
 
 # Snapshot the selected method and CLI values once, before spawning workers.
 # The operator's file is untouched; workers consume this exact hand-off instead.
+# Atomic publication preserves a readable resume source if writing fails.
 def _write_snapshot(cfg, run_dir, physical, strategy):
     dest = run_dir / show.CONFIG_FILENAME
     document = dict(cfg.document)
     document["run_name"] = cfg.args.run_name
     document["launch"] = {"method": cfg.method.name, "strategy": strategy, "gpus": list(physical)}
     try:
-        dest.write_text(toml_write.dumps(document), encoding="utf-8")
+        run_dirs.write_atomic(dest, toml_write.dumps(document))
     except OSError as e:
         raise TrlxError(f"{dest}: cannot write snapshot: {e.strerror or e}")
     return dest

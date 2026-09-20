@@ -90,14 +90,17 @@ def _training_examples(method):
         "Booleans use --flag / --no-flag. Lists and tables use shell-quoted TOML, for example:\n"
         "  --lora-target-modules '[\"module_a\",\"module_b\"]'\n"
         "  --ranges '{loss=[0,5],eval_loss=[0,5]}'\n"
-        "Fresh runs refuse nonempty output directories; use --output-dir for another run.\n"
-        "Resume: --resume-from-checkpoint runs/experiment/checkpoint-N with the same effective training settings."
+        "Fresh runs create output_dir/YYYYMMDD-N--model--dataset; N advances across that parent's date.\n"
+        f"Resume: trlx {method} --resume-from-checkpoint RUN_DIR/checkpoint-N\n"
+        "Resume loads the saved config, keeps the run directory and logs, and automatically removes "
+        "metrics/checkpoints after the selected step. Explicit CLI overrides still apply."
     )
 
 
 # Launch options have no argparse defaults that could overwrite saved settings.
 def _run_options(parser, training):
-    parser.add_argument("--config", default="run.toml", help="persistent settings file (default: run.toml)")
+    parser.add_argument("--config", default="run.toml",
+                        help="fresh-run settings (default: run.toml); resume loads the selected run's saved config")
     parser.add_argument("--gpus", dest="override:run.gpus", default=argparse.SUPPRESS,
                         help="visible device indices, e.g. 0,1, or all (config: run.gpus; init: all)")
     if training:
@@ -147,9 +150,10 @@ def build_parser(method=None):
     }
     for name in METHODS:
         p = sub.add_parser(name, help=purposes[name], formatter_class=HelpFormatter,
-                           usage=f"trlx {name} [--config FILE] --model MODEL --dataset DATA [options]",
-                           description=f"{purposes[name]}. Uses run.toml unless --config is given. "
-                                       "Model/data may also be saved in the config. All options override one run only.",
+                           usage=f"trlx {name} [--config FILE] [--model MODEL] [--dataset DATA] [options]",
+                           description=f"{purposes[name]}. Fresh runs use run.toml unless --config is given. "
+                                       "Resume uses the run's saved config. Model/data may be saved in the config. "
+                                       "All options override one run only.",
                            epilog=_training_examples(name))
         _run_options(p, training=True)
         # Internal: set by the supervisor when spawning worker processes (PLAN.md multi-GPU design).
@@ -161,7 +165,8 @@ def build_parser(method=None):
 
     p = sub.add_parser("show", help="inspect saved metrics, checkpoints, and reports", formatter_class=HelpFormatter,
                        description="Read a run directory without loading a model. Values include changes and range markers.",
-                       epilog="Examples:\n  trlx show runs/sft\n  trlx show runs/sft --tui\n\n"
+                       epilog="Examples:\n  trlx show RUN_DIR\n  trlx show RUN_DIR --tui\n\n"
+                              "RUN_DIR is the generated directory printed at training startup. "
                               "Line mode prints once. The TUI refreshes until q and includes logs/reports.")
     p.add_argument("run", help="run directory containing config.toml and metrics.jsonl")
     p.add_argument("--tui", action="store_true", help="full-screen view (default: print metric lines)")
