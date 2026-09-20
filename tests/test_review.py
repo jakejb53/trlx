@@ -39,7 +39,7 @@ class Rendering(unittest.TestCase):
     def test_method_selection_and_every_fragment_parses(self):
         expected = {"sft": "--assistant-only-loss", "dpo": "--beta", "kto": "--desirable-weight",
                     "reward": "--center-rewards-coefficient", "grpo": "--scale-rewards",
-                    "rloo": "--reward-clip-range", "distillation": "--teacher"}
+                    "rloo": "--reward-clip-range", "distillation": "--teacher-dtype"}
         for method in cli.METHODS:
             with self.subTest(method=method):
                 cfg = configuration(method)
@@ -63,6 +63,45 @@ class Rendering(unittest.TestCase):
                 self.assertIn("num_train_epochs", keys)
                 self.assertNotIn("fsdp", keys)
 
+    # Configured operational controls must stay hidden for every trainer, not just SFT.
+    def test_operational_settings_are_hidden_for_every_method(self):
+        operational = {
+            "run": {"gpus": "all", "strategy": "auto", "tui": False, "verify": True},
+            "model": {"path": "example-model", "dtype": "float32",
+                      "trust_remote_code": False, "attn_implementation": "sdpa"},
+            "run_name": "example-run", "logging_steps": 3, "report_to": [],
+            "save_strategy": "steps", "save_steps": 9, "save_total_limit": 2,
+            "dataloader_num_workers": 0, "dataloader_pin_memory": True,
+            "disable_tqdm": True, "push_to_hub": False,
+            "verify": {"prompts": "verify.jsonl"},
+        }
+        hidden = {
+            "gpus", "strategy", "tui", "verify", "model", "trust-remote-code",
+            "attn-implementation", "dataset", "split", "dataset-eval", "output-dir",
+            "run-name", "logging-steps", "report-to", "save-strategy", "save-steps",
+            "save-total-limit", "dataloader-num-workers", "dataloader-pin-memory",
+            "disable-tqdm", "push-to-hub", "verify-prompts", "teacher",
+            "vllm-server-base-url", "vllm-server-host", "vllm-server-port",
+            "vllm-server-timeout", "preflight-rows", "offpolicy-logp-per-token",
+        }
+        for method in cli.METHODS:
+            with self.subTest(method=method):
+                extra = copy.deepcopy(operational)
+                if method in {"grpo", "rloo"}:
+                    extra["vllm_server_base_url"] = "http://localhost:8000"
+                if method in {"dpo", "kto"}:
+                    extra["preflight"] = {"rows": 8, "offpolicy_logp_per_token": -5.0}
+                cfg = configuration(method, extra)
+                before = copy.deepcopy(cfg.document)
+                output = review.render(cfg)
+                shown = {shlex.split(line)[0].removeprefix("--").removeprefix("no-")
+                         for line in arguments(output)}
+                self.assertFalse(shown & hidden, shown & hidden)
+                self.assertIn("learning-rate", shown)
+                self.assertIn("dtype", shown)
+                self.assertTrue(output.startswith("Training tuning settings:\n"))
+                self.assertEqual(before, cfg.document)
+
     # Actual precedence and post-init defaults supply displayed values, not metadata defaults.
     def test_resolved_defaults_overrides_and_following_intervals(self):
         doc = configuration().document
@@ -73,14 +112,14 @@ class Rendering(unittest.TestCase):
         shown = arguments(review.render(cfg))
         self.assertIn("--learning-rate 0.004", shown)
         self.assertIn("--eval-steps 7", shown)
-        self.assertIn("--save-steps 7", shown)
+        self.assertNotIn("--save-steps 7", shown)
         self.assertIn("--gradient-checkpointing", shown)
         self.assertIn("--loss-type chunked_nll", shown)
 
     # Layout alignment includes long arguments and all wrapped continuation comments.
     def test_comment_alignment_and_no_value_truncation(self):
-        name = "a deliberately long model path with spaces " * 3
-        cfg = configuration(extra={"model": {"path": name, "dtype": "float32"}})
+        name = "a deliberately long end token with spaces " * 3
+        cfg = configuration(extra={"eos_token": name})
         output = review.render(cfg, width=80)
         columns = {line.index("#") for line in output.splitlines() if "#" in line}
         self.assertEqual(len(columns), 1)
@@ -90,23 +129,26 @@ class Rendering(unittest.TestCase):
     # Disabled schedules and features cannot advertise controls that do nothing.
     def test_inactive_settings_are_hidden(self):
         cfg = configuration(extra={"max_steps": 12, "save_strategy": "epoch", "save_steps": 8,
-                                   "packing_strategy": "bfd", "gradient_checkpointing": False})
+                                   "packing_strategy": "bfd", "gradient_checkpointing": False,
+                                   "gradient_checkpointing_kwargs": {"use_reentrant": False}, "data_seed": "None"})
         shown = arguments(review.render(cfg))
         self.assertIn("--max-steps 12", shown)
         for prefix in ("--num-train-epochs", "--eval-steps", "--per-device-eval-batch-size",
-                       "--save-steps", "--packing-strategy", "--metric-for-best-model"):
+                       "--save-steps", "--packing-strategy", "--metric-for-best-model",
+                       "--gradient-checkpointing-kwargs", "--data-seed"):
             self.assertFalse(any(line.startswith(prefix + " ") for line in shown), prefix)
 
     # LoRA set values and shell-sensitive text must round-trip through the real parser.
     def test_lora_collections_and_shell_quoting(self):
+        token = "end's token $(not-a-command) # quoted"
         cfg = configuration(extra={"peft": {"r": 12, "target_modules": ["one", "two"]},
-                                   "run_name": "run's name $(not-a-command) # quoted"})
+                                   "eos_token": token})
         parsed_values = {}
         for fragment in arguments(review.render(cfg)):
             parsed_values.update(options.overrides(cli.parse_args(["sft", *shlex.split(fragment)])))
         self.assertEqual(parsed_values["peft.r"], 12)
         self.assertEqual(set(parsed_values["peft.target_modules"]), {"one", "two"})
-        self.assertEqual(parsed_values["run_name"], cfg.args.run_name)
+        self.assertEqual(parsed_values["eos_token"], token)
         self.assertIn("peft.lora_dropout", parsed_values)
 
     # Auto generation values belong to workers, not the supervisor's world size.
@@ -128,16 +170,18 @@ class Rendering(unittest.TestCase):
         self.assertNotIn("--loss-type", output)
         self.assertIn("loss_type = 'nll'; set by trlx", output)
         self.assertIn("--replay-kl-coef 0.1", output)
+        self.assertIn("--replay-fraction 0.2", output)
+        self.assertNotIn("--replay-dataset", output)
         policy = review.render(configuration("grpo"), width=160)
         self.assertNotIn("--use-vllm", policy)
-        self.assertIn("vllm_mode = 'server'", policy)
+        self.assertNotIn("vllm_mode", policy)
 
     # Real sensitive fields and nested endpoint credentials must never reach stdout.
     def test_redaction_preserves_nonsecret_token_settings(self):
         cfg = configuration(extra={"hub_token": "private-hub-secret", "eos_token": "<end>"})
         output = review.render(cfg)
         self.assertNotIn("private-hub-secret", output)
-        self.assertIn("<redacted>", output)
+        self.assertNotIn("--hub-token", output)
         self.assertIn("--eos-token", output)
         cfg = configuration("grpo", {"rewards": {"funcs": [
             {"name": "llm_judge", "args": {"api_key": "private-key", "url": "https://u:private-pass@host/v1?token=private-token"}}
@@ -146,18 +190,18 @@ class Rendering(unittest.TestCase):
         for secret in ("private-key", "private-pass", "private-token"):
             self.assertNotIn(secret, output)
         self.assertIn("--reward:", output)
+        self.assertIn("<redacted>", output)
 
-    # Explicit settings outside the shortlist stay visible without importing other methods.
+    # Deliberately selected advanced tuning stays visible when explicitly configured.
     def test_explicit_advanced_setting_is_included(self):
         shown = arguments(review.render(configuration(extra={"adam_beta2": 0.95})))
         self.assertIn("--adam-beta2 0.95", shown)
 
-    # Instantiated nested defaults containing None must remain visible without invalid TOML.
-    def test_nested_automatic_defaults_are_explained(self):
+    # Explicit infrastructure dictionaries cannot expand the tuning review.
+    def test_nested_infrastructure_is_hidden(self):
         output = review.render(configuration(extra={"accelerator_config": {}}), width=160)
-        self.assertIn("--accelerator-config:", output)
-        self.assertIn("'dispatch_batches': None", output)
-        self.assertFalse(any(line.startswith("--accelerator-config ") for line in arguments(output)))
+        self.assertNotIn("--accelerator-config", output)
+        self.assertNotIn("dispatch_batches", output)
 
     # bool|string options require a value, unlike genuine boolean switches.
     def test_mixed_boolean_union_uses_a_value(self):
@@ -202,7 +246,7 @@ class Rendering(unittest.TestCase):
 class Input(unittest.TestCase):
     # The render path is tested above; these tests isolate consent and stream handling.
     def setUp(self):
-        self.enterContext(patch.object(review, "render", return_value="Settings applied to this run:\n"))
+        self.enterContext(patch.object(review, "render", return_value="Training tuning settings:\n"))
         self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
 
     # Only a real empty input line authorizes continuation; other text reprompts.

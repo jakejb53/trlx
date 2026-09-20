@@ -18,9 +18,16 @@ from trlx import TrlxError, config, options, toml_write
 _COMMON = frozenset("""
     num_train_epochs max_steps learning_rate optim lr_scheduler_type warmup_steps
     weight_decay max_grad_norm per_device_train_batch_size gradient_accumulation_steps
-    bf16 fp16 gradient_checkpointing seed data_seed train_sampling_strategy
-    eval_strategy eval_steps per_device_eval_batch_size save_strategy save_steps
-    save_total_limit load_best_model_at_end metric_for_best_model greater_is_better logging_steps
+    bf16 fp16 gradient_checkpointing seed train_sampling_strategy
+    eval_strategy eval_steps per_device_eval_batch_size
+    load_best_model_at_end metric_for_best_model greater_is_better
+""".split())
+# Advanced tuning is shown only when configured; merely appearing in the input
+# document never makes an operational setting eligible for the review.
+_EXPLICIT_TUNING = frozenset("""
+    adam_beta1 adam_beta2 adam_epsilon optim_args lr_scheduler_kwargs
+    gradient_checkpointing_kwargs data_seed eos_token pad_token generation_kwargs
+    peft.init_lora_weights
 """.split())
 _GENERATION = frozenset("""
     max_completion_length temperature top_p top_k min_p repetition_penalty
@@ -37,9 +44,9 @@ _METHOD = {
     "reward": frozenset("max_length center_rewards_coefficient disable_dropout".split()),
     "grpo": _GENERATION | _POLICY | frozenset("loss_type scale_rewards multi_objective_aggregation importance_sampling_level vllm_importance_sampling_correction entropy_coef".split()),
     "rloo": _GENERATION | _POLICY | {"normalize_advantages", "reward_clip_range"},
-    "distillation": _GENERATION | {"beta", "disable_dropout", "shuffle_dataset", "use_vllm"},
+    "distillation": _GENERATION | {"beta", "disable_dropout", "shuffle_dataset"},
 }
-_LORA = {"r", "lora_alpha", "lora_dropout", "target_modules", "bias", "modules_to_save"}
+_LORA = {"r", "lora_alpha", "lora_dropout", "target_modules"}
 _LOSS_FEATURES = {
     "discopop": {"discopop_tau"},
     "sapo": {"sapo_temperature_neg", "sapo_temperature_pos"},
@@ -57,7 +64,6 @@ _FEATURES = {
     "activation_offloading": {"activation_offloading"},
     "use_adaptive_entropy": {"use_adaptive_entropy", "entropy_coef_min", "entropy_coef_max", "entropy_coef_delta", "entropy_target"},
     "vllm_importance_sampling_correction": {"vllm_importance_sampling_mode", "vllm_importance_sampling_clip_max", "vllm_importance_sampling_clip_min"},
-    "push_to_hub": {"push_to_hub", "hub_model_id", "hub_private_repo", "hub_strategy", "hub_revision"},
 }
 _SECRET = re.compile(r"^(?:token|hub_token|push_to_hub_token|api_token)$|(?:^|_)(?:api_key|access_token|refresh_token|password|secret|authorization|credential)$", re.I)
 _AUTO_NOTES = {
@@ -83,22 +89,21 @@ def _explicit_keys(document):
     return keys
 
 
-# Selection follows the chosen trainer and enabled features, not other method sections.
+# Selection follows tuning relevance, the chosen trainer, and enabled features.
+# Explicit config/CLI values cannot bypass these presentation allowlists.
 def _selected(cfg):
-    selected = set(_COMMON | _METHOD[cfg.method.name]) | _explicit_keys(cfg.document)
-    # Metric display ranges do not tune training and can dwarf the review's columns.
-    selected.discard("ranges")
-    selected.update({"model.path", "model.dtype", "dataset.source", "dataset.split", "dataset.eval_fraction",
-                     "dataset.dataset_eval", "output_dir", "resume_from_checkpoint", "rewards.funcs"})
+    selected = set(_COMMON | _METHOD[cfg.method.name])
+    selected.update(_explicit_keys(cfg.document) & _EXPLICIT_TUNING)
+    selected.update({"model.dtype", "dataset.eval_fraction", "rewards.funcs"})
     for feature, details in _FEATURES.items():
         if getattr(cfg.args, feature, False):
             selected.update(details)
     if cfg.peft is not None:
         selected.update("peft." + name for name in _LORA)
     if cfg.teacher is not None:
-        selected.update({"teacher.path", "teacher.dtype"})
-    if getattr(cfg.args, "use_vllm", False):
-        selected.update({"vllm_server_base_url", "vllm_server_host", "vllm_server_port", "vllm_server_timeout"})
+        selected.add("teacher.dtype")
+    if cfg.replay is not None:
+        selected.update({"replay.fraction", "replay.kl_coef"})
     loss = getattr(cfg.args, "loss_type", None)
     losses = [loss] if isinstance(loss, str) else loss or []
     if len(losses) > 1:
@@ -139,6 +144,10 @@ def _applicable(key, cfg, controls):
         return args.max_steps <= 0
     if key == "max_steps":
         return args.max_steps > 0
+    if key == "data_seed":
+        return args.data_seed is not None
+    if key == "gradient_checkpointing_kwargs":
+        return args.gradient_checkpointing
     if (key.startswith("eval_") and key != "eval_strategy") or key in {"per_device_eval_batch_size", "num_generations_eval"}:
         if not evaluation:
             return False
@@ -314,16 +323,15 @@ def render(cfg, *, width=None):
     controls = config.run_settings(cfg.document)
     selected = _selected(cfg)
     rows = []
-    forced = dict(config.VLLM_FORCED) if cfg.rewards is not None else {}
-    if "disable_tqdm" in selected:
-        forced["disable_tqdm"] = True
+    # Only forced tuning controls belong here; launch/display policy is omitted.
+    forced = {}
     if cfg.method.name == "sft" and cfg.args.packing and cfg.args.packing_strategy == "bfd":
         forced["padding_free"] = True
     if cfg.replay is not None and cfg.replay.kl_coef > 0:
         forced.update(config.REPLAY_KL_FORCED)
     for setting in options.settings(cfg.method.name):
         key = setting.key
-        if not (key in selected or key.startswith("run.")) or not _applicable(key, cfg, controls):
+        if key not in selected or not _applicable(key, cfg, controls):
             continue
         if key in forced:
             continue
@@ -350,7 +358,7 @@ def render(cfg, *, width=None):
     # Keep a readable comment column even when a long argument exceeds the terminal.
     # Values are never shortened: terminal wrapping may occur, but no data is hidden.
     comment_width = max(40, terminal_width - column - 2)
-    lines = ["Settings applied to this run:", ""]
+    lines = ["Training tuning settings:", ""]
     for argument, description in rows:
         pieces = textwrap.wrap(description, width=comment_width, break_long_words=False, break_on_hyphens=False)
         for index, piece in enumerate(pieces):

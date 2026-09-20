@@ -86,10 +86,12 @@ Methods: `sft`, `dpo`, `grpo`, `kto`, `rloo`, `reward`, `distillation`. Stable T
 
 Training options use hyphenated field names; LoRA fields use `--lora-*` (`lora_alpha` becomes `--lora-alpha`). Boolean options have positive and negative forms; lists and tables use shell-quoted TOML. `--no-lora` and `--no-replay` remove those features for one run. Repeated `--reward` entries replace the reward list; distillation exposes `--teacher`. Conflicting explicit options are errors.
 
-Fresh and resumed training print relevant settings for the selected method to stdout after config
-validation, before model inspection, dataset loading, run allocation, or resume rewind. Each override
+Fresh and resumed training print a curated set of training tuning settings for the selected method
+to stdout after config validation, before model inspection, dataset loading, run allocation, or resume
+rewind. Paths, launch/display controls, reporting, checkpoint storage, and routine infrastructure
+settings are omitted even when explicitly configured. Each override
 uses CLI syntax with aligned description/type comments; inactive settings are omitted, automatic
-values are explained, and secrets are redacted. Forced settings appear as explanatory comments.
+values are explained, and secrets are redacted. Forced tuning settings appear as explanatory comments.
 Both display modes require Enter to continue or `q` to cancel successfully. Other input repeats the
 prompt; EOF or review I/O failure stops startup with an error. Progress notices pause during review.
 Workers and `check` do not prompt. Display failures after launch retain supervisor ownership.

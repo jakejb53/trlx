@@ -319,7 +319,7 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
 
 ### Startup settings review (complete, 2026-09-20)
 
-- Fresh and resumed training show relevant settings for the selected trainer on stdout as CLI
+- Fresh and resumed training show curated tuning settings for the selected trainer on stdout as CLI
   overrides with aligned description/type comments. Values include resolved defaults; automatic
   and forced settings are explained, inactive controls omitted, and credentials redacted.
 - After config validation, Enter continues and `q` cancels before model inspection, dataset loading,
@@ -338,6 +338,20 @@ From the repo root, with the project environment's Python executable:
 PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   tests.test_review tests.test_train tests.test_cli tests.test_resolution tests.test_imports -q
 ```
+
+Completed: tuning-only review (2026-09-20)
+
+- All seven trainers omit paths, launch/display controls, reporting, checkpoint storage, and routine
+  infrastructure settings even when explicitly configured. Method-specific tuning and enabled-feature
+  details remain visible; advanced tuning fields require deliberate inclusion in the presentation lists.
+- Updated `trlx/review.py`, `tests/test_review.py`, and `SPEC.md`. A comparable SFT configuration
+  displays 31 controls. Training behavior, runtime configurations, and existing runs are unchanged.
+- Verification: all 20 review tests passed, including selection across all seven trainers. No live GPU
+  training was run. From the repo root with the project environment's Python executable:
+
+  ```sh
+  PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest tests.test_review -q
+  ```
 
 ### Training output improvements (complete, 2026-09-20)
 
