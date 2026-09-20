@@ -1,12 +1,17 @@
 """Built-in rewards on fixed completions, and the [rewards] resolver."""
 
+import contextlib
 import http.server
+import io
 import json
 import pathlib
 import tempfile
 import threading
+import types
 import unittest
+from unittest.mock import Mock, patch
 
+from dataset.progress import Progress
 from trlx import TrlxError, rewards
 from trlx.config import RewardEntry
 
@@ -165,6 +170,77 @@ class ResolveTest(unittest.TestCase):
             rewards.resolve([RewardEntry("json:nope", None)])
         with self.assertRaisesRegex(TrlxError, "rejected args"):
             rewards.resolve([RewardEntry("get_soft_overlong_punishment", {"bogus": 1})])
+
+
+class JudgeProgressTest(unittest.TestCase):
+    # Exercise build_trainer -> resolve -> the retained callable -> real Endpoint
+    # batching, with only HTTP and sleeping mocked and no model/training execution.
+    def test_training_judge_reports_requests_and_retries_after_resolution(self):
+        from trlx import train
+
+        for method in ("grpo", "rloo"):
+            with self.subTest(method=method):
+                lines = []
+                trainer_cls = Mock()
+                entry = RewardEntry("llm_judge", {
+                    "url": "https://judge.invalid/v1", "model": "judge", "rubric": "score",
+                    "timeout": 5, "retries": 1, "concurrency": 1, "max_tokens": 16,
+                })
+                cfg = types.SimpleNamespace(
+                    args=types.SimpleNamespace(), teacher=None, rewards=[entry], replay=None,
+                    peft=None, method=types.SimpleNamespace(trainer_cls=trainer_cls),
+                )
+                replies = iter((TimeoutError(), "Score: 9", "Score: 3"))
+
+                # The stage and total must already be visible before the first HTTP call.
+                def respond(request, timeout):
+                    self.assertTrue(any("judge requests" in line and "0/2 requests" in line for line in lines))
+                    self.assertEqual(json.loads(request.data)["max_tokens"], 16)
+                    reply = next(replies)
+                    if isinstance(reply, Exception):
+                        raise reply
+                    return io.BytesIO(json.dumps({"choices": [{"message": {"content": reply}}]}).encode())
+
+                # A retry notice must be visible before entering its backoff wait.
+                def backoff(seconds):
+                    self.assertEqual(seconds, 1)
+                    self.assertTrue(any("timed out" in line and "retry attempt 2/2" in line for line in lines))
+
+                with Progress(f"trlx {method} rank 0", emit=lines.append) as progress, \
+                     patch.object(train, "_remove_stock_reporters"), \
+                     patch("dataset.endpoint.urllib.request.urlopen", side_effect=respond), \
+                     patch("dataset.endpoint.time.sleep", side_effect=backoff):
+                    train.build_trainer(cfg, object(), object(), [], None, [], progress=progress)
+                    judge = trainer_cls.call_args.kwargs["reward_funcs"][0]
+                    self.assertEqual(judge.__name__, "llm_judge")
+                    self.assertEqual(judge(["first", "second"], prompts=["p", "q"]), [9.0, 3.0])
+                self.assertTrue(any("judge requests" in line and "2/2 requests; finished" in line for line in lines))
+                self.assertTrue(all(line.startswith(f"trlx {method} rank 0:") for line in lines))
+
+    # Exhausted judge retries remain contextual training errors and never claim success.
+    def test_failed_judge_reports_before_propagating_training_error(self):
+        lines = []
+        args = {"url": "https://judge.invalid/v1", "model": "judge", "rubric": "score",
+                "timeout": 5, "retries": 0, "concurrency": 1}
+        with Progress("trlx grpo rank 0", emit=lines.append) as progress:
+            judge = rewards.resolve([RewardEntry("llm_judge", args)], progress=progress)[0]
+            with patch("dataset.endpoint.urllib.request.urlopen", side_effect=TimeoutError()), \
+                 self.assertRaisesRegex(TrlxError, r"\[rewards\].funcs\[0\].*gave up after 1 attempts"):
+                judge(["answer"])
+        self.assertTrue(any("stopping batch:" in line and "timed out" in line for line in lines))
+        self.assertTrue(any("judge requests" in line and "0/1 requests; failed" in line for line in lines))
+        self.assertFalse(any("1/1 requests; finished" in line for line in lines))
+
+    # Optional instrumentation must not make direct library reward use print progress.
+    def test_judge_without_reporter_preserves_silent_library_use(self):
+        reply = json.dumps({"choices": [{"message": {"content": "Score: 4"}}]}).encode()
+        args = {"url": "https://judge.invalid/v1", "model": "judge", "rubric": "score",
+                "timeout": 5, "retries": 0, "concurrency": 1}
+        with contextlib.redirect_stderr(io.StringIO()) as output, \
+             patch("dataset.endpoint.urllib.request.urlopen", return_value=io.BytesIO(reply)):
+            judge = rewards.resolve([RewardEntry("llm_judge", args)])[0]
+            self.assertEqual(judge(["answer"]), [4.0])
+        self.assertEqual(output.getvalue(), "")
 
 
 if __name__ == "__main__":

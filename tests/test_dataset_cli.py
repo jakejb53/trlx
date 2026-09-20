@@ -136,7 +136,8 @@ class DatasetOutputs(unittest.TestCase):
         self.assertIn("--force", error)
         self.assertEqual(self.source.read_bytes(), original)
         status, error = self.run_cli(command + ["--force"])
-        self.assertEqual((status, error), (0, ""))
+        self.assertEqual(status, 0)
+        self.assertIn("dataset shuffle: completed; elapsed", error)
         self.assertEqual(sorted(json.loads(line)["text"] for line in self.source.read_text().splitlines()),
                          ["first", "second"])
 
@@ -144,7 +145,9 @@ class DatasetOutputs(unittest.TestCase):
     def test_no_staging_does_not_imply_force(self):
         command = ["convert", self.source, "--out", self.source, "--no-staging"]
         self.assertEqual(self.run_cli(command)[0], 1)
-        self.assertEqual(self.run_cli(command + ["--force"]), (0, ""))
+        status, feedback = self.run_cli(command + ["--force"])
+        self.assertEqual(status, 0)
+        self.assertIn("dataset convert: completed; elapsed", feedback)
 
     # Output refusal occurs before any remote generation work.
     def test_chat_existing_output_refuses_before_endpoint_setup(self):
@@ -207,6 +210,94 @@ class DatasetOutputs(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn(str(source), error)
         self.assertIn("UTF-8", error)
+
+    # Every real handler announces work before opening its source and finishes on stderr.
+    def test_all_commands_report_read_processing_and_completion(self):
+        messages = self.root / "messages.jsonl"
+        messages.write_text(json.dumps({"messages": [
+            {"role": "user", "content": "Question?"},
+            {"role": "assistant", "content": "Answer."},
+        ]}) + "\n", encoding="utf-8")
+        text = self.root / "source.txt"
+        text.write_text("A short source paragraph.", encoding="utf-8")
+        broken = self.root / "repair.jsonl"
+        broken.write_text("{'text': 'repairable'}\n", encoding="utf-8")
+        cases = {
+            "convert": ([messages, "--to", "prompt-completion"], "converting messages"),
+            "shuffle": ([self.source, "--seed", "3"], "shuffling rows"),
+            "split": ([self.source, "--n", "1", "--rest", self.root / "rest.jsonl"], "splitting rows"),
+            "mix": ([self.source, self.source, "--fractions", "1,0.5", "--seed", "3"], "mixing datasets"),
+            "fields": ([self.source, "--add", "size=len(text)"], "applying field operations"),
+            "filter": ([self.source, "--where", "len(text)>0"], "filtering rows"),
+            "sample": ([self.source, "--n", "1", "--head"], "sampling rows"),
+            "cpt": ([text, "--max-tokens", "32"], "chunking source"),
+            "pairs": ([messages, messages], "aligning preference pairs"),
+            "heal": ([broken], "repairing JSONL lines"),
+            "chat": ([text, "--questions-endpoint", "https://example.invalid/v1",
+                      "--questions-model", "model", "--n", "1", "--max-tokens", "32",
+                      "--concurrency", "1", "--timeout", "1", "--retries", "0"], "questions from model"),
+            "stats": ([self.source], "counting tokens in text"),
+        }
+        self.assertEqual(set(cases), set(_commands(cli.build_parser())))
+        original_open = builtins.open
+        for name, (arguments, processing) in cases.items():
+            with self.subTest(command=name):
+                output = self.root / f"{name}.jsonl"
+                argv = [name, *arguments] + ([] if name == "stats" else ["--out", output])
+                stderr, stdout = io.StringIO(), io.StringIO()
+                reads = []
+
+                # Assert at the blocking boundary, so end-only output cannot pass this test.
+                def open_source(path, *args, **kwargs):
+                    if isinstance(path, (str, os.PathLike)) and pathlib.Path(path) == arguments[0]:
+                        reads.append(path)
+                        self.assertIn(f"dataset {name}: starting", stderr.getvalue())
+                        self.assertIn(f"reading {arguments[0]}", stderr.getvalue())
+                    return original_open(path, *args, **kwargs)
+
+                # Keep both real generation passes and endpoint progress; replace only HTTP I/O.
+                def reply(*args, **kwargs):
+                    return io.BytesIO(json.dumps({"choices": [{"message": {"content": "A reply"}}]}).encode())
+
+                with patch("dataset.cli.env.load"), patch("builtins.open", side_effect=open_source), \
+                        patch("dataset.endpoint.urllib.request.urlopen", side_effect=reply) as request, \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+                    status = cli.main([str(value) for value in argv])
+                self.assertEqual(status, 0, stderr.getvalue())
+                self.assertTrue(reads)
+                self.assertIn(processing, stderr.getvalue())
+                self.assertIn(f"dataset {name}: completed; elapsed", stderr.getvalue())
+                self.assertNotIn(f"dataset {name}:", stdout.getvalue())
+                self.assertEqual(request.call_count, 2 if name == "chat" else 0)
+                if name != "stats":
+                    self.assertTrue(output.is_file())
+                    self.assertIn(f"published {output}", stderr.getvalue())
+                if name == "chat":
+                    self.assertIn("answers from model", stderr.getvalue())
+                    self.assertIn("1/1 requests", stderr.getvalue())
+
+    # Healing may publish a partially repaired file while correctly returning a failed outcome.
+    def test_heal_unresolved_errors_do_not_report_command_success(self):
+        self.source.write_text("not JSON\n", encoding="utf-8")
+        output = self.root / "unrepaired.jsonl"
+        status, feedback = self.run_cli(["heal", self.source, "--out", output])
+        self.assertEqual(status, 1)
+        self.assertEqual(output.read_text(), "not JSON\n")
+        self.assertIn(f"published {output}", feedback)
+        self.assertIn("dataset heal: failed; elapsed", feedback)
+        self.assertNotIn("dataset heal: completed;", feedback)
+
+    # A failed input read must have an operation boundary and never claim output publication.
+    def test_invalid_input_reports_failure_without_publication(self):
+        self.source.write_text("not JSON\n", encoding="utf-8")
+        output = self.root / "failed.jsonl"
+        status, feedback = self.run_cli(["convert", self.source, "--out", output])
+        self.assertEqual(status, 1)
+        self.assertIn(f"reading {self.source}", feedback)
+        self.assertIn("dataset convert: failed; elapsed", feedback)
+        self.assertNotIn("dataset convert: completed;", feedback)
+        self.assertNotIn(f"published {output}", feedback)
+        self.assertFalse(output.exists())
 
 
 class StatsFailures(unittest.TestCase):

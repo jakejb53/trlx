@@ -15,6 +15,7 @@ import re
 
 from dataset.cpt import chunk_text
 from dataset.io import DatasetError
+from dataset.progress import stage
 
 # Built-in instructions. A --*-prompt file replaces the whole text. The
 # placeholders below are substituted in one pass over the template only, so
@@ -99,14 +100,16 @@ def parse_questions(reply, n):
 # Runs both passes. Returns (rows, skipped) where skipped lists messages for
 # chunks that yielded no questions and questions that yielded empty answers.
 def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_prompt,
-          answers_prompt, concurrency, strip_reasoning_tags=False):
-    chunks = chunk_text(text, max_tokens)
+          answers_prompt, concurrency, strip_reasoning_tags=False, *, progress=None):
+    with stage(progress, "chunking source text") as activity:
+        chunks = chunk_text(text, max_tokens, progress=activity)
+        activity.note(f"{len(chunks)} source chunks; requesting up to {n} questions per chunk")
     if not chunks:
         raise DatasetError("input text is empty")
     skipped = []
 
     requests = [[{"role": "user", "content": _fill(questions_prompt, n=n, chunk=c)}] for c in chunks]
-    replies = questions_endpoint.complete_many_full(requests, concurrency)
+    replies = questions_endpoint.complete_many_full(requests, concurrency, progress=progress, label="questions")
     pairs = []  # (chunk index, question)
     for i, reply in enumerate(replies):
         # Pass 1 discards reasoning: its output is question strings, not data.
@@ -120,7 +123,7 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
         [{"role": "user", "content": _fill(answers_prompt, chunk=chunks[i], question=q)}]
         for i, q in pairs
     ]
-    replies = answers_endpoint.complete_many_full(requests, concurrency)
+    replies = answers_endpoint.complete_many_full(requests, concurrency, progress=progress, label="answers")
     rows = []
     for (i, q), reply in zip(pairs, replies):
         where = f"chunk {i}, question: {q}"

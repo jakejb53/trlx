@@ -232,7 +232,7 @@ def length_window(where, args):
 # number in the reply is the score. A reply with no number scores 0 and is
 # logged with its text, so a misbehaving judge is visible in log.txt rather
 # than fatal mid-run.
-def llm_judge(where, args):
+def llm_judge(where, args, *, progress=None):
     _args(
         where,
         args,
@@ -260,6 +260,8 @@ def llm_judge(where, args):
     if not isinstance(concurrency, int) or concurrency < 1:
         raise TrlxError(f"{where}: concurrency must be a positive integer")
 
+    # Keep the worker's reporter for later training batches; resolution finishes
+    # before this callable performs any judge requests.
     def reward(completions, prompts=None, **kwargs):
         prompts = prompts if prompts is not None else [""] * len(completions)
         requests = [
@@ -270,7 +272,8 @@ def llm_judge(where, args):
             for p, c in zip(prompts, completions)
         ]
         try:
-            replies = endpoint.complete_many(requests, concurrency, max_tokens)
+            replies = endpoint.complete_many(requests, concurrency, max_tokens,
+                                             progress=progress, label=f"{where} judge requests")
         except DatasetError as e:
             raise TrlxError(f"{where}: {e}")
         scores = []
@@ -302,14 +305,17 @@ BUILTINS = {
 # bare string: trlx built-in, trl.rewards name, module:function or
 # path.py:function, else a model path. trl.rewards factories (get_*) take
 # their keyword arguments from the {name, args} form.
-def resolve(entries):
+def resolve(entries, *, progress=None):
     import trl.rewards
 
     funcs = []
     for i, entry in enumerate(entries):
         where = f"[rewards].funcs[{i}] '{entry.spec}'"
         name, args = entry.spec, entry.args
-        if name in BUILTINS:
+        # Only the endpoint-backed factory needs the worker's progress reporter.
+        if name == "llm_judge":
+            funcs.append(llm_judge(where, args or {}, progress=progress))
+        elif name in BUILTINS:
             funcs.append(BUILTINS[name](where, args or {}))
         elif hasattr(trl.rewards, name):
             target = getattr(trl.rewards, name)

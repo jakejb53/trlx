@@ -8,6 +8,7 @@ distinguishes those measured capabilities from conservative starting settings.
 import dataclasses
 
 from dataset.io import DatasetError, validate_output, write_text
+from dataset.progress import stage
 from trlx import TrlxError, config, hardware, trainers
 from trlx.hardware import Hardware
 from trlx.toml_write import Writer
@@ -166,12 +167,13 @@ def _default(field):
 
 # Existing settings require explicit replacement. Detect and render first so a
 # failed inspection cannot damage them, including with direct publication.
-def write(out="run.toml", force=False, no_staging=False) -> Hardware:
+def write(out="run.toml", force=False, no_staging=False, *, progress=None) -> Hardware:
     try:
         validate_output(out, force=force)
-        system = hardware.inspect()
-        text = render(system)
-        write_text(out, text, force=force, no_staging=no_staging)
+        system = hardware.inspect(progress=progress)
+        with stage(progress, "preparing environment defaults"):
+            text = render(system)
+        write_text(out, text, force=force, no_staging=no_staging, progress=progress)
     except DatasetError as exc:
         raise TrlxError(str(exc)) from exc
     return system

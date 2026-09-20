@@ -9,6 +9,7 @@ row-numbered message, never a traceback.
 import builtins
 
 from dataset.io import DatasetError
+from dataset.progress import stage
 
 # Builtins an expression may use. Everything else from builtins is withheld so
 # a typo like `lenght` reports as an unknown name rather than surprising behaviour.
@@ -47,25 +48,27 @@ def split_assignment(arg, flag):
 # Applies operations in the fixed order add, remove, rename, swap. Each list
 # holds (name, value) pairs already split from the flag argument. A remove,
 # rename, or swap naming an absent column is an error naming the row.
-def apply(rows, adds=(), removes=(), renames=(), swaps=()):
-    compiled = [(name, expr, compile_expression(expr)) for name, expr in adds]
-    out = []
-    for i, row in enumerate(rows):
-        row = dict(row)
-        for name, expr, code in compiled:
-            row[name] = evaluate(code, expr, row, i)
-        for name in removes:
-            if name not in row:
-                raise DatasetError(f"--remove {name}: row {i} has no column '{name}'")
-            del row[name]
-        for old, new in renames:
-            if old not in row:
-                raise DatasetError(f"--rename {old}={new}: row {i} has no column '{old}'")
-            row[new] = row.pop(old)
-        for a, b in swaps:
-            for name in (a, b):
+def apply(rows, adds=(), removes=(), renames=(), swaps=(), *, progress=None):
+    with stage(progress, "applying field operations", total=len(rows), unit="rows") as activity:
+        compiled = [(name, expr, compile_expression(expr)) for name, expr in adds]
+        out = []
+        for i, row in enumerate(rows):
+            row = dict(row)
+            for name, expr, code in compiled:
+                row[name] = evaluate(code, expr, row, i)
+            for name in removes:
                 if name not in row:
-                    raise DatasetError(f"--swap {a}={b}: row {i} has no column '{name}'")
-            row[a], row[b] = row[b], row[a]
-        out.append(row)
-    return out
+                    raise DatasetError(f"--remove {name}: row {i} has no column '{name}'")
+                del row[name]
+            for old, new in renames:
+                if old not in row:
+                    raise DatasetError(f"--rename {old}={new}: row {i} has no column '{old}'")
+                row[new] = row.pop(old)
+            for a, b in swaps:
+                for name in (a, b):
+                    if name not in row:
+                        raise DatasetError(f"--swap {a}={b}: row {i} has no column '{name}'")
+                row[a], row[b] = row[b], row[a]
+            out.append(row)
+            activity.advance()
+        return out

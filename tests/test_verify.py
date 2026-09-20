@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from dataset.progress import Progress
 from trlx import TrlxError, verify
 
 
@@ -71,3 +72,19 @@ class VerifyOutput(unittest.TestCase):
         with patch("trlx.verify.generate._render", return_value=("prompt", False)):
             with self.assertRaisesRegex(TrlxError, "CUDA memory exhausted comparing reward-model scores"):
                 self.raw_outputs(model, processor, ["prompt"])
+
+    # Successful scores alone advance the prompt counter, leaving returned scores unchanged.
+    def test_reward_scoring_reports_completed_prompts(self):
+        lines = []
+        model = Mock()
+        model.can_generate.return_value = False
+        model.parameters.return_value = iter([verify.torch.nn.Parameter(verify.torch.zeros(1))])
+        model.return_value.logits = verify.torch.tensor([[0.25]])
+        processor = Mock()
+        processor.tokenizer.return_value.to.return_value = {}
+        with patch("trlx.verify.generate._render", return_value=("prompt", False)):
+            with Progress("verify", emit=lines.append) as progress:
+                scores = self.raw_outputs(model, processor, ["first", "second"], progress=progress)
+        self.assertEqual(scores, ["score 0.25", "score 0.25"])
+        self.assertTrue(any("scoring verification prompts; 0/2 prompts" in line for line in lines))
+        self.assertTrue(any("scoring verification prompts; 2/2 prompts; finished" in line for line in lines))

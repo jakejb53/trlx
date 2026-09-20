@@ -20,6 +20,8 @@ import tempfile
 import pyarrow
 import pyarrow.parquet
 
+from dataset.progress import stage
+
 
 # Raised for any user-facing failure in this package. main() prints its message
 # and exits nonzero, so callers never see a traceback for bad input.
@@ -35,7 +37,7 @@ def _heal_guidance(path):
 
 
 # Reads a JSONL file. A line that is not a JSON object is an error naming the line.
-def _read_jsonl(path):
+def _read_jsonl(path, *, activity=None):
     rows = []
     with open(path, encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
@@ -48,19 +50,23 @@ def _read_jsonl(path):
             if not isinstance(row, dict):
                 raise DatasetError(f"{path}:{lineno}: expected a JSON object, got {type(row).__name__}")
             rows.append(row)
+            if activity is not None:
+                activity.advance()
     return rows
 
 
 # One object per line, non-ASCII kept as is so text round-trips readably.
-def _write_jsonl(path, rows):
+def _write_jsonl(path, rows, *, activity=None):
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False))
             f.write("\n")
+            if activity is not None:
+                activity.advance()
 
 
 # Reads a JSON file that must be an array of objects.
-def _read_json(path):
+def _read_json(path, *, activity=None):
     with open(path, encoding="utf-8") as f:
         try:
             data = json.load(f)
@@ -71,11 +77,13 @@ def _read_json(path):
     for i, row in enumerate(data):
         if not isinstance(row, dict):
             raise DatasetError(f"{path}: element {i} is {type(row).__name__}, expected an object")
+        if activity is not None:
+            activity.advance()
     return data
 
 
 # One array, indented one space per level to stay diffable without bloat.
-def _write_json(path, rows):
+def _write_json(path, rows, *, activity=None):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=1)
         f.write("\n")
@@ -83,14 +91,19 @@ def _write_json(path, rows):
 
 # CSV cells are read as strings; no type inference, since guessing types would
 # silently change data.
-def _read_csv(path):
+def _read_csv(path, *, activity=None):
     with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+        rows = []
+        for row in csv.DictReader(f):
+            rows.append(row)
+            if activity is not None:
+                activity.advance()
+        return rows
 
 
 # CSV cannot carry lists or dicts. Refuses rather than JSON-encoding silently.
 # Columns are the union over all rows in first-seen order.
-def _write_csv(path, rows):
+def _write_csv(path, rows, *, activity=None):
     columns = []
     seen = set()
     for i, row in enumerate(rows):
@@ -105,17 +118,20 @@ def _write_csv(path, rows):
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow(row)
+            if activity is not None:
+                activity.advance()
 
 
 # Whole table to Python values; nested struct columns become dicts and lists.
-def _read_parquet(path):
+def _read_parquet(path, *, activity=None):
     return pyarrow.parquet.read_table(path).to_pylist()
 
 
 # from_pylist infers one schema across all rows; rows with conflicting nested
 # shapes surface as a pyarrow error, which we translate rather than pass through.
-def _write_parquet(path, rows):
+def _write_parquet(path, rows, *, activity=None):
     try:
         table = pyarrow.Table.from_pylist(rows)
     except (pyarrow.ArrowInvalid, pyarrow.ArrowTypeError) as e:
@@ -124,6 +140,7 @@ def _write_parquet(path, rows):
 
 
 # Single source of truth for supported formats.
+# Format callbacks receive an optional stage; opaque codecs report only on return.
 FORMATS = {
     ".jsonl": (_read_jsonl, _write_jsonl),
     ".json": (_read_json, _write_json),
@@ -145,14 +162,17 @@ def _format(path):
 
 
 # Translate file/format failures where the input path and a recovery action are known.
-def read_rows(path):
+def read_rows(path, *, progress=None):
     reader, _ = _format(path)
     try:
         if not pathlib.Path(path).exists():
             raise DatasetError(f"{path}: no such file; supply an existing dataset path")
         if not pathlib.Path(path).is_file():
             raise DatasetError(f"{path}: not a regular file; supply a dataset file, not a directory")
-        return reader(path)
+        with stage(progress, f"reading {path}", unit="rows") as activity:
+            rows = reader(path, activity=activity)
+            activity.update(len(rows), total=len(rows))
+            return rows
     except UnicodeError as e:
         raise DatasetError(f"{path}: cannot decode dataset: {e}; save text datasets as UTF-8") from e
     except (csv.Error, pyarrow.ArrowInvalid, pyarrow.ArrowTypeError) as e:
@@ -303,52 +323,59 @@ def _publish_prepared(target, folder, force, directory):
 
 # Callers finish reading inputs before calling this function. Direct mode deliberately
 # gives up preservation on failure; force authorizes replacement, not silent link traversal.
-def publish_output(path, writer, *, force=False, no_staging=False, directory=False, follow_symlinks=False):
-    target = validate_output(path, force, follow_symlinks=follow_symlinks, directory=directory)
-    folder = None
-    try:
-        if directory:
-            target.parent.mkdir(parents=True, exist_ok=True)
-        if no_staging:
-            mode = _output_mode(target)
-            if force:
-                _remove_output(target)
-            _reserve_output(target, directory)
-            writer(target)
-            # A writable parent permits replacing a read-only file. Restore its mode
-            # only after writing so direct mode does not fail reopening its own output.
-            if mode is not None and not directory:
-                target.chmod(mode)
-        else:
-            folder = _prepare_output(target, writer, directory)
-            _publish_prepared(target, folder, force, directory)
-    except (OSError, DatasetError) as e:
-        consequence = (
-            "direct writing was requested; the original may be lost and the destination may be incomplete"
-            if no_staging else "staged output operation failed; inspect the publication status above"
-        )
-        recovery = ("Use --force to replace the output created by another writer, or choose another path"
-                    if isinstance(e, FileExistsError) and not force else
-                    "Check available space and filesystem permissions before retrying")
-        raise DatasetError(
-            f"{path}: cannot write output: {e}; {consequence}. {recovery}"
-        ) from e
-    finally:
-        if folder is not None:
-            failure = sys.exception()
-            try:
-                _clean_stage(folder)
-            except OSError as e:
-                detail = f"{failure}; " if failure is not None else f"{path}: output published; "
-                message = f"{detail}cannot clean staging directory {folder}: {e}; remove it after checking the output"
-                if failure is not None and not isinstance(failure, (OSError, DatasetError)):
-                    failure.add_note(message)
-                else:
-                    raise DatasetError(message) from failure
+def publish_output(path, writer, *, force=False, no_staging=False, directory=False, follow_symlinks=False, progress=None):
+    with stage(progress, f"writing {path}") as activity:
+        target = validate_output(path, force, follow_symlinks=follow_symlinks, directory=directory)
+        folder = None
+        try:
+            if directory:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            if no_staging:
+                with stage(activity, f"writing directly to {path}"):
+                    mode = _output_mode(target)
+                    if force:
+                        _remove_output(target)
+                    _reserve_output(target, directory)
+                    writer(target)
+                    # A writable parent permits replacing a read-only file. Restore its mode
+                    # only after writing so direct mode does not fail reopening its own output.
+                    if mode is not None and not directory:
+                        target.chmod(mode)
+            else:
+                with stage(activity, f"preparing output {path}"):
+                    folder = _prepare_output(target, writer, directory)
+                with stage(activity, f"publishing {path}"):
+                    _publish_prepared(target, folder, force, directory)
+        except (OSError, DatasetError) as e:
+            consequence = (
+                "direct writing was requested; the original may be lost and the destination may be incomplete"
+                if no_staging else "staged output operation failed; inspect the publication status above"
+            )
+            recovery = ("Use --force to replace the output created by another writer, or choose another path"
+                        if isinstance(e, FileExistsError) and not force else
+                        "Check available space and filesystem permissions before retrying")
+            raise DatasetError(
+                f"{path}: cannot write output: {e}; {consequence}. {recovery}"
+            ) from e
+        finally:
+            if folder is not None:
+                failure = sys.exception()
+                try:
+                    with stage(activity, f"cleaning output staging for {path}"):
+                        _clean_stage(folder)
+                except OSError as e:
+                    detail = f"{failure}; " if failure is not None else f"{path}: output published; "
+                    message = f"{detail}cannot clean staging directory {folder}: {e}; remove it after checking the output"
+                    if failure is not None and not isinstance(failure, (OSError, DatasetError)):
+                        failure.add_note(message)
+                    else:
+                        raise DatasetError(message) from failure
+        # Publication is successful only after retained-output and staging cleanup.
+        activity.note(f"published {path}")
 
 
 # Text reports/configs and healing share publication policy without changing their content.
-def write_text(path, text, *, force=False, no_staging=False, follow_symlinks=False):
+def write_text(path, text, *, force=False, no_staging=False, follow_symlinks=False, progress=None):
     # The destination is already reserved; writing here never chooses replacement policy.
     def write(prepared):
         try:
@@ -356,17 +383,20 @@ def write_text(path, text, *, force=False, no_staging=False, follow_symlinks=Fal
         except UnicodeError as e:
             raise DatasetError(f"{path}: cannot encode output as UTF-8; correct invalid Unicode characters in the input") from e
 
-    publish_output(path, write, force=force, no_staging=no_staging, follow_symlinks=follow_symlinks)
+    publish_output(path, write, force=force, no_staging=no_staging,
+                   follow_symlinks=follow_symlinks, progress=progress)
 
 
 # Serialization errors describe the operator's output, never the temporary staging filename.
-def _rows_writer(path, rows):
+def _rows_writer(path, rows, *, progress=None):
     _, writer = _format(path)
 
     # Unsupported values may originate in input formats or user expressions, not code bugs.
     def write(prepared):
         try:
-            writer(prepared, rows)
+            with stage(progress, f"serializing {path}", total=len(rows), unit="rows") as activity:
+                writer(prepared, rows, activity=activity)
+                activity.update(len(rows))
         except (TypeError, ValueError, UnicodeError, csv.Error, pyarrow.ArrowInvalid, pyarrow.ArrowTypeError) as e:
             raise DatasetError(
                 f"{path}: cannot serialize {pathlib.Path(path).suffix} output: {e}; "
@@ -380,9 +410,10 @@ def _rows_writer(path, rows):
 
 # Inputs have been fully materialized by the caller, so force can replace the input path.
 # Keep the inputs argument for existing callers; replacement authorization is destination-based.
-def write_rows(path, rows, inputs=(), *, force=False, no_staging=False):
+def write_rows(path, rows, inputs=(), *, force=False, no_staging=False, progress=None):
     validate_rows_output(path, force)
-    publish_output(path, _rows_writer(path, rows), force=force, no_staging=no_staging)
+    publish_output(path, _rows_writer(path, rows, progress=progress),
+                   force=force, no_staging=no_staging, progress=progress)
 
 
 # Distinct output entries are required even with force: two results cannot occupy one path.
@@ -400,39 +431,48 @@ def _validate_outputs(outputs, force):
 
 # Split prepares every serialization before publishing any result. Publication itself is
 # sequential, so a second-output failure must identify results already changed.
-def write_many_rows(outputs, inputs=(), *, force=False, no_staging=False):
-    outputs = list(outputs)
-    prepared = []
-    changed = []
-    try:
-        targets = _validate_outputs(outputs, force)
-        if not no_staging:
-            for target, (path, rows) in zip(targets, outputs):
-                prepared.append(_prepare_output(target, _rows_writer(path, rows), False))
-        for i, (target, (path, rows)) in enumerate(zip(targets, outputs)):
-            if no_staging:
-                publish_output(target, _rows_writer(path, rows), force=force, no_staging=True)
-            else:
-                _publish_prepared(target, prepared[i], force, False)
-            changed.append(str(path))
-    except (OSError, DatasetError) as e:
-        status = "completed destinations: " + ", ".join(changed) if changed else "no destination completed"
-        raise DatasetError(f"cannot write split outputs: {e}; {status}. Check the named destinations before retrying") from e
-    finally:
-        failure = sys.exception()
-        cleanup_errors = []
-        for folder in prepared:
-            try:
-                _clean_stage(folder)
-            except OSError as e:
-                cleanup_errors.append(f"{folder}: {e}")
-        if cleanup_errors:
-            # Cleanup cannot erase the original failure or which split result was installed.
+def write_many_rows(outputs, inputs=(), *, force=False, no_staging=False, progress=None):
+    with stage(progress, "writing split outputs", total=None, unit="files") as activity:
+        outputs = list(outputs)
+        prepared = []
+        changed = []
+        try:
+            targets = _validate_outputs(outputs, force)
+            if not no_staging:
+                for target, (path, rows) in zip(targets, outputs):
+                    with stage(activity, f"preparing output {path}"):
+                        prepared.append(_prepare_output(target, _rows_writer(path, rows, progress=activity), False))
+            for i, (target, (path, rows)) in enumerate(zip(targets, outputs)):
+                if no_staging:
+                    publish_output(target, _rows_writer(path, rows, progress=activity),
+                                   force=force, no_staging=True, progress=activity)
+                else:
+                    with stage(activity, f"publishing {path}"):
+                        _publish_prepared(target, prepared[i], force, False)
+                changed.append(str(path))
+        except (OSError, DatasetError) as e:
             status = "completed destinations: " + ", ".join(changed) if changed else "no destination completed"
-            detail = f"{failure}; " if failure is not None else ""
-            message = (f"{detail}cannot clean staging directories: {'; '.join(cleanup_errors)}; {status}; "
-                       "inspect the destinations before removing retained staging files")
-            if failure is not None and not isinstance(failure, (OSError, DatasetError)):
-                failure.add_note(message)
-            else:
-                raise DatasetError(message) from failure
+            raise DatasetError(f"cannot write split outputs: {e}; {status}. Check the named destinations before retrying") from e
+        finally:
+            failure = sys.exception()
+            cleanup_errors = []
+            for folder in prepared:
+                try:
+                    with stage(activity, "cleaning split output staging"):
+                        _clean_stage(folder)
+                except OSError as e:
+                    cleanup_errors.append(f"{folder}: {e}")
+            if cleanup_errors:
+                # Cleanup cannot erase the original failure or which split result was installed.
+                status = "completed destinations: " + ", ".join(changed) if changed else "no destination completed"
+                detail = f"{failure}; " if failure is not None else ""
+                message = (f"{detail}cannot clean staging directories: {'; '.join(cleanup_errors)}; {status}; "
+                           "inspect the destinations before removing retained staging files")
+                if failure is not None and not isinstance(failure, (OSError, DatasetError)):
+                    failure.add_note(message)
+                else:
+                    raise DatasetError(message) from failure
+        # Completion follows cleanup of every prepared destination.
+        activity.update(len(changed), total=len(outputs))
+        for path in changed:
+            activity.note(f"published {path}")

@@ -10,6 +10,7 @@ import statistics
 from dataset.convert import final_assistant_index
 from dataset.cpt import ESTIMATE_LABEL, estimate_tokens
 from dataset.io import DatasetError
+from dataset.progress import stage
 
 # Columns scored for log-prob when present. Each is conditioned on the row's
 # `prompt` column; `messages` is conditioned on its own preceding turns.
@@ -56,19 +57,21 @@ def _summary(values):
 
 
 # Length distribution per column. `count` maps text to a token count.
-def lengths(rows, columns, count):
+def lengths(rows, columns, count, *, progress=None):
     out = {}
     for column in columns:
         values = []
-        for i, row in enumerate(rows):
-            if column not in row:
-                raise DatasetError(f"row {i} has no column '{column}'")
-            v = row[column]
-            text = _messages_text(v) if isinstance(v, list) else v
-            if not isinstance(text, str):
-                raise DatasetError(f"row {i} column '{column}' is {type(v).__name__}, expected text")
-            values.append(count(text))
-        out[column] = _summary(values)
+        with stage(progress, f"counting tokens in {column}", total=len(rows), unit="rows") as activity:
+            for i, row in enumerate(rows):
+                if column not in row:
+                    raise DatasetError(f"row {i} has no column '{column}'")
+                v = row[column]
+                text = _messages_text(v) if isinstance(v, list) else v
+                if not isinstance(text, str):
+                    raise DatasetError(f"row {i} column '{column}' is {type(v).__name__}, expected text")
+                values.append(count(text))
+                activity.advance()
+            out[column] = _summary(values)
     return out
 
 
@@ -172,7 +175,7 @@ def _response_pair(row, column, index):
 # Per-column mean log-prob summaries. Rows are scored one at a time. Rows
 # with no scoreable response tokens are counted and reported, never dropped
 # silently, so the summary count can be reconciled with the row count.
-def logprobs(rows, tokenizer, model, device):
+def logprobs(rows, tokenizer, model, device, *, progress=None):
     import torch
 
     present = [c for c in RESPONSE_COLUMNS + ("messages",) if c in rows[0]]
@@ -180,37 +183,41 @@ def logprobs(rows, tokenizer, model, device):
     for column in present:
         values = []
         empty = 0
-        for i, row in enumerate(rows):
-            if "messages" not in row and column == "messages":
-                raise DatasetError(f"row {i} has no column 'messages'")
-            ctx, full = _encode_pair(tokenizer, *_response_pair(row, column, i), i)
-            # Resource exhaustion is an operator failure; other model bugs still propagate.
-            try:
-                lp = _logprob(model, device, ctx, full)
-            except torch.cuda.OutOfMemoryError as e:
-                raise DatasetError(
-                    f"row {i}, column '{column}': out of memory scoring {len(full)} tokens on {device}; "
-                    "free device memory, shorten the input, or choose a smaller model"
-                ) from e
-            if lp is None:
-                empty += 1
-            else:
-                values.append(lp)
-        if empty:
-            print(f"{column}: {empty} rows with an empty response were not scored")
-        if values:
-            out[column] = _summary(values)
+        with stage(progress, f"scoring {column}", total=len(rows), unit="rows") as activity:
+            for i, row in enumerate(rows):
+                if "messages" not in row and column == "messages":
+                    raise DatasetError(f"row {i} has no column 'messages'")
+                ctx, full = _encode_pair(tokenizer, *_response_pair(row, column, i), i)
+                # Resource exhaustion is an operator failure; other model bugs still propagate.
+                try:
+                    lp = _logprob(model, device, ctx, full)
+                except torch.cuda.OutOfMemoryError as e:
+                    raise DatasetError(
+                        f"row {i}, column '{column}': out of memory scoring {len(full)} tokens on {device}; "
+                        "free device memory, shorten the input, or choose a smaller model"
+                    ) from e
+                if lp is None:
+                    empty += 1
+                else:
+                    values.append(lp)
+                # Counts inspected rows, including empty responses that cannot be scored.
+                activity.advance()
+            if empty:
+                print(f"{column}: {empty} rows with an empty response were not scored")
+            if values:
+                out[column] = _summary(values)
     return out
 
 
 # Entry point for the subcommand. Prints tables; returns nothing.
-def run(rows, columns=None, model_path=None):
+def run(rows, columns=None, model_path=None, *, progress=None):
     columns = _columns(rows, columns)
     if model_path is None:
-        print_table("token lengths", lengths(rows, columns, estimate_tokens), ESTIMATE_LABEL)
+        print_table("token lengths", lengths(rows, columns, estimate_tokens, progress=progress), ESTIMATE_LABEL)
         return
-    tokenizer, model, device = _load(model_path)
+    with stage(progress, f"loading model and tokenizer {model_path}"):
+        tokenizer, model, device = _load(model_path)
     count = lambda text: len(tokenizer(text, add_special_tokens=False)["input_ids"])
-    print_table("token lengths", lengths(rows, columns, count), f"exact, {model_path}")
+    print_table("token lengths", lengths(rows, columns, count, progress=progress), f"exact, {model_path}")
     print()
-    print_table("mean per-token log-prob of response", logprobs(rows, tokenizer, model, device), "nats")
+    print_table("mean per-token log-prob of response", logprobs(rows, tokenizer, model, device, progress=progress), "nats")

@@ -17,6 +17,7 @@ from transformers import AutoConfig, AutoProcessor
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 
+from dataset.progress import stage
 from trlx import TrlxError
 
 SEQUENCE_CLASSIFICATION = "sequence_classification"
@@ -34,9 +35,10 @@ def _pretrained_kwargs(spec):
 
 # The model's own config. A missing path or unreachable hub id surfaces here
 # first, so this is where that error is made readable.
-def load_config(spec):
+def load_config(spec, *, progress=None):
     try:
-        return AutoConfig.from_pretrained(spec.path, **_pretrained_kwargs(spec))
+        with stage(progress, f"loading model configuration {spec.path}"):
+            return AutoConfig.from_pretrained(spec.path, **_pretrained_kwargs(spec))
     except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load model config: {e}")
 
@@ -83,9 +85,10 @@ def _sequence_classification_class(spec, config):
 # Method.model_kind. device_map is passed through when given (merge and
 # verify use "auto"); training leaves it None so each rank loads onto its
 # own device.
-def load_model(spec, kind, device_map=None):
-    config = load_config(spec)
-    cls = model_class(spec, config, kind)
+def load_model(spec, kind, device_map=None, *, progress=None):
+    config = load_config(spec, progress=progress)
+    with stage(progress, f"resolving model class {spec.path}"):
+        cls = model_class(spec, config, kind)
     kwargs = _pretrained_kwargs(spec)
     # "auto" is transformers' own "use the checkpoint's dtype"; config.py never
     # accepts it from a run config, merge constructs it directly.
@@ -98,7 +101,8 @@ def load_model(spec, kind, device_map=None):
         # A reward model outputs one scalar; TRL's RewardTrainer requires it.
         kwargs["num_labels"] = 1
     try:
-        return cls.from_pretrained(spec.path, **kwargs)
+        with stage(progress, f"loading model weights {spec.path}"):
+            return cls.from_pretrained(spec.path, **kwargs)
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError(f"[model].path '{spec.path}': CUDA memory exhausted while loading weights; "
                         "free GPU memory or select a smaller model") from e
@@ -108,8 +112,9 @@ def load_model(spec, kind, device_map=None):
 
 # Tokenizer or processor for the model. AutoProcessor returns the tokenizer
 # for text-only checkpoints, so one call covers both.
-def load_processor(spec):
+def load_processor(spec, *, progress=None):
     try:
-        return AutoProcessor.from_pretrained(spec.path, **_pretrained_kwargs(spec))
+        with stage(progress, f"loading processor {spec.path}"):
+            return AutoProcessor.from_pretrained(spec.path, **_pretrained_kwargs(spec))
     except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load tokenizer or processor: {e}")

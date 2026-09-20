@@ -45,6 +45,21 @@ Fresh training allocates a new run; checkpoint resume retains its automatic rewi
 Training's `--no-staging` controls config snapshots, resume metric rewrites, preflight reports, and
 verification reports. Trainer checkpoints are saved directly in either mode.
 
+### 1.2 Command feedback
+
+Both CLIs report startup, current operations, measured counts when available,
+retries, and final outcome with elapsed time to flushed stderr. After ten seconds
+without feedback, report the active operation, elapsed time, and time since its
+last measured progress; waiting notices do not establish that work is advancing.
+Opaque operations have no inferred percentage. Counter output is coalesced to
+one second; these intervals are display constants. Help does not start reporting.
+
+Training records operational feedback in `log.txt`; line mode mirrors it and the
+TUI shows its existing log pane. Worker feedback identifies the rank. Metrics
+remain authoritative in `metrics.jsonl`. Publication success follows publication
+and cleanup. Endpoint batches report completions as observed while preserving
+input order in their returned results.
+
 ## 2. trlx
 
 ### 2.1 Commands

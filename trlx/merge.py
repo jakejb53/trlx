@@ -12,6 +12,7 @@ import torch
 from peft import PeftModel
 
 from dataset.io import DatasetError, publish_output, validate_output
+from dataset.progress import stage
 from trlx import TrlxError, adapter_check, model
 from trlx.config import ModelSpec
 
@@ -54,7 +55,7 @@ def _check_direct_inputs(target, base, adapter):
 
 
 # Validate trained adapter weights before publishing the model and its processor together.
-def merge(base, adapter, out, *, force=False, no_staging=False):
+def merge(base, adapter, out, *, force=False, no_staging=False, progress=None):
     try:
         target = validate_output(out, force, directory=True)
     except DatasetError as e:
@@ -64,38 +65,44 @@ def merge(base, adapter, out, *, force=False, no_staging=False):
     # A GPU is a baseline requirement of trlx; there is no CPU path.
     if not torch.cuda.is_available():
         raise TrlxError("merge needs a CUDA device and none is available")
-    task_type = adapter_check.task_type(adapter)
+    with stage(progress, f"reading adapter configuration {adapter}"):
+        task_type = adapter_check.task_type(adapter)
     kind = model.SEQUENCE_CLASSIFICATION if task_type == "SEQ_CLS" else model.CAUSAL
     # dtype "auto" keeps the base checkpoint's own dtype; merge has no flag
     # for it because a merge must not change the weights' precision.
     spec = ModelSpec(path=base, dtype="auto", trust_remote_code=None, attn_implementation=None)
-    base_model = model.load_model(spec, kind, device_map="auto")
+    base_model = model.load_model(spec, kind, device_map="auto", progress=progress)
     print(f"loaded {type(base_model).__name__} from {base}")
 
     try:
-        peft_model = PeftModel.from_pretrained(base_model, adapter)
+        with stage(progress, f"loading adapter {adapter}"):
+            peft_model = PeftModel.from_pretrained(base_model, adapter)
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError(f"{adapter}: CUDA memory exhausted loading adapter; free GPU memory") from e
     except (OSError, ValueError) as e:
         raise TrlxError(f"{adapter}: cannot load adapter: {e}")
 
-    result = adapter_check.check(adapter, peft_model)
+    with stage(progress, f"checking loaded adapter {adapter}"):
+        result = adapter_check.check(adapter, peft_model)
     print(result.message())
     if not result.ok:
         raise TrlxError("adapter check failed; nothing written")
 
     try:
-        merged = peft_model.merge_and_unload()
+        with stage(progress, "merging adapter weights"):
+            merged = peft_model.merge_and_unload()
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError(f"{adapter}: CUDA memory exhausted merging adapter; free GPU memory") from e
     # In-place replacement is staged, so save_pretrained can still read input assets.
-    processor = model.load_processor(spec)
+    processor = model.load_processor(spec, progress=progress)
 
     # Both artifacts share one publication boundary, so staging protects either failure.
     def save(destination):
         try:
-            merged.save_pretrained(destination)
-            processor.save_pretrained(destination)
+            with stage(progress, f"saving merged model {out}"):
+                merged.save_pretrained(destination)
+            with stage(progress, f"saving processor {out}"):
+                processor.save_pretrained(destination)
         except torch.cuda.OutOfMemoryError as e:
             raise DatasetError(f"{out}: CUDA memory exhausted saving merged model; free GPU memory") from e
         except ValueError as e:
@@ -103,7 +110,7 @@ def merge(base, adapter, out, *, force=False, no_staging=False):
                                "check the model and processor configuration") from e
 
     try:
-        publish_output(out, save, force=force, no_staging=no_staging, directory=True)
+        publish_output(out, save, force=force, no_staging=no_staging, directory=True, progress=progress)
     except DatasetError as e:
         raise TrlxError(str(e)) from e
     print(f"merged model written to {out}")

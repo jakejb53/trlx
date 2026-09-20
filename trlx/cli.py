@@ -5,6 +5,7 @@ import sys
 
 from dataset.env import load as load_env
 from dataset.io import DatasetError
+from dataset.progress import Progress, stage
 from trlx import TrlxError
 from trlx.options import HelpFormatter, add_training_options, overrides
 
@@ -18,7 +19,7 @@ STRATEGIES = ["ddp", "fsdp"]
 def _cmd_init(args):
     from trlx import init_cmd
 
-    system = init_cmd.write(args.out, force=args.force, no_staging=args.no_staging)
+    system = init_cmd.write(args.out, force=args.force, no_staging=args.no_staging, progress=args.progress)
     print(f"wrote {args.out} for {len(system.gpus)} visible GPU(s), {system.cpu_count} logical processor(s)")
     return 0
 
@@ -27,7 +28,8 @@ def _cmd_init(args):
 def _cmd_merge(args):
     from trlx import merge
 
-    merge.merge(args.base, args.adapter, args.out, force=args.force, no_staging=args.no_staging)
+    merge.merge(args.base, args.adapter, args.out, force=args.force,
+                no_staging=args.no_staging, progress=args.progress)
     return 0
 
 
@@ -44,9 +46,9 @@ def _cmd_show(args):
     from trlx import show
 
     if args.tui:
-        show.show_tui(args.run)
+        show.show_tui(args.run, progress=args.progress)
     else:
-        show.show_lines(args.run)
+        show.show_lines(args.run, progress=args.progress)
     return 0
 
 
@@ -65,14 +67,14 @@ def _cmd_verify(args):
 
     prompts = config.dataset_ref("trlx verify", "--prompts", args.prompts) if args.prompts else None
     return 0 if verify.run(args.checkpoint, args.base, prompts,
-                          force=args.force, no_staging=args.no_staging).ok else 1
+                          force=args.force, no_staging=args.no_staging, progress=args.progress).ok else 1
 
 
 # Generate replay rows locally or through a configured endpoint.
 def _cmd_replay_build(args):
     from trlx import replay_build
 
-    replay_build.run(args)
+    replay_build.run(args, progress=args.progress)
     return 0
 
 
@@ -125,6 +127,8 @@ def build_parser(method=None):
         epilog="Start here:\n  trlx init\n  trlx sft --model MODEL --dataset DATA\n\n"
                "Settings: CLI overrides > selected method section > shared run.toml settings.\n"
                "CLI overrides apply to one run; edit run.toml for persistent changes.\n"
+               "Progress goes to stderr; training also records it in log.txt.\n"
+               "Waiting notices follow 10 seconds without feedback.\n"
                "Inspect a command: trlx sft --help, trlx check sft --help, trlx merge --help.\n"
                "Help never requires a config file, model, dataset, or GPU.",
     )
@@ -284,21 +288,57 @@ def parse_args(argv=None):
     return build_parser(method).parse_args(argv)
 
 
+# Progress stores startup display failures; the training supervisor records them
+# once log.txt exists and preserves ownership of the job despite a broken terminal.
+def _defer_training_display_error(error):
+    pass
+
+
 # Only execution loads .env or dispatches work; help requires neither.
 def main(argv=None):
-    args = parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Detailed help may inspect library metadata, but help never starts execution feedback.
+    if "--help" in argv or "-h" in argv:
+        parse_args(argv)
+        return 0
+    commands = METHODS + ["init", "show", "check", "verify", "merge", "replay-build"]
+    command = argv[0] if argv and argv[0] in commands else "command"
+    label = f"trlx {command}"
+    # Identify internal worker output even during library imports. This only labels
+    # feedback; parse_args still owns argument validation and the actual rank value.
+    worker_rank = None
+    for index, token in enumerate(argv):
+        if token == "--_rank" and index + 1 < len(argv):
+            worker_rank = argv[index + 1]
+        elif token.startswith("--_rank="):
+            worker_rank = token.partition("=")[2]
+    if worker_rank is not None and worker_rank.isdecimal():
+        label += f" rank {worker_rank}"
     try:
-        # Before any handler runs, so an api_key variable named in a run config
-        # or on the command line can come from .env. The loader is shared with
-        # dataset, so its error is restated as the one exception type this
-        # entry point catches.
-        try:
-            load_env()
-        except DatasetError as e:
-            raise TrlxError(str(e))
-        return args.func(args)
+        on_error = _defer_training_display_error if command in METHODS and worker_rank is None else None
+        with Progress(label, on_error=on_error) as progress:
+            with stage(progress, "loading command options"):
+                args = parse_args(argv)
+            rank = getattr(args, "_rank", None)
+            progress.command = f"trlx {args.command}" + (f" rank {rank}" if rank is not None else "")
+            if rank is not None:
+                # Worker stderr is the authoritative log, so its write failures are fatal.
+                progress.on_error = None
+            args.progress = progress
+            # Secrets are loaded before dispatch, without including their values in feedback.
+            with stage(progress, "loading credentials"):
+                try:
+                    load_env()
+                except DatasetError as e:
+                    raise TrlxError(str(e))
+            with stage(progress, f"running {args.command}"):
+                result = args.func(args)
+            progress.finish("completed" if result == 0 else "failed")
+            return result
     except TrlxError as e:
-        print(f"trlx {args.command}: {e}", file=sys.stderr)
+        # A supervisor may have disabled a broken stderr; never redirect errors to metrics stdout.
+        if sys.stderr is not None:
+            print(f"trlx {command}: {e}", file=sys.stderr)
         return 1
 
 

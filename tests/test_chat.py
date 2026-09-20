@@ -4,13 +4,17 @@ No network: StubEndpoint stands in for Endpoint and returns canned Reply
 objects in request order, which is the order build() relies on.
 """
 
+import io
+import json
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from dataset.chat import ANSWERS_PROMPT, QUESTIONS_PROMPT, build, load_prompt, strip_inline_reasoning
-from dataset.endpoint import Reply
+from dataset.endpoint import Endpoint, Reply
 from dataset.io import DatasetError
+from dataset.progress import Progress
 
 TEXT = "Rain falls from clouds. Rivers carry water to the sea."
 
@@ -22,7 +26,7 @@ class StubEndpoint:
         self.replies = list(replies)
         self.requests = []
 
-    def complete_many_full(self, message_lists, concurrency, max_tokens=None):
+    def complete_many_full(self, message_lists, concurrency, max_tokens=None, *, progress=None, label="requests"):
         self.requests.extend(message_lists)
         out, self.replies = self.replies[: len(message_lists)], self.replies[len(message_lists):]
         return out
@@ -81,6 +85,37 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual(rows[0]["messages"][0]["content"], "What falls?")
         self.assertEqual(rows[0]["messages"][1]["content"], "Rain falls.")
+
+
+class BuildProgress(unittest.TestCase):
+    # Two-pass generation must expose source size and the active pass before awaiting replies.
+    def test_source_count_and_each_pass_are_visible_before_network_work(self):
+        lines = []
+        observed = []
+        questions = Endpoint("http://questions/v1", "question-model", None, 1, 0)
+        answers = Endpoint("http://answers/v1", "answer-model", None, 1, 0)
+
+        # Snapshot at the external boundary, before any reply can complete.
+        def reply(request, timeout):
+            observed.append((request.full_url, list(lines)))
+            content = "What falls?" if request.full_url == questions.url else "Rain falls."
+            return io.BytesIO(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+
+        with patch("dataset.endpoint.urllib.request.urlopen", side_effect=reply):
+            rows, skipped = build(TEXT, 1000, 1, questions, answers, QUESTIONS_PROMPT,
+                                  ANSWERS_PROMPT, 1, progress=Progress("dataset chat", emit=lines.append))
+        self.assertEqual(skipped, [])
+        self.assertEqual(rows[0]["messages"][1]["content"], "Rain falls.")
+        self.assertEqual([url for url, _ in observed], [questions.url, answers.url])
+        question_output = "\n".join(observed[0][1])
+        answer_output = "\n".join(observed[1][1])
+        self.assertIn("1 source chunks", question_output)
+        self.assertIn("questions from question-model", question_output)
+        self.assertIn("0/1 requests", question_output)
+        self.assertNotIn("answers from answer-model", question_output)
+        self.assertIn("questions from question-model", answer_output)
+        self.assertIn("1/1 requests; finished", answer_output)
+        self.assertIn("answers from answer-model", answer_output)
 
 
 class PromptErrors(unittest.TestCase):

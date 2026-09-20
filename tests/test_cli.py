@@ -2,9 +2,11 @@
 
 import contextlib
 import io
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
+from dataset.progress import Progress
 from trlx import TrlxError, cli, config, hardware, model, options
 
 
@@ -23,7 +25,8 @@ class Interface(unittest.TestCase):
                  patch("trlx.init_cmd.write", return_value=hardware.Hardware(8, ())) as write, \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(["init", "--force", "--out", "alternate.toml", *flags]), 0)
-            write.assert_called_once_with("alternate.toml", force=True, no_staging=no_staging)
+            write.assert_called_once_with("alternate.toml", force=True, no_staging=no_staging, progress=ANY)
+            self.assertIsInstance(write.call_args.kwargs["progress"], Progress)
 
     # Force is an execution control even on commands with no destructive output work.
     def test_force_is_accepted_without_becoming_a_config_override(self):
@@ -156,6 +159,90 @@ class Interface(unittest.TestCase):
                     self.assertIn("Library default", help_text)
                     self.assertNotIn("--_rank", help_text)
                     self.assertNotIn("Config: dataset.source", help_text)
+
+
+class CommandProgress(unittest.TestCase):
+    # Every public entrypoint must emit before its expensive operation and keep stdout clean.
+    def test_every_command_announces_activity_before_work_and_reports_completion(self):
+        commands = [([method], "trlx.train.run", 0) for method in cli.METHODS]
+        commands += [
+            (["init"], "trlx.init_cmd.write", hardware.Hardware(8, ())),
+            (["show", "memory-run"], "trlx.show.show_lines", None),
+            (["check", "sft"], "trlx.train.check", 0),
+            (["verify", "checkpoint", "--base", "base"], "trlx.verify.run", types.SimpleNamespace(ok=True)),
+            (["merge", "--base", "base", "--adapter", "adapter", "--out", "merged"], "trlx.merge.merge", None),
+            (["replay-build", "--model", "model", "--prompts", "prompts.jsonl", "--out", "replay.jsonl",
+              "--max-tokens", "10"], "trlx.replay_build.run", None),
+        ]
+        for argv, target, result in commands:
+            with self.subTest(command=argv[0]):
+                stderr, stdout = io.StringIO(), io.StringIO()
+                label = f"trlx {argv[0]}"
+
+                # Observe output at dispatch time so completion-only feedback cannot pass.
+                def work(*args, **kwargs):
+                    output = stderr.getvalue()
+                    self.assertIn(f"{label}: starting", output)
+                    self.assertIn(f"{label}: running {argv[0]}", output)
+                    self.assertNotIn(f"{label}: completed;", output)
+                    progress = kwargs.get("progress", getattr(args[0], "progress", None))
+                    self.assertIsInstance(progress, Progress)
+                    return result
+
+                with patch.object(cli, "load_env"), patch(target, side_effect=work) as operation, \
+                     contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+                    self.assertEqual(cli.main(argv), 0)
+                operation.assert_called_once()
+                self.assertIn(f"{label}: completed; elapsed", stderr.getvalue())
+                self.assertNotIn("starting", stdout.getvalue())
+
+    # Training and verification return failures without raising, so lifecycle must use their status.
+    def test_nonzero_result_reports_failure_without_changing_exit_status(self):
+        for argv, target, result, expected in (
+            (["sft"], "trlx.train.run", 7, 7),
+            (["verify", "checkpoint", "--base", "base"], "trlx.verify.run", types.SimpleNamespace(ok=False), 1),
+        ):
+            with self.subTest(command=argv[0]), patch.object(cli, "load_env"), \
+                 patch(target, return_value=result), contextlib.redirect_stderr(io.StringIO()) as output:
+                self.assertEqual(cli.main(argv), expected)
+                self.assertIn(f"trlx {argv[0]}: failed; elapsed", output.getvalue())
+                self.assertNotIn(f"trlx {argv[0]}: completed;", output.getvalue())
+
+    # Shared worker logs need rank attribution from the first emitted line.
+    def test_worker_feedback_identifies_rank(self):
+        with patch.object(cli, "load_env"), patch("trlx.train.run", return_value=0), \
+             contextlib.redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(cli.main(["sft", "--_rank", "3"]), 0)
+        self.assertTrue(all(line.startswith("trlx sft rank 3:") for line in output.getvalue().splitlines()))
+
+    # Importing dynamic trainer options can block before normal command dispatch starts.
+    def test_startup_is_visible_before_dynamic_command_options_are_loaded(self):
+        output = io.StringIO()
+
+        # Stand in for the expensive parse boundary without importing a trainer.
+        def parse(argv):
+            self.assertEqual(argv, ["sft"])
+            self.assertIn("trlx sft: starting", output.getvalue())
+            self.assertIn("loading command options", output.getvalue())
+            return types.SimpleNamespace(command="sft", _rank=None, func=lambda args: 0)
+
+        with patch.object(cli, "parse_args", side_effect=parse) as parse_args, \
+             patch.object(cli, "load_env"), contextlib.redirect_stderr(output):
+            self.assertEqual(cli.main(["sft"]), 0)
+        parse_args.assert_called_once()
+
+    # Help must retain ordinary argparse output without execution threads or credentials reads.
+    def test_help_starts_no_reporter(self):
+        for argv in (["--help"], ["sft", "--help"], ["sft", "-h"]):
+            with self.subTest(argv=argv), patch.object(cli, "Progress") as reporter, \
+                 patch.object(cli, "load_env") as load_env, \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main(argv)
+                self.assertEqual(caught.exception.code, 0)
+                reporter.assert_not_called()
+                load_env.assert_not_called()
+                self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

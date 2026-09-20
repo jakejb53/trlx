@@ -24,23 +24,23 @@ ENDPOINT_FLAGS = ENDPOINT_REQUIRED + ("api_key",)
 
 
 # Entry point for the subcommand. `args` is the argparse namespace.
-def run(args):
+def run(args, *, progress=None):
     _check_flags(args)
     try:
         validate_rows_output(args.out, args.force)
     except DatasetError as e:
         raise TrlxError(str(e)) from e
     ref = config_mod.dataset_ref("trlx replay-build", "--prompts", args.prompts)
-    prompts = generate.prompts_from(ref)
+    prompts = generate.prompts_from(ref, progress=progress)
     if args.endpoint is not None:
-        replies = _from_endpoint(args, prompts)
+        replies = _from_endpoint(args, prompts, progress=progress)
     else:
-        replies = _from_local(args, prompts)
+        replies = _from_local(args, prompts, progress=progress)
     rows = [{"messages": _turns(p) + [{"role": "assistant", "content": r}]} for p, r in zip(prompts, replies)]
     # Prompts and completions are fully materialized before replacing either input.
     inputs = [args.prompts] if ref.is_file else ()
     try:
-        write_rows(args.out, rows, inputs, force=args.force, no_staging=args.no_staging)
+        write_rows(args.out, rows, inputs, force=args.force, no_staging=args.no_staging, progress=progress)
     except DatasetError as e:
         raise TrlxError(str(e))
     empty = sum(not r for r in replies)
@@ -76,18 +76,18 @@ def _turns(prompt):
 
 # Samples from the local model. dtype "auto" and device_map "auto" as
 # verify loads a base outside a run; greedy decoding for reproducible rows.
-def _from_local(args, prompts):
+def _from_local(args, prompts, *, progress=None):
     spec = config_mod.ModelSpec(path=args.model, dtype="auto", trust_remote_code=None, attn_implementation=None)
-    model = model_mod.load_model(spec, model_mod.CAUSAL, device_map="auto")
-    processor = model_mod.load_processor(spec)
+    model = model_mod.load_model(spec, model_mod.CAUSAL, device_map="auto", progress=progress)
+    processor = model_mod.load_processor(spec, progress=progress)
     print(f"loaded {type(model).__name__} from {args.model}; sampling {len(prompts)} prompts", flush=True)
-    return generate.generate(model, processor, prompts, max_new_tokens=args.max_tokens)
+    return generate.generate(model, processor, prompts, max_new_tokens=args.max_tokens, progress=progress)
 
 
 # Samples from an OpenAI-compatible endpoint. The key is read from the
 # environment variable named by --api-key, as dataset chat does, so it never
 # appears on a command line.
-def _from_endpoint(args, prompts):
+def _from_endpoint(args, prompts, *, progress=None):
     api_key = None
     if args.api_key:
         api_key = os.environ.get(args.api_key)
@@ -96,6 +96,7 @@ def _from_endpoint(args, prompts):
     try:
         endpoint = Endpoint(args.endpoint, args.model, api_key, args.timeout, args.retries)
         print(f"sampling {len(prompts)} prompts from {args.model} at {endpoint.display_url}", flush=True)
-        return endpoint.complete_many([_turns(p) for p in prompts], args.concurrency, args.max_tokens)
+        return endpoint.complete_many([_turns(p) for p in prompts], args.concurrency, args.max_tokens,
+                                      progress=progress, label="replay generation")
     except DatasetError as e:
         raise TrlxError(str(e))

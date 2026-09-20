@@ -18,6 +18,7 @@ import json
 import pathlib
 import time
 
+from dataset.progress import stage
 from trlx import TrlxError
 
 FILENAME = "metrics.jsonl"
@@ -25,6 +26,54 @@ FILENAME = "metrics.jsonl"
 # Top-level keys every record carries. The reader rejects a record missing any
 # of them so a renderer never has to guess at a partial record.
 RECORD_KEYS = ("step", "max_steps", "epoch", "num_train_epochs", "eval", "log")
+
+
+# Observe actual trainer callbacks without altering its control flags or metric records.
+def activity_callback_class():
+    from transformers import TrainerCallback
+
+    class ActivityCallback(TrainerCallback):
+        # The caller owns the enclosing trainer stage and closes us on failure too.
+        def __init__(self, activity):
+            self.activity = activity
+            self.evaluation = None
+
+        # Resume's completed count is read from the trainer, never guessed from the path.
+        def on_train_begin(self, args, state, control, **kwargs):
+            self.activity.update(state.global_step, state.max_steps)
+
+        # A finished optimizer step is measured progress, even between metric log steps.
+        def on_step_end(self, args, state, control, **kwargs):
+            self.activity.update(state.global_step, state.max_steps)
+            if control.should_evaluate:
+                self.activity.note(f"evaluation scheduled after step {state.global_step}")
+            if control.should_save:
+                self.activity.note(f"checkpoint save scheduled after step {state.global_step}")
+
+        # There is no evaluation-start callback; the first completed prediction batch
+        # is our first evidence of evaluation. Never infer a batch total from the train set.
+        def on_prediction_step(self, args, state, control, **kwargs):
+            if self.evaluation is None:
+                self.evaluation = stage(self.activity, "evaluating", unit="batches")
+                self.evaluation.__enter__()
+            self.evaluation.advance()
+
+        # Evaluation end is explicit even when an empty evaluation produced no batches.
+        def on_evaluate(self, args, state, control, **kwargs):
+            self.close()
+            self.activity.note(f"evaluation completed at step {state.global_step}")
+
+        # on_save runs after the trainer saved; it is not evidence that saving has begun.
+        def on_save(self, args, state, control, **kwargs):
+            self.activity.note(f"checkpoint saved at step {state.global_step} in {args.output_dir}")
+
+        # Close an outstanding evaluation stage on normal completion or trainer failure.
+        def close(self, exc_info=(None, None, None)):
+            if self.evaluation is not None:
+                self.evaluation.__exit__(*exc_info)
+                self.evaluation = None
+
+    return ActivityCallback
 
 
 # Builds one record from a Trainer.log call. Separated from the callback so it

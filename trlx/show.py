@@ -7,12 +7,14 @@ RunState. The TUI calls `load` on every poll, so a run still being written
 displays through exactly this code; Phase 5 needs no second path.
 """
 
+import contextlib
 import dataclasses
 import json
 import pathlib
 import re
 import tomllib
 
+from dataset.progress import stage
 from trlx import TrlxError, metrics, ranges, render_lines
 
 CONFIG_FILENAME = "config.toml"
@@ -170,15 +172,21 @@ def _read_json(path):
 
 # Line mode: every row, once. Fails on a missing metrics.jsonl because a
 # finished run without it has nothing to show and saying so is the answer.
-def show_lines(run_dir):
-    _, range_table = load_config(run_dir)
-    records = metrics.read(pathlib.Path(run_dir) / metrics.FILENAME)
-    print(render_lines.render(ranges.evaluate(records, range_table), range_table))
+def show_lines(run_dir, *, progress=None):
+    with stage(progress, f"reading run artifacts from {run_dir}") as activity:
+        _, range_table = load_config(run_dir)
+        records = metrics.read(pathlib.Path(run_dir) / metrics.FILENAME)
+        activity.note(f"read {len(records)} metric records")
+    with stage(progress, "rendering saved metrics"):
+        print(render_lines.render(ranges.evaluate(records, range_table), range_table))
 
 
 # TUI mode: polls `load` until quit.
-def show_tui(run_dir):
+def show_tui(run_dir, *, progress=None):
     from trlx import render_tui
 
-    name, range_table = load_config(run_dir)
-    render_tui.run(lambda log_lines: load(run_dir, name, range_table, log_lines))
+    with stage(progress, f"opening run display for {run_dir}"):
+        name, range_table = load_config(run_dir)
+    # The existing TUI owns the terminal and continuously displays artifact updates.
+    with progress.suspended() if progress is not None else contextlib.nullcontext():
+        render_tui.run(lambda log_lines: load(run_dir, name, range_table, log_lines))

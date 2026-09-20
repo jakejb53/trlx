@@ -7,6 +7,7 @@ assistant turn, system message included, in TRL's conversational format.
 
 from dataset.convert import final_assistant_index, messages_to_prompt_completion
 from dataset.io import DatasetError
+from dataset.progress import stage
 
 
 # Content may be a string or, for multimodal data, a list; str() gives a
@@ -29,32 +30,36 @@ def _validate(row, index, side):
 # Returns (pairs, unmatched) where unmatched is a list of "side row N"
 # strings. Equal keys pair in order of appearance on each side, so duplicate
 # keys pair first-with-first.
-def align(chosen_rows, rejected_rows):
-    rejected_by_key = {}
-    for i, row in enumerate(rejected_rows):
-        _validate(row, i, "rejected")
-        rejected_by_key.setdefault(_key(row["messages"]), []).append((i, row))
-    pairs, unmatched = [], []
-    for i, row in enumerate(chosen_rows):
-        last = _validate(row, i, "chosen")
-        bucket = rejected_by_key.get(_key(row["messages"]))
-        if not bucket:
-            unmatched.append(f"chosen row {i}")
-            continue
-        _, other = bucket.pop(0)
-        pairs.append(
-            {
-                "prompt": row["messages"][:last],
-                "chosen": row["messages"][last:],
-                "rejected": other["messages"][-1:],
-            }
-        )
-    for bucket in rejected_by_key.values():
-        unmatched.extend(f"rejected row {i}" for i, _ in bucket)
-    unmatched.sort(key=lambda s: (s.split()[0], int(s.split()[2])))
-    return pairs, unmatched
+def align(chosen_rows, rejected_rows, *, progress=None):
+    with stage(progress, "aligning preference pairs", total=len(chosen_rows) + len(rejected_rows), unit="rows") as activity:
+        rejected_by_key = {}
+        for i, row in enumerate(rejected_rows):
+            _validate(row, i, "rejected")
+            rejected_by_key.setdefault(_key(row["messages"]), []).append((i, row))
+            activity.advance()
+        pairs, unmatched = [], []
+        for i, row in enumerate(chosen_rows):
+            last = _validate(row, i, "chosen")
+            bucket = rejected_by_key.get(_key(row["messages"]))
+            if not bucket:
+                unmatched.append(f"chosen row {i}")
+                activity.advance()
+                continue
+            _, other = bucket.pop(0)
+            pairs.append(
+                {
+                    "prompt": row["messages"][:last],
+                    "chosen": row["messages"][last:],
+                    "rejected": other["messages"][-1:],
+                }
+            )
+            activity.advance()
+        for bucket in rejected_by_key.values():
+            unmatched.extend(f"rejected row {i}" for i, _ in bucket)
+        unmatched.sort(key=lambda s: (s.split()[0], int(s.split()[2])))
+        return pairs, unmatched
 
 
 # One messages dataset to prompt/completion for distillation.
-def single(rows):
-    return messages_to_prompt_completion(rows)
+def single(rows, *, progress=None):
+    return messages_to_prompt_completion(rows, progress=progress)

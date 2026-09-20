@@ -16,6 +16,7 @@ import datasets
 from pyarrow import ArrowInvalid, ArrowTypeError
 
 from dataset.io import DatasetError, read_rows
+from dataset.progress import stage
 from trlx import TrlxError
 
 # Column sets that satisfy each Method.dataset_format, in TRL's vocabulary. A
@@ -33,9 +34,9 @@ _FORMAT_COLUMNS = {
 
 # Loads the train set and the eval set (None when eval is disabled) for a
 # config.DatasetSpec, validated against `dataset_format`.
-def load(spec, dataset_format):
+def load(spec, dataset_format, *, progress=None):
     if spec.split:
-        whole = load_ref(spec.source)
+        whole = load_ref(spec.source, progress=progress)
         # Round evaluation upward so a positive fraction always reserves data.
         # Refuse an empty side rather than silently changing the requested split.
         # Decimal spelling avoids binary noise such as 100 * 0.07 rounding up to 8.
@@ -47,11 +48,13 @@ def load(spec, dataset_format):
                 f"{train_rows} train rows and {eval_rows} eval rows; both must be nonempty "
                 f"(dataset has {whole.num_rows} rows)"
             )
-        train = whole.select(range(train_rows))
-        eval_set = whole.select(range(train_rows, whole.num_rows))
+        with stage(progress, "splitting training and evaluation rows") as activity:
+            train = whole.select(range(train_rows))
+            eval_set = whole.select(range(train_rows, whole.num_rows))
+            activity.note(f"{train_rows} training rows; {eval_rows} evaluation rows")
     else:
-        train = load_ref(spec.source)
-        eval_set = load_ref(spec.eval_source) if spec.eval_source is not None else None
+        train = load_ref(spec.source, progress=progress)
+        eval_set = load_ref(spec.eval_source, progress=progress) if spec.eval_source is not None else None
 
     _check_columns(spec.source.source, train, dataset_format)
     if eval_set is not None:
@@ -73,8 +76,8 @@ REPLAY_COLUMN = "replay"
 # The two sets must have the same columns: concatenation needs equal
 # features, and the trainer decides the row shape from the first example.
 # `flag` adds REPLAY_COLUMN; without it the result is plain mixing.
-def mix_replay(train, spec, flag):
-    replay = load_ref(spec.dataset)
+def mix_replay(train, spec, flag, *, progress=None):
+    replay = load_ref(spec.dataset, progress=progress)
     if set(replay.column_names) != set(train.column_names):
         raise TrlxError(
             f"{spec.dataset.source}: [replay].dataset columns {{{', '.join(sorted(replay.column_names))}}} "
@@ -86,15 +89,19 @@ def mix_replay(train, spec, flag):
             f"{spec.dataset.source}: [replay].fraction = {spec.fraction} needs {count} replay rows for "
             f"{train.num_rows} train rows; the dataset has {replay.num_rows}"
         )
-    replay = replay.select(range(count))
-    if flag:
-        if REPLAY_COLUMN in train.column_names:
-            raise TrlxError(f"[replay]: column '{REPLAY_COLUMN}' is reserved for replay KL row markers; "
-                            "rename that column in both inputs before enabling replay KL")
-        train = train.add_column(REPLAY_COLUMN, [False] * train.num_rows)
-        replay = replay.add_column(REPLAY_COLUMN, [True] * count)
+    with stage(progress, "preparing replay rows"):
+        replay = replay.select(range(count))
+        if flag:
+            if REPLAY_COLUMN in train.column_names:
+                raise TrlxError(f"[replay]: column '{REPLAY_COLUMN}' is reserved for replay KL row markers; "
+                                "rename that column in both inputs before enabling replay KL")
+            train = train.add_column(REPLAY_COLUMN, [False] * train.num_rows)
+            replay = replay.add_column(REPLAY_COLUMN, [True] * count)
     try:
-        return datasets.concatenate_datasets([train, replay])
+        with stage(progress, "mixing replay rows") as activity:
+            mixed = datasets.concatenate_datasets([train, replay])
+            activity.note(f"{train.num_rows} training rows + {count} replay rows = {mixed.num_rows} rows")
+            return mixed
     except ValueError as e:
         # Same column names but different inferred types (a message key present
         # in one file only, say).
@@ -102,20 +109,26 @@ def mix_replay(train, spec, flag):
 
 
 # One config.DatasetRef to a Dataset.
-def load_ref(ref):
+def load_ref(ref, *, progress=None):
     if ref.is_file:
         try:
-            rows = read_rows(ref.source)
+            rows = read_rows(ref.source, progress=progress)
         except DatasetError as e:
             raise TrlxError(str(e))
         if not rows:
             raise TrlxError(f"{ref.source}: dataset is empty")
         try:
-            return datasets.Dataset.from_list(rows)
+            with stage(progress, f"converting dataset rows {ref.source}", total=len(rows), unit="rows") as activity:
+                loaded = datasets.Dataset.from_list(rows)
+                activity.advance(len(rows))
+                return loaded
         except (ArrowInvalid, ArrowTypeError) as e:
             raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {e}; "
                             "use consistent value types within each column") from e
-    return _load_hub(ref)
+    with stage(progress, f"loading dataset {ref.source}") as activity:
+        loaded = _load_hub(ref)
+        activity.note(f"loaded {loaded.num_rows} rows")
+        return loaded
 
 
 # HF hub id. With `:split` that split is requested directly. Without one, the

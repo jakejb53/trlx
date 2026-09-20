@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from dataset import io
+from dataset.progress import Progress
 
 
 class OutputPublication(unittest.TestCase):
@@ -29,6 +30,84 @@ class OutputPublication(unittest.TestCase):
                 path = self.root / ("output" + suffix)
                 io.write_rows(path, [{"value": "hello"}])
                 self.assertEqual(io.read_rows(path), [{"value": "hello"}])
+
+    # Announcements precede filesystem work; published success follows installation and cleanup.
+    def test_progress_publication_boundaries(self):
+        actual_publish, actual_clean = io._publish_prepared, io._clean_stage
+        for direct in (False, True):
+            with self.subTest(direct=direct):
+                path = self.root / f"progress-{direct}.jsonl"
+                lines = []
+
+                # This callback represents opaque, potentially blocking output production.
+                def write(prepared):
+                    self.assertTrue(any(f"writing {path}" in line for line in lines))
+                    boundary = "writing directly to" if direct else "preparing output"
+                    self.assertTrue(any(f"{boundary} {path}" in line for line in lines))
+                    self.assertFalse(any(f": published {path}" in line for line in lines))
+                    prepared.write_text('{"value": "ready"}\n', encoding="utf-8")
+
+                # A serialization completion must not be mistaken for publication success.
+                def publish(target, *args):
+                    self.assertTrue(any(f"publishing {path}" in line for line in lines))
+                    self.assertFalse(any(f": published {path}" in line for line in lines))
+                    return actual_publish(target, *args)
+
+                # Even a successfully installed output can still fail during staging cleanup.
+                def clean(folder):
+                    self.assertTrue(path.is_file())
+                    self.assertFalse(any(f": published {path}" in line for line in lines))
+                    self.assertTrue(any("cleaning output staging" in line for line in lines))
+                    return actual_clean(folder)
+
+                with patch.object(io, "_publish_prepared", side_effect=publish) as install, \
+                        patch.object(io, "_clean_stage", side_effect=clean) as cleanup, \
+                        Progress("publication", emit=lines.append) as progress:
+                    io.publish_output(path, write, no_staging=direct, progress=progress)
+                self.assertEqual(io.read_rows(path), [{"value": "ready"}])
+                self.assertFalse(list(self.root.glob(".*.stage-*")))
+                self.assertEqual(install.call_count, 0 if direct else 1)
+                self.assertEqual(cleanup.call_count, 0 if direct else 1)
+                self.assertTrue(any(f": published {path}" in line for line in lines))
+                self.assertIn("publication: completed; elapsed", lines[-1])
+
+    # Preparation, installation, and cleanup failures all suppress final success feedback.
+    def test_progress_does_not_claim_success_on_output_failure(self):
+        for phase in ("prepare", "publish", "cleanup"):
+            with self.subTest(phase=phase):
+                path = self.existing(f"failure-{phase}.jsonl")
+                lines = []
+                target = {"prepare": "_prepare_output", "publish": "_publish_prepared", "cleanup": "_clean_stage"}[phase]
+                with patch.object(io, target, side_effect=OSError(f"{phase} unavailable")), \
+                        self.assertRaisesRegex(io.DatasetError, f"{phase} unavailable"):
+                    with Progress("publication", emit=lines.append) as progress:
+                        io.write_rows(path, [{"new": True}], force=True, progress=progress)
+                self.assertFalse(any(f": published {path}" in line for line in lines))
+                self.assertFalse(any("publication: completed;" in line for line in lines))
+                self.assertIn("publication: failed; elapsed", lines[-1])
+                self.assertEqual(io.read_rows(path), [{"new": True}] if phase == "cleanup" else [{"old": True}])
+
+    # Split completion waits for every prepared output's cleanup, not merely the first install.
+    def test_split_progress_finishes_after_all_cleanup(self):
+        paths = [self.root / "first.jsonl", self.root / "second.jsonl"]
+        lines, cleaned = [], []
+        actual_clean = io._clean_stage
+
+        # Both installations are done before cleanup, but the overall operation is still pending.
+        def clean(folder):
+            self.assertTrue(all(path.is_file() for path in paths))
+            self.assertFalse(any(": published " in line for line in lines))
+            result = actual_clean(folder)
+            cleaned.append(folder)
+            return result
+
+        with patch.object(io, "_clean_stage", side_effect=clean), Progress("split", emit=lines.append) as progress:
+            io.write_many_rows([(path, [{"index": i}]) for i, path in enumerate(paths)], progress=progress)
+        self.assertEqual(len(cleaned), 2)
+        for path in paths:
+            self.assertTrue(any(f": published {path}" in line for line in lines))
+        self.assertTrue(any("2/2 files" in line for line in lines))
+        self.assertIn("split: completed; elapsed", lines[-1])
 
     # Direct writing alone is never replacement authorization.
     def test_existing_output_requires_force_in_both_modes(self):

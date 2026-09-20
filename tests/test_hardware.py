@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from dataset.progress import Progress
 from trlx import TrlxError
 from trlx.hardware import Gpu, Hardware, inspect
 
@@ -62,16 +63,33 @@ class FakeCuda:
 
 class InspectHardware(unittest.TestCase):
     # Inject only the CUDA metadata surface; no real torch import or GPU use.
-    def inspect_fake(self, cuda, cpus=12):
+    def inspect_fake(self, cuda, cpus=12, *, progress=None):
         with patch.dict("sys.modules", {"torch": SimpleNamespace(cuda=cuda)}):
             with patch("trlx.hardware.os.cpu_count", return_value=cpus):
-                return inspect()
+                return inspect(progress=progress)
 
     # A CPU-only operator can initialize without fabricated GPU capabilities.
     def test_no_gpu(self):
         cuda = FakeCuda()
         self.assertEqual(self.inspect_fake(cuda), Hardware(12, ()))
         self.assertEqual(cuda.visited, [])
+
+    # Enumeration can block in the driver; completed counts must reflect inspected devices.
+    def test_reports_before_enumeration_and_counts_devices(self):
+        lines = []
+        devices = (Gpu(0, "first", 10, 5, True), Gpu(1, "second", 20, 8, False))
+        cuda = FakeCuda(devices)
+
+        # Inspect the visible output from inside the dependency, before it returns.
+        def count_devices():
+            self.assertIn("enumerating visible CUDA devices", lines[-1])
+            return len(devices)
+
+        with patch.object(cuda, "device_count", side_effect=count_devices):
+            with Progress("init", emit=lines.append) as progress:
+                result = self.inspect_fake(cuda, progress=progress)
+        self.assertEqual(result.gpus, devices)
+        self.assertTrue(any("inspecting CUDA devices; 2/2 devices; finished" in line for line in lines))
 
     # Unknown CPU count has the explicitly documented one-worker assumption.
     def test_unknown_cpu_count(self):

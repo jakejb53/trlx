@@ -12,6 +12,7 @@ import types
 import unittest
 from unittest.mock import Mock
 
+from dataset.progress import Progress, stage
 from trlx import TrlxError, metrics, ranges, render_lines
 
 
@@ -109,6 +110,66 @@ class Record(MetricsCase):
         cb._file.write.side_effect = OSError("disk full")
         with self.assertRaisesRegex(TrlxError, "metrics.jsonl.*disk full"):
             cb.on_log(None, self.state(step=1), None, logs={"loss": 2.0})
+
+
+class Activity(unittest.TestCase):
+    # Counts and checkpoint notices must reflect trainer events without changing control flags.
+    def test_resume_steps_evaluation_batches_and_save_notices_follow_trainer_events(self):
+        clock = Mock(return_value=0.0)
+        lines = []
+        progress = Progress("trlx sft rank 0", emit=lines.append, clock=clock)
+        args = types.SimpleNamespace(output_dir="memory-run")
+        state = types.SimpleNamespace(global_step=5, max_steps=10)
+        control = types.SimpleNamespace(should_evaluate=True, should_save=True)
+        original_control = vars(control).copy()
+        with stage(progress, "training", unit="steps") as activity:
+            callback = metrics.activity_callback_class()(activity)
+            clock.return_value = 1.0
+            callback.on_train_begin(args, state, control)
+            self.assertIn("5/10 steps", lines[-1])
+            state.global_step = 6
+            clock.return_value = 2.0
+            callback.on_step_end(args, state, control)
+            self.assertIn("evaluation scheduled after step 6", "\n".join(lines))
+            self.assertIn("checkpoint save scheduled after step 6", lines[-1])
+            self.assertNotIn("checkpoint saved", "\n".join(lines))
+            clock.return_value = 3.0
+            callback.on_prediction_step(args, state, control)
+            clock.return_value = 4.0
+            callback.on_prediction_step(args, state, control)
+            self.assertIn("evaluating; 2 batches", lines[-1])
+            self.assertNotIn("/", lines[-1])
+            clock.return_value = 14.0
+            progress.waiting()
+            self.assertIn("waiting: evaluating; 2 batches", lines[-1])
+            self.assertIn("last measured progress 10.0s ago", lines[-1])
+            callback.on_evaluate(args, state, control)
+            self.assertIn("evaluation completed at step 6", lines[-1])
+            clock.return_value = 24.0
+            progress.waiting()
+            self.assertIn("waiting: training; 6/10 steps", lines[-1])
+            self.assertIn("last measured progress 22.0s ago", lines[-1])
+            callback.on_save(args, state, control)
+            self.assertIn("checkpoint saved at step 6 in memory-run", lines[-1])
+        self.assertEqual(vars(control), original_control)
+
+    # Trainer failure must not leave a stale evaluation stage active during outer cleanup.
+    def test_failed_evaluation_closes_once_and_restores_training_stage(self):
+        clock = Mock(return_value=0.0)
+        lines = []
+        progress = Progress("trlx sft rank 0", emit=lines.append, clock=clock)
+        with stage(progress, "training", total=10, unit="steps") as activity:
+            callback = metrics.activity_callback_class()(activity)
+            callback.on_prediction_step(None, None, None)
+            error = ValueError("evaluation failed")
+            callback.close((type(error), error, None))
+            self.assertIn("evaluating; 1 batches; failed", lines[-1])
+            before = list(lines)
+            callback.close()
+            self.assertEqual(lines, before)
+            clock.return_value = 10.0
+            progress.waiting()
+            self.assertIn("waiting: training; 0/10 steps", lines[-1])
 
 
 class Evaluate(unittest.TestCase):

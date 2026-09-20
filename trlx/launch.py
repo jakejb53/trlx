@@ -199,13 +199,17 @@ def spawn_verify(checkpoint, base, prompts, physical, log_file, *, force=False, 
 # for --no-verify; it is called late because the checkpoint to verify exists
 # only after training. A failure is (label, code) for the message and exit.
 class Job:
-    def __init__(self, workers, start_verify):
+    # Own worker/verify lifetimes; a progress-log failure remains a supervisor failure.
+    def __init__(self, workers, start_verify, *, progress=None):
         self.workers = workers
         self.start_verify = start_verify
         self.verify = None
+        self.progress = progress
 
     # Non-blocking. Starts verify when its turn comes.
     def poll(self):
+        if self.progress is not None:
+            self.progress.check_error()
         failure = check(self.workers)
         if failure is not None:
             return f"worker rank {failure[0]}", failure[1]

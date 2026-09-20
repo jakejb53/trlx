@@ -8,6 +8,7 @@ import math
 import re
 
 from dataset.io import DatasetError
+from dataset.progress import stage
 
 # Characters per token assumed by the estimate. Prose on modern tokenizers runs
 # near 4, so 3.5 overestimates slightly, which is the safe direction for a
@@ -58,26 +59,32 @@ def _pack(pieces, max_tokens, sep):
 # limit is split by sentence and pre-packed with spaces; the resulting pieces
 # then join the paragraph-level pack, so a trailing remainder of a split
 # paragraph may share a chunk with the next paragraph.
-def chunk_text(text, max_tokens):
+def chunk_text(text, max_tokens, *, progress=None):
     if max_tokens < 1:
         raise DatasetError(f"--max-tokens must be at least 1, got {max_tokens}")
-    paragraphs = [p.strip() for p in _PARAGRAPH_BREAK.split(text) if p.strip()]
-    pieces = []
-    for p in paragraphs:
-        if estimate_tokens(p) <= max_tokens:
-            pieces.append(p)
-        else:
-            pieces.extend(_pack(_split_oversized(p, max_tokens), max_tokens, " "))
-    return _pack(pieces, max_tokens, "\n\n")
+    with stage(progress, "splitting source paragraphs"):
+        paragraphs = [p.strip() for p in _PARAGRAPH_BREAK.split(text) if p.strip()]
+    with stage(progress, "chunking source", total=len(paragraphs), unit="paragraphs") as activity:
+        pieces = []
+        for p in paragraphs:
+            if estimate_tokens(p) <= max_tokens:
+                pieces.append(p)
+            else:
+                pieces.extend(_pack(_split_oversized(p, max_tokens), max_tokens, " "))
+            activity.advance()
+    with stage(progress, "packing source chunks") as activity:
+        chunks = _pack(pieces, max_tokens, "\n\n")
+        activity.note(f"source chunks: {len(chunks)}")
+        return chunks
 
 
 # Reads a text file and returns one {"text": chunk} row per chunk.
-def cpt_rows(path, max_tokens):
+def cpt_rows(path, max_tokens, *, progress=None):
     try:
-        with open(path, encoding="utf-8") as f:
+        with stage(progress, f"reading {path}"), open(path, encoding="utf-8") as f:
             text = f.read()
     except OSError as e:
         raise DatasetError(f"{path}: cannot read: {e.strerror or e}; check the path and permissions")
     except UnicodeError:
         raise DatasetError(f"{path}: input is not valid UTF-8; convert the text to UTF-8")
-    return [{"text": chunk} for chunk in chunk_text(text, max_tokens)]
+    return [{"text": chunk} for chunk in chunk_text(text, max_tokens, progress=progress)]

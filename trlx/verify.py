@@ -26,6 +26,7 @@ import torch
 from peft import PeftModel
 
 from dataset.io import DatasetError, validate_output, write_text
+from dataset.progress import stage
 from trlx import TrlxError, adapter_check, config as config_mod, generate, model as model_mod, show
 
 
@@ -53,7 +54,7 @@ class Result:
 
 # Runs the checks and returns the Result. `prompts_ref` is a config.DatasetRef
 # or None for the built-in prompts.
-def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False):
+def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progress=None):
     ckpt = pathlib.Path(checkpoint)
     if not ckpt.is_dir():
         raise TrlxError(f"{checkpoint}: not a directory")
@@ -65,31 +66,36 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False):
         raise TrlxError(str(e)) from e
     if not torch.cuda.is_available():
         raise TrlxError("verify needs a CUDA device and none is available")
-    spec = _base_spec(run_dir, base)
-    prompts = generate.prompts_from(prompts_ref)
+    with stage(progress, "reading verification settings"):
+        spec = _base_spec(run_dir, base)
+    prompts = generate.prompts_from(prompts_ref, progress=progress)
     failures = []
 
     if (ckpt / adapter_check.ADAPTER_FILE).is_file():
-        kind = model_mod.SEQUENCE_CLASSIFICATION if adapter_check.task_type(ckpt) == "SEQ_CLS" else model_mod.CAUSAL
-        base_model = model_mod.load_model(spec, kind, device_map="auto")
-        processor = model_mod.load_processor(spec)
+        with stage(progress, f"reading adapter configuration {checkpoint}"):
+            kind = model_mod.SEQUENCE_CLASSIFICATION if adapter_check.task_type(ckpt) == "SEQ_CLS" else model_mod.CAUSAL
+        base_model = model_mod.load_model(spec, kind, device_map="auto", progress=progress)
+        processor = model_mod.load_processor(spec, progress=progress)
         print(f"loaded {type(base_model).__name__} from {base}", flush=True)
         try:
-            peft_model = PeftModel.from_pretrained(base_model, str(ckpt))
+            with stage(progress, f"loading adapter {checkpoint}"):
+                peft_model = PeftModel.from_pretrained(base_model, str(ckpt))
         except torch.cuda.OutOfMemoryError as e:
             raise TrlxError(f"{checkpoint}: CUDA memory exhausted loading adapter; free GPU memory") from e
         except (OSError, ValueError) as e:
             raise TrlxError(f"{checkpoint}: cannot load adapter: {e}")
-        check = adapter_check.check(ckpt, peft_model)
+        with stage(progress, f"checking loaded adapter {checkpoint}"):
+            check = adapter_check.check(ckpt, peft_model)
         print(check.message(), flush=True)
         adapter = dataclasses.asdict(check) | {"ok": check.ok}
         if not check.ok:
             failures.append("adapter check failed")
         # Same weights, adapters off: the base's behaviour without a second
         # copy of the model in memory.
-        with peft_model.disable_adapter():
-            base_outputs = _outputs(peft_model, processor, prompts)
-        ckpt_outputs = _outputs(peft_model, processor, prompts)
+        with stage(progress, "checking base behaviour") as activity, peft_model.disable_adapter():
+            base_outputs = _outputs(peft_model, processor, prompts, progress=activity)
+        with stage(progress, "checking checkpoint behaviour") as activity:
+            ckpt_outputs = _outputs(peft_model, processor, prompts, progress=activity)
     else:
         # A full fine-tune: the checkpoint is a whole model, and its own
         # config says which kind (a reward model was saved as sequence
@@ -97,16 +103,18 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False):
         # checkpoint are loaded in turn so only one is resident at a time.
         adapter = None
         ckpt_spec = dataclasses.replace(spec, path=str(ckpt))
-        kind = _checkpoint_kind(ckpt_spec)
-        base_model = model_mod.load_model(spec, kind, device_map="auto")
-        processor = model_mod.load_processor(spec)
+        kind = _checkpoint_kind(ckpt_spec, progress=progress)
+        base_model = model_mod.load_model(spec, kind, device_map="auto", progress=progress)
+        processor = model_mod.load_processor(spec, progress=progress)
         print(f"loaded {type(base_model).__name__} from {base}", flush=True)
-        base_outputs = _outputs(base_model, processor, prompts)
+        with stage(progress, "checking base behaviour") as activity:
+            base_outputs = _outputs(base_model, processor, prompts, progress=activity)
         del base_model
         torch.cuda.empty_cache()
-        ckpt_model = model_mod.load_model(ckpt_spec, kind, device_map="auto")
+        ckpt_model = model_mod.load_model(ckpt_spec, kind, device_map="auto", progress=progress)
         print(f"loaded {type(ckpt_model).__name__} from {checkpoint}", flush=True)
-        ckpt_outputs = _outputs(ckpt_model, processor, prompts)
+        with stage(progress, "checking checkpoint behaviour") as activity:
+            ckpt_outputs = _outputs(ckpt_model, processor, prompts, progress=activity)
 
     samples = [
         {"prompt": p, "base": b, "checkpoint": c, "differs": b != c}
@@ -122,11 +130,13 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False):
     if differing == 0:
         failures.append("behaviour unchanged: every output equals the base's")
 
-    template_equal = _chat_template_equal(spec, ckpt, processor, failures)
+    with stage(progress, "checking chat template") as activity:
+        template_equal = _chat_template_equal(spec, ckpt, processor, failures, progress=activity)
 
     result = Result(str(ckpt), base, adapter, behaviour, template_equal, failures)
     try:
-        write_text(path, json.dumps(result.to_dict(), indent=1) + "\n", force=force, no_staging=no_staging)
+        write_text(path, json.dumps(result.to_dict(), indent=1) + "\n", force=force,
+                   no_staging=no_staging, progress=progress)
     except DatasetError as e:
         raise TrlxError(str(e)) from e
     verdict = "verify passed" if result.ok else "verify failed: " + "; ".join(failures)
@@ -158,8 +168,8 @@ def _base_spec(run_dir, base):
 # Model kind of a full checkpoint: sequence classification when the class
 # its config names is the sequence-classification class transformers maps
 # that config to, causal otherwise.
-def _checkpoint_kind(ckpt_spec):
-    config = model_mod.load_config(ckpt_spec)
+def _checkpoint_kind(ckpt_spec, *, progress=None):
+    config = model_mod.load_config(ckpt_spec, progress=progress)
     architectures = getattr(config, "architectures", None) or []
     try:
         seq_cls = model_mod.model_class(ckpt_spec, config, model_mod.SEQUENCE_CLASSIFICATION)
@@ -171,18 +181,19 @@ def _checkpoint_kind(ckpt_spec):
 # Text outputs for the prompts: generated completions, or for a model that
 # cannot generate (a sequence-classification reward model) its score per
 # prompt, formatted so equal scores compare equal as strings.
-def _outputs(model, processor, prompts):
+def _outputs(model, processor, prompts, *, progress=None):
     if model.can_generate():
-        return generate.generate(model, processor, prompts)
+        return generate.generate(model, processor, prompts, progress=progress)
     tokenizer = getattr(processor, "tokenizer", processor)
     device = next(model.parameters()).device
     scores = []
     try:
-        with torch.no_grad():
+        with stage(progress, "scoring verification prompts", total=len(prompts), unit="prompts") as activity, torch.no_grad():
             for prompt in prompts:
                 text, templated = generate._render(tokenizer, prompt)
                 encoded = tokenizer(text, return_tensors="pt", add_special_tokens=not templated).to(device)
                 scores.append(f"score {model(**encoded).logits[0, 0].item():.6g}")
+                activity.advance()
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError("CUDA memory exhausted comparing reward-model scores; "
                         "free GPU memory or shorten verification prompts") from e
@@ -192,9 +203,9 @@ def _outputs(model, processor, prompts):
 # The checkpoint's saved chat template against the base's. A checkpoint
 # without a saved tokenizer has no template to compare, which fails the check
 # rather than passing it silently.
-def _chat_template_equal(spec, ckpt, base_processor, failures):
+def _chat_template_equal(spec, ckpt, base_processor, failures, *, progress=None):
     try:
-        ckpt_processor = model_mod.load_processor(dataclasses.replace(spec, path=str(ckpt)))
+        ckpt_processor = model_mod.load_processor(dataclasses.replace(spec, path=str(ckpt)), progress=progress)
     except TrlxError as e:
         failures.append(f"chat template: checkpoint has no loadable tokenizer ({e})")
         return False

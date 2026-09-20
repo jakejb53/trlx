@@ -17,6 +17,7 @@ import pathlib
 import re
 
 from dataset.io import DatasetError, validate_output, write_text
+from dataset.progress import stage
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PY_LITERALS = {"True": "true", "False": "false", "None": "null"}
@@ -267,7 +268,7 @@ def _heal_jsonl_line(line, lineno, is_last):
 
 
 # Heals a JSONL file. Returns (output_text, repairs, errors).
-def heal_jsonl(text):
+def heal_jsonl(text, *, progress=None):
     lines = text.split("\n")
     # A trailing newline yields an empty final element that is not a line.
     trailing_newline = text.endswith("\n")
@@ -275,15 +276,18 @@ def heal_jsonl(text):
         lines = lines[:-1]
     last_index = max((i for i, l in enumerate(lines) if l.strip()), default=-1)
     out, repairs, errors = [], [], []
-    for i, line in enumerate(lines):
-        if not line.strip():
-            out.append(line)
-            continue
-        fixed, line_repairs, error = _heal_jsonl_line(line, i + 1, i == last_index)
-        out.extend(fixed)
-        repairs.extend(line_repairs)
-        if error:
-            errors.append(error)
+    with stage(progress, "repairing JSONL lines", total=len(lines), unit="lines") as activity:
+        for i, line in enumerate(lines):
+            if not line.strip():
+                out.append(line)
+                activity.advance()
+                continue
+            fixed, line_repairs, error = _heal_jsonl_line(line, i + 1, i == last_index)
+            out.extend(fixed)
+            repairs.extend(line_repairs)
+            if error:
+                errors.append(error)
+            activity.advance()
     result = "\n".join(out)
     if trailing_newline or out:
         result += "\n"
@@ -310,7 +314,7 @@ def heal_json(text):
 
 # Reads, heals by extension, writes. Returns (repairs, errors); the caller
 # prints them and sets the exit code.
-def heal_file(src, dst, *, force=False, no_staging=False):
+def heal_file(src, dst, *, force=False, no_staging=False, progress=None):
     suffix = pathlib.Path(src).suffix.lower()
     if suffix not in (".jsonl", ".json"):
         raise DatasetError(f"{src}: heal handles .jsonl and .json, not '{suffix}'")
@@ -319,13 +323,14 @@ def heal_file(src, dst, *, force=False, no_staging=False):
     # Healing repairs the selected target, preserving any symlink used to name it.
     validate_output(dst, force=force, follow_symlinks=True)
     try:
-        with open(src, encoding="utf-8") as f:
+        with stage(progress, f"reading {src}"), open(src, encoding="utf-8") as f:
             text = f.read()
     except OSError as e:
         raise DatasetError(f"{src}: cannot read: {e.strerror or e}; check the path and permissions")
     except UnicodeError:
         raise DatasetError(f"{src}: input is not valid UTF-8; convert it to UTF-8 before healing")
-    heal = heal_jsonl if suffix == ".jsonl" else heal_json
-    result, repairs, errors = heal(text)
-    write_text(dst, result, force=force, no_staging=no_staging, follow_symlinks=True)
+    with stage(progress, f"repairing {src}") as activity:
+        result, repairs, errors = heal_jsonl(text, progress=activity) if suffix == ".jsonl" else heal_json(text)
+        activity.note(f"repairs: {len(repairs)}; unresolved errors: {len(errors)}")
+    write_text(dst, result, force=force, no_staging=no_staging, follow_symlinks=True, progress=progress)
     return repairs, errors

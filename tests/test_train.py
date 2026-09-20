@@ -5,11 +5,13 @@ import io
 import pathlib
 import subprocess
 import sys
+import threading
 import types
 import unittest
 from unittest.mock import Mock, patch
 
-from trlx import TrlxError, launch, render_tui, run_dirs, train
+from dataset.progress import Progress
+from trlx import TrlxError, cli, launch, render_tui, run_dirs, train
 
 
 # A process that finishes after several polls, so the real Job exercises its
@@ -147,6 +149,89 @@ class Supervisor(unittest.TestCase):
         self.spawn.assert_called_once()
         self.assertIn(b"BrokenPipeError", self.log.getvalue())
 
+    # Reporter failures obey the same protected display boundary as metric rendering.
+    def test_reporter_stderr_failure_preserves_verify_status_and_durable_progress(self):
+        self.verify.code = 7
+        self.enterContext(patch.object(sys, "stderr", BrokenStream()))
+        with Progress("trlx sft", on_error=cli._defer_training_display_error) as progress:
+            self.args.progress = progress
+            self._assert_completed(7)
+            progress.finish("failed")
+        self.assertIsInstance(progress.error, BrokenPipeError)
+        self.assertIsNone(sys.stderr)
+        log = self.log.getvalue().decode()
+        self.assertIn("display stopped: BrokenPipeError", log)
+        self.assertIn("starting training workers", log)
+        self.assertIn("starting post-training verification", log)
+        self.assertIn("failed: verify exited with code 7", log)
+        self.assertFalse(progress._thread.is_alive())
+
+    # Both reporter lifetimes must respect curses ownership while the job continues logging.
+    def test_tui_reporters_write_waiting_feedback_to_log_without_touching_terminal(self):
+        self.args.tui = True
+        clock = Mock(return_value=0.0)
+        children = []
+
+        # Share a controllable clock while retaining the real child reporter and its sink.
+        def reporter(*args, **kwargs):
+            child = Progress(*args, **kwargs, clock=clock)
+            children.append(child)
+            return child
+
+        # Advance the job and both timers while treating the terminal as owned by curses.
+        def render(load):
+            before = self.stderr.buffer.getvalue()
+            for now in range(10, 91, 10):
+                clock.return_value = float(now)
+                self.args.progress.waiting()
+                children[0].waiting()
+                load(4)
+                self.assertEqual(self.stderr.buffer.getvalue(), before)
+
+        self.tui.side_effect = render
+        self.enterContext(patch.object(train, "Progress", side_effect=reporter))
+        with Progress("trlx sft", clock=clock, on_error=cli._defer_training_display_error) as progress:
+            self.args.progress = progress
+            self._assert_completed()
+        self.tui.assert_called_once()
+        self.assertEqual(len(children), 1)
+        log = self.log.getvalue().decode()
+        self.assertIn("trlx sft supervisor: waiting", log)
+        self.assertIn("starting post-training verification", log)
+        self.assertNotIn("display stopped", log)
+        self.assertFalse(children[0]._thread.is_alive())
+
+    # Losing the authoritative log asynchronously is a supervision failure requiring cleanup.
+    def test_background_progress_log_failure_terminates_owned_worker(self):
+        failed_write = threading.Event()
+        owner = threading.current_thread()
+        original_write = self.log.write
+
+        # Fail only the background heartbeat, after ordinary startup writes have succeeded.
+        def write(data):
+            if threading.current_thread() is not owner and b"waiting" in data:
+                failed_write.set()
+                raise OSError("disk full during heartbeat")
+            return original_write(data)
+
+        # Keep a running worker alive until the independent reporter hits the bad log.
+        def header(*args, **kwargs):
+            self.assertTrue(failed_write.wait(3), "background reporter never attempted a log write")
+            return "metrics header"
+
+        self.enterContext(patch.object(self.log, "write", side_effect=write))
+        self._patch("trlx.render_lines.header", side_effect=header)
+        with patch("dataset.progress.WAIT_SECONDS", 0.01):
+            with Progress("trlx sft", on_error=cli._defer_training_display_error) as progress:
+                self.args.progress = progress
+                with self.assertRaisesRegex(TrlxError, "log.txt.*cannot write progress log.*disk full"):
+                    train.run(self.args)
+        self.assertTrue(failed_write.is_set())
+        self.assertEqual(self.worker.kills, 1)
+        self.assertGreater(self.worker.waits, 0)
+        self.spawn_verify.assert_not_called()
+        self.assertNotIn(b"display stopped", self.log.getvalue())
+
     # Failed metric reads are attempted once, while worker polling continues.
     def test_metric_read_error_disables_display(self):
         self.records.side_effect = TrlxError("metrics.jsonl: corrupt record")
@@ -282,7 +367,7 @@ class Supervisor(unittest.TestCase):
     # Invalid checkpoint metadata must fail preflight before any run mutation.
     def test_invalid_checkpoint_prevents_rewind_and_worker_spawn(self):
         self.cfg.args.resume_from_checkpoint = "memory-run/checkpoint-20"
-        self.check_config.side_effect = train.preflight._check_resume
+        self.check_config.side_effect = lambda *args, **kwargs: train.preflight._check_resume(*args)
         self._patch("trlx.run_dirs.inspect_checkpoint", side_effect=TrlxError("invalid trainer_state.json"))
         rewind = self._patch("trlx.run_dirs.rewind")
         with self.assertRaisesRegex(TrlxError, "invalid trainer_state.json"):

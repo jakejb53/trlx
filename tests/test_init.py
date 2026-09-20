@@ -111,7 +111,7 @@ class InitDefaults(unittest.TestCase):
             path = pathlib.Path(folder) / "run.toml"
 
             # Simulate another writer claiming the destination after initial validation.
-            def inspect():
+            def inspect(*, progress=None):
                 path.write_text("competing settings", encoding="utf-8")
                 return Hardware(8, ())
 
@@ -129,7 +129,7 @@ class InitDefaults(unittest.TestCase):
                     self.assertIs(init_cmd.write(), system)
         self.assertEqual(write.call_args.args[0], "run.toml")
         self.assertEqual(tomllib.loads(write.call_args.args[1]), self.document(system))
-        self.assertEqual(write.call_args.kwargs, {"force": False, "no_staging": False})
+        self.assertEqual(write.call_args.kwargs, {"force": False, "no_staging": False, "progress": None})
 
     # Forced generation replaces settings explicitly, also permitting a new path.
     def test_force_writes_fresh_defaults(self):

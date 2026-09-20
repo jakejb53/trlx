@@ -8,6 +8,7 @@ chat template, and are fed raw otherwise.
 
 import torch
 
+from dataset.progress import stage
 from trlx import TrlxError, data_load
 
 # Tokens generated per prompt. Enough for a behaviour difference to show; a
@@ -32,21 +33,26 @@ BUILTIN_PROMPTS = [
 # Prompts for a config.DatasetRef, or the built-in set for None. A `prompt`
 # column is taken as is (string or messages); a `messages` column is cut
 # after its last user turn so the model has something to answer.
-def prompts_from(ref):
+def prompts_from(ref, *, progress=None):
     if ref is None:
         return list(BUILTIN_PROMPTS)
-    dataset = data_load.load_ref(ref)
+    dataset = data_load.load_ref(ref, progress=progress)
     if "prompt" in dataset.column_names:
-        return list(dataset["prompt"])
+        with stage(progress, "preparing generation prompts", total=dataset.num_rows, unit="prompts") as activity:
+            prompts = list(dataset["prompt"])
+            activity.advance(len(prompts))
+            return prompts
     if "messages" in dataset.column_names:
         prompts = []
-        for row, messages in enumerate(dataset["messages"], 1):
-            if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
-                raise TrlxError(f"{ref.source}: row {row}: messages must be a list of message objects")
-            last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=None)
-            if last_user is None:
-                raise TrlxError(f"{ref.source}: row {row}: messages has no user turn to prompt with")
-            prompts.append(messages[: last_user + 1])
+        with stage(progress, "preparing generation prompts", total=dataset.num_rows, unit="prompts") as activity:
+            for row, messages in enumerate(dataset["messages"], 1):
+                if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+                    raise TrlxError(f"{ref.source}: row {row}: messages must be a list of message objects")
+                last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=None)
+                if last_user is None:
+                    raise TrlxError(f"{ref.source}: row {row}: messages has no user turn to prompt with")
+                prompts.append(messages[: last_user + 1])
+                activity.advance()
         return prompts
     raise TrlxError(
         f"{ref.source}: prompts need a 'prompt' or 'messages' column; columns: {', '.join(dataset.column_names)}"
@@ -66,7 +72,7 @@ def _render(tokenizer, prompt):
 
 # Greedy completions for `prompts`, decoded without special tokens. The
 # model is put in eval mode for the duration and restored after.
-def generate(model, processor, prompts, max_new_tokens=MAX_NEW_TOKENS):
+def generate(model, processor, prompts, max_new_tokens=MAX_NEW_TOKENS, *, progress=None):
     tokenizer = getattr(processor, "tokenizer", processor)
     device = next(model.parameters()).device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
@@ -74,7 +80,7 @@ def generate(model, processor, prompts, max_new_tokens=MAX_NEW_TOKENS):
     model.eval()
     outputs = []
     try:
-        with torch.no_grad():
+        with stage(progress, "generating completions", total=len(prompts), unit="prompts") as activity, torch.no_grad():
             for prompt in prompts:
                 text, templated = _render(tokenizer, prompt)
                 encoded = tokenizer(text, return_tensors="pt", add_special_tokens=not templated).to(device)
@@ -82,6 +88,8 @@ def generate(model, processor, prompts, max_new_tokens=MAX_NEW_TOKENS):
                     **encoded, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=pad_id
                 )
                 outputs.append(tokenizer.decode(generated[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True))
+                # Count completed, decoded outputs, never merely submitted prompts.
+                activity.advance()
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError("CUDA memory exhausted during generation; free GPU memory, shorten prompts, "
                         "or reduce the completion token limit") from e

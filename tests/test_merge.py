@@ -6,6 +6,7 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+from dataset.progress import Progress
 from trlx import TrlxError, merge
 
 
@@ -31,7 +32,7 @@ class MergeOutput(unittest.TestCase):
         self.processor.save_pretrained.side_effect = lambda path: (pathlib.Path(path) / "tokenizer.json").write_text("processor")
 
     # Even direct mode must load the processor while its base is still available.
-    def load_processor(self, spec):
+    def load_processor(self, spec, *, progress=None):
         self.assertTrue((self.base / "original").exists())
         return self.processor
 
@@ -61,11 +62,38 @@ class MergeOutput(unittest.TestCase):
 
     # Both model and processor must save before any old output is removed.
     def test_staged_save_failure_preserves_original(self):
+        lines = []
         self.processor.save_pretrained.side_effect = OSError("disk full")
-        with self.assertRaisesRegex(TrlxError, "disk full"):
-            merge.merge(str(self.base), str(self.adapter), self.base, force=True)
+        with patch("builtins.print") as output, self.assertRaisesRegex(TrlxError, "disk full"):
+            with Progress("merge", emit=lines.append) as progress:
+                merge.merge(str(self.base), str(self.adapter), self.base, force=True, progress=progress)
         self.assertEqual((self.base / "original").read_text(), "base")
         self.assertFalse((self.base / "model.safetensors").exists())
+        self.assertTrue(any("saving processor" in line and "failed" in line for line in lines))
+        self.assertIn("merge: failed;", lines[-1])
+        self.assertFalse(any("merged model written" in call.args[0] for call in output.call_args_list))
+
+    # Feedback must already be visible when adapter loading and serialization begin.
+    def test_reports_before_blocking_load_and_save(self):
+        lines = []
+        out = self.directory / "merged"
+
+        # Probe inside the blocking dependency rather than after its return.
+        def load_adapter(*args, **kwargs):
+            self.assertIn(f"loading adapter {self.adapter}", lines[-1])
+            return self.peft
+
+        # Real publication still verifies that reporting does not replace the save.
+        def save_weights(path):
+            self.assertIn(f"saving merged model {out}", lines[-1])
+            self.save_weights(path)
+
+        self.peft.merge_and_unload.return_value.save_pretrained.side_effect = save_weights
+        with patch("trlx.merge.PeftModel.from_pretrained", side_effect=load_adapter):
+            with Progress("merge", emit=lines.append) as progress:
+                merge.merge(str(self.base), str(self.adapter), out, progress=progress)
+        self.assertEqual((out / "model.safetensors").read_text(), "merged")
+        self.assertIn("merge: completed;", lines[-1])
 
     # Known serializer and allocation failures preserve staged inputs and name the output.
     def test_expected_save_errors_are_contextual(self):

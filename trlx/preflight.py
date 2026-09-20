@@ -13,7 +13,8 @@ available:
 - `check_offpolicy`: one forward pass per response under the starting
   model. Runs from a TrainerCallback at on_train_begin on every rank,
   because under FSDP the placed model is a collective and every rank must
-  join the forward; rank 0 alone reports.
+  join the forward; rank 0 alone publishes the facts and warnings. Each rank
+  can report its own progress through the reporter supplied by its worker.
 
 A Report collects warnings and facts. Rank 0 writes it to preflight.json
 after `check_trainer` and again after `check_offpolicy`, so the file is
@@ -34,6 +35,7 @@ import urllib.request
 import torch
 
 from dataset.io import DatasetError, write_text
+from dataset.progress import stage
 from trlx import TrlxError, run_dirs, show
 
 # Seconds allowed for the vLLM server health probe. A connection that takes
@@ -75,11 +77,12 @@ class Report:
         self.lines.clear()
 
     # Writes preflight.json, replacing an earlier write from a previous stage.
-    def write(self, run_dir, *, no_staging=False):
+    def write(self, run_dir, *, no_staging=False, progress=None):
         path = pathlib.Path(run_dir) / show.PREFLIGHT_FILENAME
         try:
             # Both stages belong to the same run; updating its report is already authorized.
-            write_text(path, json.dumps(self.to_dict(), indent=1) + "\n", force=True, no_staging=no_staging)
+            write_text(path, json.dumps(self.to_dict(), indent=1) + "\n", force=True,
+                       no_staging=no_staging, progress=progress)
         except DatasetError as e:
             raise TrlxError(str(e)) from e
 
@@ -87,11 +90,12 @@ class Report:
 # Config-only fatal checks. `config_path` is the operator's file and
 # `strategy` the launcher's choice for this run, or None from `trlx check`,
 # which makes no such choice.
-def check_config(cfg, config_path, strategy):
-    _check_save_strategy(cfg)
-    _check_replay(cfg)
-    _check_resume(cfg, config_path, strategy)
-    _check_vllm(cfg)
+def check_config(cfg, config_path, strategy, *, progress=None):
+    with stage(progress, "checking preflight configuration") as activity:
+        _check_save_strategy(cfg)
+        _check_replay(cfg)
+        _check_resume(cfg, config_path, strategy)
+        _check_vllm(cfg, progress=activity)
 
 
 # A run that never saves leaves nothing for verify or merge; better refused
@@ -187,7 +191,7 @@ def _diff_tables(current, snapshot, prefix):
 # vLLM (SPEC 5). Probed before the model loads so an absent or wrong server
 # fails in seconds, not after a long load. The address is resolved the way
 # GRPOTrainer resolves it: base_url when set, else host and port.
-def _check_vllm(cfg):
+def _check_vllm(cfg, *, progress=None):
     if cfg.rewards is None:
         return
     base = cfg.args.vllm_server_base_url or f"http://{cfg.args.vllm_server_host}:{cfg.args.vllm_server_port}"
@@ -200,8 +204,9 @@ def _check_vllm(cfg):
     display_base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
     display_url = display_base.rstrip("/") + VLLM_PROBE_PATH
     try:
-        with urllib.request.urlopen(url, timeout=VLLM_PROBE_SECONDS) as response:
-            status = response.status
+        with stage(progress, f"probing TRL vLLM server {display_url}"):
+            with urllib.request.urlopen(url, timeout=VLLM_PROBE_SECONDS) as response:
+                status = response.status
     except urllib.error.HTTPError as e:
         raise TrlxError(
             f"{display_base} answered {e.code} on {VLLM_PROBE_PATH}: a server is listening but it is not the TRL vLLM "
@@ -221,14 +226,17 @@ def _check_vllm(cfg):
 
 # Checks on the built trainer, before training. Fatal ones raise; the rest
 # go to `report`.
-def check_trainer(cfg, trainer, train_set, report):
+def check_trainer(cfg, trainer, train_set, report, *, progress=None):
     model = trainer.model
     tokenizer = _tokenizer(trainer.processing_class)
-    _check_targets(cfg, model, report)
-    _check_pad_token(tokenizer, report)
-    _check_use_cache(cfg, model, report)
-    _check_truncation(cfg, train_set, tokenizer, report)
-    _check_example(cfg, trainer, tokenizer, report)
+    with stage(progress, "checking trainable parameters and LoRA targets"):
+        _check_targets(cfg, model, report)
+    with stage(progress, "checking tokenizer and model cache settings"):
+        _check_pad_token(tokenizer, report)
+        _check_use_cache(cfg, model, report)
+    _check_truncation(cfg, train_set, tokenizer, report, progress=progress)
+    with stage(progress, "checking prepared training example"):
+        _check_example(cfg, trainer, tokenizer, report)
 
 
 # The tokenizer behind a processor; a text-only checkpoint's processor is
@@ -306,7 +314,7 @@ def _check_use_cache(cfg, model, report):
 # response tokenized separately then joined. Prompt-only methods have no
 # response to cut; `text` rows have no response either and are counted as
 # over-length only.
-def _check_truncation(cfg, train_set, tokenizer, report):
+def _check_truncation(cfg, train_set, tokenizer, report, *, progress=None):
     max_length = getattr(cfg.args, "max_length", None)
     if max_length is None:
         return
@@ -315,16 +323,20 @@ def _check_truncation(cfg, train_set, tokenizer, report):
         return
     if cfg.method.name == "sft":
         over = cut = 0
-        for row in train_set:
-            length, has_response = _sft_length(row, tokenizer)
-            if length > max_length:
-                over += 1
-                cut += has_response
+        with stage(progress, "checking training row truncation", total=train_set.num_rows, unit="rows") as activity:
+            for row in train_set:
+                length, has_response = _sft_length(row, tokenizer)
+                if length > max_length:
+                    over += 1
+                    cut += has_response
+                activity.advance()
     elif cfg.method.dataset_format in ("preference", "unpaired preference"):
         over = 0
-        for row in train_set:
-            if any(len(p) + len(r) > max_length for p, r in _response_pairs(row, tokenizer)):
-                over += 1
+        with stage(progress, "checking training row truncation", total=train_set.num_rows, unit="rows") as activity:
+            for row in train_set:
+                if any(len(p) + len(r) > max_length for p, r in _response_pairs(row, tokenizer)):
+                    over += 1
+                activity.advance()
         cut = over
     else:
         return
@@ -418,7 +430,7 @@ def _check_example(cfg, trainer, tokenizer, report):
 # response below the threshold is one the starting model finds unlikely,
 # which is what off-policy data looks like. Runs on every rank (see module
 # docstring); the model is put in eval mode for the forwards and restored.
-def check_offpolicy(cfg, model, processor, train_set, report):
+def check_offpolicy(cfg, model, processor, train_set, report, *, progress=None):
     if "preflight" not in cfg.method.blocks:
         return
     if cfg.preflight is None:
@@ -433,7 +445,7 @@ def check_offpolicy(cfg, model, processor, train_set, report):
     was_training = model.training
     model.eval()
     try:
-        with torch.no_grad():
+        with stage(progress, "checking off-policy responses", total=count, unit="rows") as activity, torch.no_grad():
             for row in train_set.select(range(count)):
                 pairs = _response_pairs(row, tokenizer)
                 names = ("completion",) if len(pairs) == 1 else ("chosen", "rejected")
@@ -443,6 +455,9 @@ def check_offpolicy(cfg, model, processor, train_set, report):
                         skipped[name] = skipped.get(name, 0) + 1
                     else:
                         scores.setdefault(name, []).append(value)
+                # All responses in the row have been checked; every rank must still
+                # execute the same forwards because FSDP participates collectively.
+                activity.advance()
     finally:
         model.train(was_training)
     facts = {"rows": count, "threshold": threshold}
@@ -494,7 +509,8 @@ def callback_class():
     from transformers import TrainerCallback
 
     class PreflightCallback(TrainerCallback):
-        def __init__(self, cfg, processor, train_set, report, run_dir, rank, *, no_staging=False):
+        # Each worker owns its progress reporter; report publication remains rank 0's responsibility.
+        def __init__(self, cfg, processor, train_set, report, run_dir, rank, *, no_staging=False, progress=None):
             self.cfg = cfg
             self.processor = processor
             self.train_set = train_set
@@ -502,11 +518,13 @@ def callback_class():
             self.run_dir = run_dir
             self.rank = rank
             self.no_staging = no_staging
+            self.progress = progress
 
+        # Forward passes run on every rank; only the authoritative report is flushed and written once.
         def on_train_begin(self, args, state, control, model=None, **kwargs):
-            check_offpolicy(self.cfg, model, self.processor, self.train_set, self.report)
+            check_offpolicy(self.cfg, model, self.processor, self.train_set, self.report, progress=self.progress)
             if self.rank == 0:
                 self.report.flush()
-                self.report.write(self.run_dir, no_staging=self.no_staging)
+                self.report.write(self.run_dir, no_staging=self.no_staging, progress=self.progress)
 
     return PreflightCallback

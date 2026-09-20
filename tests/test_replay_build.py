@@ -5,9 +5,10 @@ import pathlib
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from trlx import TrlxError, replay_build
+from dataset.progress import Progress
+from trlx import TrlxError, generate, replay_build
 
 
 class ReplayOutput(unittest.TestCase):
@@ -67,3 +68,32 @@ class ReplayOutput(unittest.TestCase):
         self.assertIn("example.test/v1/chat/completions", line)
         for secret in ("user", "secret", "private", "token="):
             self.assertNotIn(secret, line)
+
+
+class LocalGenerationProgress(unittest.TestCase):
+    # A failed second prompt must not be counted, and feedback must preserve model state.
+    def test_counts_decoded_completions_and_restores_training(self):
+        for fail_second in (False, True):
+            with self.subTest(fail_second=fail_second):
+                lines = []
+                model = Mock(training=True)
+                model.parameters.return_value = iter([generate.torch.nn.Parameter(generate.torch.zeros(1))])
+                generated = generate.torch.tensor([[1, 2]])
+                model.generate.side_effect = [generated, generate.torch.cuda.OutOfMemoryError("full")
+                                              if fail_second else generated]
+                tokenizer = Mock(pad_token_id=0, eos_token_id=1, chat_template=None)
+                tokenizer.return_value.to.return_value = {"input_ids": generate.torch.tensor([[1]])}
+                tokenizer.decode.side_effect = ["first answer", "second answer"]
+                processor = types.SimpleNamespace(tokenizer=tokenizer)
+                if fail_second:
+                    with self.assertRaisesRegex(TrlxError, "CUDA memory exhausted during generation"):
+                        with Progress("replay", emit=lines.append) as progress:
+                            generate.generate(model, processor, ["first", "second"], progress=progress)
+                    self.assertTrue(any("generating completions; 1/2 prompts; failed" in line for line in lines))
+                    self.assertFalse(any("2/2 prompts" in line for line in lines))
+                else:
+                    with Progress("replay", emit=lines.append) as progress:
+                        replies = generate.generate(model, processor, ["first", "second"], progress=progress)
+                    self.assertEqual(replies, ["first answer", "second answer"])
+                    self.assertTrue(any("generating completions; 2/2 prompts; finished" in line for line in lines))
+                model.train.assert_called_once_with(True)

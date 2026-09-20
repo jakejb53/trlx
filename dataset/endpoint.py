@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 
 from dataset.io import DatasetError
+from dataset.progress import stage
 
 # A reply's two parts. `reasoning` is the endpoint's own reasoning field and is
 # "" when the endpoint returns none: either the model is not a reasoning model,
@@ -64,10 +65,16 @@ class Endpoint:
         self._base_display_url = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")
         )
-        self._secrets = sorted({value for value in (
+        values = {value for value in (
             api_key, parsed.username, parsed.password,
             *(value for _, value in urllib.parse.parse_qsl(parsed.query)),
-        ) if value}, key=len, reverse=True)
+            *(part.partition("=")[2] for part in parsed.query.split("&")),
+        ) if value}
+        # Servers may echo either URL-encoded or decoded credentials in error bodies.
+        values.update(urllib.parse.unquote(value) for value in tuple(values))
+        values.update(urllib.parse.quote(value, safe="") for value in tuple(values))
+        values.update(urllib.parse.quote_plus(value, safe="") for value in tuple(values))
+        self._secrets = sorted(values, key=len, reverse=True)
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
@@ -82,12 +89,13 @@ class Endpoint:
 
     # One chat completion. Returns the assistant text; callers that need the
     # reasoning field call complete_full.
-    def complete(self, messages, max_tokens=None):
-        return self.complete_full(messages, max_tokens).content
+    def complete(self, messages, max_tokens=None, *, progress=None):
+        with stage(progress, f"request to {self.display_url}") as activity:
+            return self.complete_full(messages, max_tokens, progress=activity).content
 
     # One chat completion as a Reply. Raises DatasetError with the URL and last
     # status when retries are exhausted or the reply is malformed.
-    def complete_full(self, messages, max_tokens=None):
+    def complete_full(self, messages, max_tokens=None, *, progress=None, request="request"):
         body = {"model": self.model, "messages": messages}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
@@ -98,7 +106,10 @@ class Endpoint:
         last = None
         for attempt in range(self.retries + 1):
             if attempt:
-                time.sleep(_BACKOFF_BASE_SECONDS * 2 ** (attempt - 1))
+                delay = _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
+                if progress is not None:
+                    progress.note(f"{request}: {last}; retry attempt {attempt + 1}/{self.retries + 1} in {delay:g}s")
+                time.sleep(delay)
             try:
                 req = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -158,20 +169,35 @@ class Endpoint:
         return Reply(content, reasoning)
 
     # Assistant texts for many message lists, in request order.
-    def complete_many(self, message_lists, concurrency, max_tokens=None):
-        return [r.content for r in self.complete_many_full(message_lists, concurrency, max_tokens)]
+    def complete_many(self, message_lists, concurrency, max_tokens=None, *, progress=None, label="requests"):
+        return [r.content for r in self.complete_many_full(
+            message_lists, concurrency, max_tokens, progress=progress, label=label)]
 
     # Runs complete_full() over many message lists with `concurrency` threads.
-    # Results are in request order. The first failure cancels pending requests
-    # and is raised.
-    def complete_many_full(self, message_lists, concurrency, max_tokens=None):
+    # Observe completion order but store input order. Report failure before the
+    # pool waits for running requests; queued requests are cancelled immediately.
+    def complete_many_full(self, message_lists, concurrency, max_tokens=None, *, progress=None, label="requests"):
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise DatasetError("concurrency must be an integer at least 1")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(self.complete_full, m, max_tokens) for m in message_lists]
-            try:
-                return [f.result() for f in futures]
-            except DatasetError:
-                for f in futures:
-                    f.cancel()
-                raise
+        message_lists = list(message_lists)
+        with stage(progress, f"{label} from {self.model} at {self.display_url}",
+                   total=len(message_lists), unit="requests") as activity:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = {pool.submit(self.complete_full, messages, max_tokens,
+                                       progress=activity, request=f"request {i + 1}"): i
+                           for i, messages in enumerate(message_lists)}
+                replies = [None] * len(futures)
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        replies[futures[future]] = future.result()
+                        activity.advance()
+                except BaseException as error:
+                    for pending in futures:
+                        pending.cancel()
+                    # Error diagnostics already sanitize endpoint responses. Sanitize
+                    # again at this boundary before publishing a batch-level notice.
+                    detail = self._diagnostic(error) if isinstance(error, DatasetError) else type(error).__name__
+                    running = sum(f.running() for f in futures)
+                    activity.note(f"stopping batch: {detail}; waiting for {running} in-flight request(s)")
+                    raise
+                return replies

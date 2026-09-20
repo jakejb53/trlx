@@ -115,7 +115,7 @@ dataset/
 tests/
 ```
 
-Import rule: `dataset/` imports nothing from `trlx/` or `trl`. `trlx/` may import `dataset/io.py`, `dataset/endpoint.py` and `dataset/env.py`. A test asserts the rule by scanning imports.
+Import rule: `dataset/` imports nothing from `trlx/` or `trl`. `trlx/` may import `dataset/io.py`, `dataset/endpoint.py`, `dataset/env.py`, and `dataset/progress.py`. A test asserts the rule by scanning imports.
 
 ## Config schema
 

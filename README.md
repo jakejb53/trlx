@@ -45,6 +45,11 @@ dataset --help
 Help lists commands, options, defaults, constraints, and examples; it needs no
 config, model, dataset, or GPU. The sections below are reference and optional tuning.
 
+Both tools report their current operation, completed counts when available, retries,
+and final outcome to stderr. After ten seconds without feedback, a waiting notice
+shows elapsed time and the last measured progress; it does not claim work is advancing.
+Training also records feedback in `log.txt`, visible in the TUI's log pane.
+
 ## Installing updates
 
 Editing or updating the checkout does not update an installed copy of the tools.

@@ -23,11 +23,14 @@ Both display modes read the run directory only: metrics.jsonl is the single
 metric source (SPEC 2.3), and log.txt is mirrored to stderr in line mode.
 """
 
+import contextlib
+import functools
 import logging
 import os
 import pathlib
 import sys
 
+from dataset.progress import Progress, stage
 from trlx import (
     TrlxError,
     config as config_mod,
@@ -62,29 +65,34 @@ def run(args):
 
 # Supervisor side.
 def _supervise(args):
-    document = config_mod.resolve(args.config, args.command, getattr(args, "overrides", None))
+    progress = getattr(args, "progress", None)
+    with stage(progress, "resolving training configuration"):
+        document = config_mod.resolve(args.config, args.command, getattr(args, "overrides", None))
     source = config_mod.source_path(document, args.config)
     controls = config_mod.run_settings(document, source)
     args.tui = controls["tui"]
     args.no_verify = not controls["verify"]
     gpu_flag = None if controls["gpus"] == "all" else controls["gpus"]
     strategy_flag = None if controls["strategy"] == "auto" else controls["strategy"]
-    gpus, count = launch.select_gpus(gpu_flag)
-    physical = launch.physical_ids(gpus, count)
+    with stage(progress, "inspecting selected GPUs"):
+        gpus, count = launch.select_gpus(gpu_flag)
+        physical = launch.physical_ids(gpus, count)
     # From here the supervisor sees only the selected devices: config.load
     # initializes CUDA, and the memory query in choose_strategy indexes them.
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
-    cfg = config_mod.from_document(document, args.command, path=source)
-    strategy, why = launch.choose_strategy(strategy_flag, cfg, physical)
+    with stage(progress, "validating trainer settings and estimating model memory"):
+        cfg = config_mod.from_document(document, args.command, path=source)
+        strategy, why = launch.choose_strategy(strategy_flag, cfg, physical)
     # Config-only preflight (SPEC 2.6) before anything is written: a fatal
     # check must not leave a half-made run directory behind.
-    preflight.check_config(cfg, source, strategy)
+    preflight.check_config(cfg, source, strategy, progress=progress)
     startup = f"strategy: {strategy} ({why}); GPUs {','.join(physical)}"
 
-    run_dir = _create_run_dir(cfg)
+    with stage(progress, "allocating run directory"):
+        run_dir = _create_run_dir(cfg)
     # Retain exclusive ownership through verification; another supervisor must not
     # rewind files while this job's workers or verification are still using them.
-    with run_dirs.locked(run_dir):
+    with stage(progress, f"acquiring run ownership: {run_dir}"), run_dirs.locked(run_dir):
         try:
             return _run_job(args, cfg, run_dir, physical, strategy, startup)
         except OSError as e:
@@ -92,18 +100,51 @@ def _supervise(args):
                             "check available space and permissions") from e
 
 
+# Log failures remain supervision failures, independently of terminal rendering.
+def _write_progress_log(log_file, log_path, line):
+    try:
+        log_file.write((line + "\n").encode("utf-8"))
+        log_file.flush()
+    except OSError as error:
+        raise TrlxError(f"{log_path}: cannot write progress log: {error}; check available space and permissions") from error
+
+
+# Startup feedback reaches the terminal until the supervisor starts its display.
+# The inner reporter stops before log_file closes; child processes own their reporters.
+@contextlib.contextmanager
+def _job_feedback(args, log_file, log_path):
+    parent = getattr(args, "progress", None)
+    if parent is None:
+        yield None
+        return
+
+    # Before live mirroring starts, metadata operations must be visible too.
+    def emit(line):
+        _write_progress_log(log_file, log_path, line)
+        if parent.error is None:
+            try:
+                parent.emit(line)
+            except Exception as error:
+                parent.error = error
+
+    with parent.suspended(), Progress(f"trlx {args.command} supervisor", emit=emit) as progress:
+        yield progress
+
+
 # The directory is owned and config preflight has passed before history is changed.
 def _run_job(args, cfg, run_dir, physical, strategy, startup):
     log_path = run_dir / show.LOG_FILENAME
-    with open(log_path, "ab") as log_file:
+    with open(log_path, "ab") as log_file, _job_feedback(args, log_file, log_path) as progress:
         retained = 0
         startup = f"run directory: {run_dir}\n{startup}"
         if cfg.args.resume_from_checkpoint:
-            resume = run_dirs.inspect_checkpoint(cfg.args.resume_from_checkpoint)
-            retained, marker = run_dirs.rewind(resume, no_staging=getattr(args, "no_staging", False))
+            with stage(progress, "validating and rewinding checkpoint resume"):
+                resume = run_dirs.inspect_checkpoint(cfg.args.resume_from_checkpoint)
+                retained, marker = run_dirs.rewind(resume, no_staging=getattr(args, "no_staging", False))
             startup = f"{marker}\n{startup}"
-        snapshot = _write_snapshot(cfg, run_dir, physical, strategy,
-                                   no_staging=getattr(args, "no_staging", False))
+        with stage(progress, "writing resolved configuration snapshot"):
+            snapshot = _write_snapshot(cfg, run_dir, physical, strategy,
+                                       no_staging=getattr(args, "no_staging", False))
         try:
             log_file.write((startup + "\n").encode("utf-8"))
             log_file.flush()
@@ -112,6 +153,10 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
         # Capture the boundary before workers start, including fast first writes.
         # Startup is printed below; only subsequent log bytes need mirroring.
         log_offset = log_file.tell()
+        if progress is not None:
+            # From now on the log reader/TUI owns presentation; writing stderr here
+            # would duplicate line output or corrupt the curses screen.
+            progress.set_sink(functools.partial(_write_progress_log, log_file, log_path))
         display_failed = False
 
         # The log remains authoritative after presentation stops. A failure to
@@ -121,32 +166,40 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
             display_failed = True
             _report_display_error(error, log_file, log_path)
 
+        parent_progress = getattr(args, "progress", None)
+        if parent_progress is not None and parent_progress.error is not None:
+            on_display_error(parent_progress.error)
         try:
-            print(startup, file=sys.stderr, flush=True)
+            if sys.stderr is not None:
+                print(startup, file=sys.stderr, flush=True)
         except Exception as error:
             on_display_error(error)
-        workers = launch.spawn(args.command, str(snapshot), strategy, physical, log_file,
-                               force=getattr(args, "force", False), no_staging=getattr(args, "no_staging", False))
+        with stage(progress, "starting training workers", total=len(physical), unit="workers") as activity:
+            workers = launch.spawn(args.command, str(snapshot), strategy, physical, log_file,
+                                   force=getattr(args, "force", False), no_staging=getattr(args, "no_staging", False))
+            activity.update(len(workers))
         start_verify = None
         if not args.no_verify:
             # Called by the Job once the workers are done: the checkpoint to
             # verify exists only then.
             def start_verify():
-                checkpoint = _final_checkpoint(run_dir)
-                prompts = _dataset_arg(cfg.verify_prompts)
-                return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, log_file,
-                                           force=getattr(args, "force", False),
-                                           no_staging=getattr(args, "no_staging", False))
+                with stage(progress, "starting post-training verification"):
+                    checkpoint = _final_checkpoint(run_dir)
+                    prompts = _dataset_arg(cfg.verify_prompts)
+                    return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, log_file,
+                                               force=getattr(args, "force", False),
+                                               no_staging=getattr(args, "no_staging", False))
 
-        job = launch.Job(workers, start_verify)
+        job = launch.Job(workers, start_verify, progress=progress)
         try:
-            if display_failed:
-                failure = job.wait(lambda: None)
-            elif args.tui:
-                failure = _supervise_tui(run_dir, job, on_display_error)
-            else:
-                failure = _supervise_lines(run_dir, cfg.ranges, log_path, job, on_display_error,
-                                           printed=retained, log_offset=log_offset)
+            with stage(progress, "supervising training workers and verification"):
+                if display_failed:
+                    failure = job.wait(lambda: None)
+                elif args.tui:
+                    failure = _supervise_tui(run_dir, job, on_display_error)
+                else:
+                    failure = _supervise_lines(run_dir, cfg.ranges, log_path, job, on_display_error,
+                                               printed=retained, log_offset=log_offset)
             if failure is not None:
                 label, code = failure
                 # Final diagnostics are display work too: a broken stream or
@@ -165,6 +218,8 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
             # Display exceptions have already been handled at their boundary.
             job.terminate()
             raise
+        if progress is not None:
+            progress.finish("completed" if failure is None else f"failed: {failure[0]} exited with code {failure[1]}")
     return 0 if failure is None else failure[1]
 
 
@@ -220,6 +275,8 @@ def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, prin
         try:
             chunk = log_reader.read()
             if chunk:
+                if job.progress is not None:
+                    job.progress.output_seen()
                 sys.stderr.buffer.write(chunk)
                 sys.stderr.buffer.flush()
             if metrics_path.exists():
@@ -249,11 +306,12 @@ def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, prin
 def _supervise_tui(run_dir, job, on_display_error):
     failure = None
     poll_error = None
+    last_log = None
 
     # Polling is embedded in the TUI callback. Remember its error separately
     # so the outer curses error boundary cannot classify it as presentation.
     def load(log_lines):
-        nonlocal failure, poll_error
+        nonlocal failure, poll_error, last_log
         try:
             failure = job.poll()
         except Exception as error:
@@ -261,7 +319,11 @@ def _supervise_tui(run_dir, job, on_display_error):
             raise
         if failure is not None:
             raise TrlxError(f"{failure[0]} exited with code {failure[1]}")
-        return show.load(run_dir, name, range_table, log_lines)
+        state = show.load(run_dir, name, range_table, log_lines)
+        if state.log_tail != last_log and job.progress is not None:
+            job.progress.output_seen()
+        last_log = state.log_tail
+        return state
 
     try:
         from trlx import render_tui
@@ -308,36 +370,44 @@ def _worker(args):
     import torch
 
     rank = args._rank
+    progress = getattr(args, "progress", None)
     fsdp = "full_shard" if args._strategy == "fsdp" else None
-    cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
-                          overrides=getattr(args, "overrides", None), resolved=True)
+    with stage(progress, "loading resolved worker configuration"):
+        cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
+                              overrides=getattr(args, "overrides", None), resolved=True)
     run_dir = pathlib.Path(cfg.args.output_dir)
     _attach_logging()
 
-    model = model_mod.load_model(cfg.model, cfg.method.model_kind)
-    processor = model_mod.load_processor(cfg.model)
-    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format)
-    train_set = _mix_replay(cfg, train_set)
+    model = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
+    processor = model_mod.load_processor(cfg.model, progress=progress)
+    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    train_set = _mix_replay(cfg, train_set, progress=progress)
 
     # Preflight (SPEC 2.6): rank 0 holds the report; every rank carries the
     # callback because the forward-pass check is a collective under FSDP.
     # Other ranks' reports are discarded.
     report = preflight.Report()
     callbacks = [preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
-                                            no_staging=getattr(args, "no_staging", False))]
+                                            no_staging=getattr(args, "no_staging", False), progress=progress)]
     if rank == 0:
         callbacks.append(metrics.callback_class()(run_dir))
-    trainer = build_trainer(cfg, model, processor, train_set, eval_set, callbacks)
+    trainer = build_trainer(cfg, model, processor, train_set, eval_set, callbacks, progress=progress)
     if rank == 0:
         # Flushed even when a check is fatal: the lines already noted (the
         # LoRA breakdown, say) are the context for the failure.
         try:
-            preflight.check_trainer(cfg, trainer, train_set, report)
+            preflight.check_trainer(cfg, trainer, train_set, report, progress=progress)
         finally:
             report.flush()
-        report.write(run_dir, no_staging=getattr(args, "no_staging", False))
+        report.write(run_dir, no_staging=getattr(args, "no_staging", False), progress=progress)
     try:
-        trainer.train(resume_from_checkpoint=cfg.args.resume_from_checkpoint)
+        with stage(progress, "trainer running", unit="steps") as activity:
+            feedback = metrics.activity_callback_class()(activity)
+            trainer.add_callback(feedback)
+            try:
+                trainer.train(resume_from_checkpoint=cfg.args.resume_from_checkpoint)
+            finally:
+                feedback.close(sys.exc_info())
     except torch.cuda.OutOfMemoryError as e:
         raise TrlxError("CUDA memory exhausted during training; reduce batch size or sequence length, "
                         "or use more GPU memory") from e
@@ -359,32 +429,36 @@ def _worker(args):
 def check(args):
     import torch
 
-    document = config_mod.resolve(args.config, args.method, getattr(args, "overrides", None))
+    progress = getattr(args, "progress", None)
+    with stage(progress, "resolving check configuration"):
+        document = config_mod.resolve(args.config, args.method, getattr(args, "overrides", None))
     source = config_mod.source_path(document, args.config)
     controls = config_mod.run_settings(document, source)
     gpu_flag = None if controls["gpus"] == "all" else controls["gpus"]
-    gpus, count = launch.select_gpus(gpu_flag)
-    physical = launch.physical_ids(gpus[:1], count)
+    with stage(progress, "inspecting selected GPU"):
+        gpus, count = launch.select_gpus(gpu_flag)
+        physical = launch.physical_ids(gpus[:1], count)
     os.environ["CUDA_VISIBLE_DEVICES"] = physical[0]
-    cfg = config_mod.from_document(document, args.method, path=source)
+    with stage(progress, "validating trainer settings"):
+        cfg = config_mod.from_document(document, args.method, path=source)
     print(f"check: one process on GPU {physical[0]}", file=sys.stderr)
-    preflight.check_config(cfg, source, None)
+    preflight.check_config(cfg, source, None, progress=progress)
     print("preflight: config checks passed", file=sys.stderr)
     _attach_logging()
 
-    model = model_mod.load_model(cfg.model, cfg.method.model_kind)
-    processor = model_mod.load_processor(cfg.model)
-    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format)
-    train_set = _mix_replay(cfg, train_set)
+    model = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
+    processor = model_mod.load_processor(cfg.model, progress=progress)
+    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    train_set = _mix_replay(cfg, train_set, progress=progress)
     report = preflight.Report()
     # The Trainer creates output_dir on construction. check writes nothing,
     # so a directory that did not exist before is removed if still empty.
     run_dir = pathlib.Path(cfg.args.output_dir)
     existed = run_dir.exists()
     try:
-        trainer = build_trainer(cfg, model, processor, train_set, eval_set, [])
-        preflight.check_trainer(cfg, trainer, train_set, report)
-        preflight.check_offpolicy(cfg, trainer.model, processor, train_set, report)
+        trainer = build_trainer(cfg, model, processor, train_set, eval_set, [], progress=progress)
+        preflight.check_trainer(cfg, trainer, train_set, report, progress=progress)
+        preflight.check_offpolicy(cfg, trainer.model, processor, train_set, report, progress=progress)
     except torch.cuda.OutOfMemoryError:
         raise TrlxError(
             f"[model].path '{cfg.model.path}' does not fit GPU {physical[0]} for a standalone check; "
@@ -399,18 +473,19 @@ def check(args):
 
 
 # The method's trainer over loaded objects, as every worker and `check`
-# build it. SPEC 2.4: no progress bar; metrics.jsonl is the only reporter.
-def build_trainer(cfg, model, processor, train_set, eval_set, callbacks):
+# build it. Metrics remain in metrics.jsonl; operational feedback goes to the log.
+def build_trainer(cfg, model, processor, train_set, eval_set, callbacks, *, progress=None):
     cfg.args.disable_tqdm = True
     extra = {}
     if cfg.teacher is not None:
         # distillation: the teacher is a loaded object, never a path, so
         # [teacher] governs its dtype and attention implementation too.
-        extra["teacher_model"] = model_mod.load_model(cfg.teacher, model_mod.CAUSAL)
+        extra["teacher_model"] = model_mod.load_model(cfg.teacher, model_mod.CAUSAL, progress=progress)
     if cfg.rewards is not None:
         from trlx import rewards
 
-        extra["reward_funcs"] = rewards.resolve(cfg.rewards)
+        with stage(progress, "resolving reward functions"):
+            extra["reward_funcs"] = rewards.resolve(cfg.rewards, progress=progress)
     trainer_cls = cfg.method.trainer_cls
     if _replay_kl_on(cfg):
         # The KL term needs the replay subclass (SPEC 2.9). LoRA runs compare
@@ -422,20 +497,21 @@ def build_trainer(cfg, model, processor, train_set, eval_set, callbacks):
         trainer_cls = replay_trainer.ReplayTrainer
         extra["kl_coef"] = cfg.replay.kl_coef
         if cfg.peft is None:
-            extra["reference_model"] = model_mod.load_model(cfg.model, cfg.method.model_kind)
+            extra["reference_model"] = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
     from peft.utils.error import NoMatchingPeftModuleError
 
     try:
-        trainer = trainer_cls(
-            model=model,
-            args=cfg.args,
-            train_dataset=train_set,
-            eval_dataset=eval_set,
-            processing_class=processor,
-            peft_config=cfg.peft,
-            callbacks=callbacks,
-            **extra,
-        )
+        with stage(progress, "constructing trainer and preparing datasets"):
+            trainer = trainer_cls(
+                model=model,
+                args=cfg.args,
+                train_dataset=train_set,
+                eval_dataset=eval_set,
+                processing_class=processor,
+                peft_config=cfg.peft,
+                callbacks=callbacks,
+                **extra,
+            )
     except NoMatchingPeftModuleError as e:
         # peft refuses target_modules that match nothing while wrapping the
         # model (SPEC 2.6 fatal); reported against the config key.
@@ -453,10 +529,10 @@ def _replay_kl_on(cfg):
 # The train set with [replay].dataset mixed in, or unchanged without a
 # [replay] block. The flag column is added only for the KL term: the stock
 # trainer would carry an unused column through packing otherwise.
-def _mix_replay(cfg, train_set):
+def _mix_replay(cfg, train_set, *, progress=None):
     if cfg.replay is None:
         return train_set
-    return data_load.mix_replay(train_set, cfg.replay, _replay_kl_on(cfg))
+    return data_load.mix_replay(train_set, cfg.replay, _replay_kl_on(cfg), progress=progress)
 
 
 # transformers installs PrinterCallback (tqdm disabled) or ProgressCallback
