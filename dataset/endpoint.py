@@ -94,8 +94,9 @@ class Endpoint:
             return self.complete_full(messages, max_tokens, progress=activity).content
 
     # One chat completion as a Reply. Raises DatasetError with the URL and last
-    # status when retries are exhausted or the reply is malformed.
-    def complete_full(self, messages, max_tokens=None, *, progress=None, request="request"):
+    # status when retries are exhausted or the reply is malformed. Strict callers
+    # require explicit completion metadata; legacy callers retain their behavior.
+    def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False):
         body = {"model": self.model, "messages": messages}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
@@ -113,7 +114,18 @@ class Endpoint:
             try:
                 req = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    return self._extract(json.loads(resp.read().decode("utf-8")))
+                    raw = json.loads(resp.read().decode("utf-8"))
+                    reply = self._extract(raw)
+                    if require_stop:
+                        reason = raw["choices"][0].get("finish_reason")
+                        if reason != "stop":
+                            detail = self._diagnostic(repr(reason))[:200]
+                            remedy = ("increase --max-tokens" if reason == "length" else
+                                      "check the endpoint's completion metadata and response")
+                            raise DatasetError(
+                                f"{self.display_url}: expected finish_reason='stop', got {detail}; {remedy}"
+                            )
+                    return reply
             except urllib.error.HTTPError as e:
                 last = f"HTTP {e.code}"
                 if e.code not in _RETRY_STATUSES:
@@ -176,20 +188,30 @@ class Endpoint:
     # Runs complete_full() over many message lists with `concurrency` threads.
     # Observe completion order but store input order. Report failure before the
     # pool waits for running requests; queued requests are cancelled immediately.
-    def complete_many_full(self, message_lists, concurrency, max_tokens=None, *, progress=None, label="requests"):
+    def complete_many_full(self, message_lists, concurrency, max_tokens=None, *, progress=None,
+                           label="requests", require_stop=False):
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise DatasetError("concurrency must be an integer at least 1")
         message_lists = list(message_lists)
         with stage(progress, f"{label} from {self.model} at {self.display_url}",
                    total=len(message_lists), unit="requests") as activity:
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                # Omit the new keyword for existing callers and endpoint subclasses.
+                completion_options = {"require_stop": True} if require_stop else {}
                 futures = {pool.submit(self.complete_full, messages, max_tokens,
-                                       progress=activity, request=f"request {i + 1}"): i
+                                       progress=activity, request=f"request {i + 1}",
+                                       **completion_options): i
                            for i, messages in enumerate(message_lists)}
                 replies = [None] * len(futures)
                 try:
                     for future in concurrent.futures.as_completed(futures):
-                        replies[futures[future]] = future.result()
+                        try:
+                            replies[futures[future]] = future.result()
+                        except DatasetError as error:
+                            # Request order is source-row order for eval-build.
+                            raise DatasetError(
+                                f"{label}: request {futures[future] + 1}: {self._diagnostic(error)}"
+                            ) from error
                         activity.advance()
                 except BaseException as error:
                     for pending in futures:

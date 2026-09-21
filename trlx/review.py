@@ -96,6 +96,8 @@ def _selected(cfg):
     selected = set(_COMMON | _METHOD[cfg.method.name])
     selected.update(_explicit_keys(cfg.document) & _EXPLICIT_TUNING)
     selected.update({"model.dtype", "dataset.eval_fraction", "rewards.funcs"})
+    if cfg.method.name == "sft":
+        selected.add("dataset.synthetic_dataset_eval")
     for feature, details in _FEATURES.items():
         if getattr(cfg.args, feature, False):
             selected.update(details)

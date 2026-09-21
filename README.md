@@ -382,10 +382,30 @@ trlx sft --model MODEL --no-split --dataset data.jsonl
 
 To persist separate files, use `split = false` with `dataset_train` and optional
 `dataset_eval` in `[dataset]`; remove `dataset` and `eval_fraction`.
-Without `dataset_eval`, also remove top-level `eval_*` settings. The CLI's
-`--no-split` handles that removal automatically when no evaluation source is set.
+Without a separate or synthetic evaluation dataset, also remove top-level `eval_*`
+settings. The CLI's `--no-split` handles that removal automatically.
 The old `train = N` setting is rejected. Dataset IDs use `org/name:split`;
 a dataset with multiple splits requires an explicit split name.
+
+For SFT with CPT `text` rows, generate evaluation summaries with the model already
+loaded for training:
+
+```sh
+trlx sft --model MODEL --dataset train.jsonl --synthetic-dataset-eval --max-length 1024
+```
+
+This trains on all primary source rows and generates one factual prose summary per
+row before the step-zero evaluation. The positive `--max-length` value also limits
+generated tokens per summary. The flag replaces configured splitting or evaluation
+sources; explicit `--split`, `--eval-fraction`, and `--dataset-eval` conflict with it.
+The ordinary evaluation schedule is retained. Startup skips evaluation-data inspection;
+`trlx check sft` validates the setup without generating summaries.
+
+Summaries are saved only in this run as `synthetic-eval.jsonl` and reused unchanged
+on resume. A missing file prevents resume before rewind. Replay rows are not summarized.
+Generation failures stop training; source prompts are not silently truncated. Model
+response templates separate reasoning from summary content; unparsed tagged responses
+are errors. No endpoint, separate model load, or cross-run cache is involved.
 
 ## Tutorial: LoRA, memory, and GPUs
 
@@ -541,6 +561,35 @@ templates use `{chunk}` and `{question}`.
 Output contains `messages` and separate `reasoning`. Configure the server's reasoning
 parser; inline reasoning is rejected unless `--strip-reasoning-tags` removes a complete
 leading block. An unclosed block is always an error.
+
+For a synthetic CPT evaluation dataset:
+
+```sh
+dataset eval-build train.jsonl --out eval.jsonl \
+  --endpoint ENDPOINT --model MODEL --max-tokens 1024
+
+trlx sft --model MODEL --no-split \
+  --dataset train.jsonl --dataset-eval eval.jsonl \
+  --eval-strategy steps --eval-steps 5
+```
+
+For best results, generate summaries using the same model you'll use this data set to train.
+
+Each input row must contain nonempty string `text`; output contains one factual prose
+summary in `text` per input row, in the same order. JSONL, JSON, CSV, and Parquet are
+supported. `--max-tokens` is a positive completion-token limit, not a source chunk limit.
+Train on all original chunks; generate summaries once and reuse them for the step-zero
+baseline and subsequent ordinary evaluations through `--dataset-eval`.
+
+Inputs and destination are validated before requests. Empty or malformed replies and
+any `finish_reason` other than `"stop"` (including missing metadata) fail with the source
+row number, without publishing an incomplete dataset. Separate reasoning is excluded;
+inline reasoning follows the same `--strip-reasoning-tags` policy as `chat`.
+Existing outputs require `--force`; `--no-staging` controls publication only.
+
+`dataset chat` and `dataset eval-build` share optional request settings:
+`--concurrency` defaults to 4 (positive integer), `--timeout` to 120 seconds (finite and
+positive), and `--retries` to 2 (nonnegative integer). Both accept `--api-key ENVVAR`.
 
 For replay generation through an endpoint:
 

@@ -1,7 +1,7 @@
 """`trlx <method> [options]`: supervisor and worker sides of a training run.
 
 Supervisor (no --_rank): select GPUs -> validate configuration -> inspect metadata
-and fully scan datasets -> review settings/assessment and await consent -> choose
+and scan source datasets (synthetic eval inspection is skipped) -> review and consent -> choose
 strategy -> allocate or rewind -> write snapshot/assessment -> spawn workers.
 The supervisor owns the directory through verification; workers never allocate it.
 It never loads model weights. It does hold a CUDA context on the first selected
@@ -9,7 +9,7 @@ device, because transformers validates bf16 against a real device when the
 config is instantiated.
 
 Worker (--_rank r): load the config, the model, the datasets, and train.
-Rank 0 owns metrics.jsonl, quality evidence, and the preflight report. The supervisor drains
+Rank 0 owns metrics.jsonl, quality evidence, synthetic summaries, and the preflight report. The supervisor drains
 raw output and typed feedback separately, recording both in log.txt.
 
 Preflight runs in stages where its inputs exist: the config-only checks in
@@ -49,6 +49,7 @@ from trlx import (
     review,
     run_dirs,
     show,
+    synthetic_eval,
     toml_write,
 )
 
@@ -118,11 +119,17 @@ def _assessment_metadata(model_config):
     return {name: getattr(text, name, None) for name in names}
 
 
-# Read and profile every effective row before confirmation; model weights remain worker-owned.
+# Profile source rows before confirmation; synthetic evaluation inspection is deferred.
 def _assess(cfg, gpu_count, *, progress=None):
+    if cfg.dataset.synthetic_dataset_eval and cfg.args.resume_from_checkpoint:
+        synthetic_eval.require_saved(pathlib.Path(cfg.args.resume_from_checkpoint).resolve().parent)
     metadata = _assessment_metadata(model_mod.load_config(cfg.model, progress=progress))
     processor = model_mod.assessment_processor(cfg, progress=progress)
     train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    if cfg.dataset.synthetic_dataset_eval:
+        with stage(progress, "validating CPT source rows", visible=True) as activity:
+            synthetic_eval.validate_source(train_set)
+            activity.note("synthetic evaluation: startup eval-data inspection skipped; summaries belong to this run")
     primary_rows = train_set.num_rows
     train_set = _mix_replay(cfg, train_set, progress=progress)
     profile = data_profile.scan(cfg, processor, train_set, eval_set, primary_rows=primary_rows, progress=progress)
@@ -477,10 +484,21 @@ def _train_worker(args):
     model = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
     processor = model_mod.load_processor(cfg.model, progress=progress)
     train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    synthetic_callback = None
+    if cfg.dataset.synthetic_dataset_eval:
+        synthetic_eval.validate_source(train_set)
+        if cfg.args.resume_from_checkpoint:
+            eval_set = synthetic_eval.load_saved(run_dir, progress=progress)
+        else:
+            synthetic_callback = synthetic_eval.callback_class()(
+                train_set, run_dir, no_staging=getattr(args, "no_staging", False), progress=progress,
+            )
     train_set = _mix_replay(cfg, train_set, progress=progress)
     if rank == 0:
+        evaluation = ("synthetic evaluation rows pending generation" if synthetic_callback is not None
+                      else f"{eval_set.num_rows if eval_set is not None else 0} evaluation rows")
         print(f"dataset: {train_set.num_rows} training rows; "
-              f"{eval_set.num_rows if eval_set is not None else 0} evaluation rows", flush=True)
+              f"{evaluation}", flush=True)
 
     # Preflight (SPEC 2.6): rank 0 holds the report; every rank carries the
     # callback because the forward-pass check is a collective under FSDP.
@@ -488,6 +506,8 @@ def _train_worker(args):
     report = preflight.Report()
     callbacks = [preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
                                             no_staging=getattr(args, "no_staging", False), progress=progress)]
+    if synthetic_callback is not None:
+        callbacks.append(synthetic_callback)
     writer = metrics.callback_class()(run_dir, settings, cfg.method.name, cfg.ranges) if rank == 0 else None
     quality_callback = None
     if settings.quality_checks:
@@ -498,6 +518,8 @@ def _train_worker(args):
         # Completion quality must publish before this callback closes the sole metrics writer.
         callbacks.append(writer)
     trainer = build_trainer(cfg, model, processor, train_set, eval_set, callbacks, progress=progress)
+    if synthetic_callback is not None:
+        synthetic_callback.bind(trainer)
     if quality_callback is not None:
         quality_callback.bind(trainer)
     if rank == 0:
@@ -614,7 +636,9 @@ def build_trainer(cfg, model, processor, train_set, eval_set, callbacks, *, prog
     from peft.utils.error import NoMatchingPeftModuleError
 
     try:
-        with stage(progress, "constructing trainer and preparing datasets", visible=True):
+        with stage(progress, "constructing trainer and preparing datasets", visible=True), synthetic_eval.deferred_evaluation(
+            cfg.args, cfg.dataset.synthetic_dataset_eval and eval_set is None,
+        ):
             trainer = trainer_cls(
                 model=model,
                 args=cfg.args,

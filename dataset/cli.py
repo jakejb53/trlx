@@ -12,10 +12,16 @@ import argparse
 import os
 import sys
 
-from dataset import chat, convert, cpt, env, fields, heal, pairs, rows, stats
+from dataset import chat, convert, cpt, env, eval_build, fields, heal, pairs, rows, stats
 from dataset.endpoint import Endpoint
 from dataset.io import DatasetError, read_rows, validate_rows_output, write_many_rows, write_rows
 from dataset.progress import Progress, stage
+
+# Shared dataset endpoint defaults are an explicit exception recorded in PLAN.md.
+# Endpoint itself still receives resolved values; trlx callers are unaffected.
+ENDPOINT_CONCURRENCY = 4
+ENDPOINT_TIMEOUT = 120
+ENDPOINT_RETRIES = 2
 
 
 # File format follows --out's extension; --to additionally reshapes rows.
@@ -175,6 +181,26 @@ def _cmd_chat(args):
         print(f"skipped {s}", file=sys.stderr)
     write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging, progress=args.progress)
     print(f"{len(data)} rows, {len(skipped)} skipped")
+    return 0
+
+
+# All generation and validation finish before publication, even with --no-staging.
+def _cmd_eval_build(args):
+    if not args.model.strip():
+        raise DatasetError("--model must name the model served by the endpoint")
+    api_key = None
+    if args.api_key:
+        api_key = os.environ.get(args.api_key)
+        if not api_key:
+            raise DatasetError(f"--api-key: environment variable {args.api_key} is not set")
+    endpoint = Endpoint(args.endpoint, args.model, api_key, args.timeout, args.retries)
+    data = eval_build.build(
+        read_rows(args.input, progress=args.progress), endpoint, args.max_tokens,
+        args.concurrency, args.strip_reasoning_tags, progress=args.progress,
+    )
+    write_rows(args.out, data, [args.input], force=args.force,
+               no_staging=args.no_staging, progress=args.progress)
+    print(f"{len(data)} summaries written to {args.out}", file=sys.stderr)
     return 0
 
 
@@ -388,16 +414,58 @@ def build_parser():
     answers.add_argument("--answers-prompt", metavar="FILE",
                    help="UTF-8 template with {chunk} and {question}; default: built-in answer instruction")
     requests = p.add_argument_group("requests and credentials (both passes)")
-    requests.add_argument("--concurrency", type=int, required=True, metavar="REQUESTS",
-                   help="maximum simultaneous API requests per pass; integer >= 1")
-    requests.add_argument("--timeout", type=float, required=True, metavar="SECONDS",
-                   help="positive timeout per API request, in seconds")
-    requests.add_argument("--retries", type=int, required=True, metavar="COUNT",
-                   help="integer retries after initial request, >= 0; transient failures use exponential backoff")
+    requests.add_argument("--concurrency", type=int, default=ENDPOINT_CONCURRENCY, metavar="REQUESTS",
+                   help=f"maximum simultaneous API requests per pass; integer >= 1; default: {ENDPOINT_CONCURRENCY}")
+    requests.add_argument("--timeout", type=float, default=ENDPOINT_TIMEOUT, metavar="SECONDS",
+                   help=f"finite positive timeout per API request, in seconds; default: {ENDPOINT_TIMEOUT}")
+    requests.add_argument("--retries", type=int, default=ENDPOINT_RETRIES, metavar="COUNT",
+                   help=f"integer retries after initial request, >= 0; exponential backoff; default: {ENDPOINT_RETRIES}")
     requests.add_argument("--api-key", metavar="ENVVAR",
                    help="name of variable holding the key, shared by both endpoints; default: no Authorization header")
     requests.add_argument("--strip-reasoning-tags", action="store_true",
                    help="discard a leading inline reasoning block; default: fail; unclosed blocks always fail")
+
+    p = add("eval-build", "generate factual summaries for CPT evaluation", _cmd_eval_build,
+            "Summarize every input text chunk through an OpenAI-compatible endpoint.\n"
+            "Each input row must contain nonempty string text. Output contains one\n"
+            '{"text": "generated summary"} row per input, in the same order.\n'
+            "Built-in instructions request concise factual prose preserving key facts,\n"
+            "names, numbers, and relationships, without invented facts or Q&A formatting.\n\n"
+            "No sampling or re-chunking. Inputs and destination are validated before\n"
+            "requests. Empty, malformed, or incomplete responses fail with the source\n"
+            "row number; generation failures do not publish an incomplete dataset.\n"
+            'The endpoint must report finish_reason="stop" for every summary.\n'
+            "Separate endpoint reasoning is excluded from summaries.\n\n"
+            "For best results, generate summaries using the same model you'll use this data set to train.\n\n"
+            "Generate once and reuse for ordinary next-token-loss evaluation, including\n"
+            "the step-zero baseline. Train on all original chunks and use these summaries\n"
+            "as --dataset-eval. Progress and final outcome go to stderr.\n"
+            "Credentials: --api-key names an environment variable, also loaded from\n"
+            ".env in the working directory; exported values take precedence.",
+            "  dataset eval-build train.jsonl --out eval.jsonl \\\n"
+            "    --endpoint http://localhost:8000/v1 --model my-model --max-tokens 1024\n"
+            "  dataset eval-build train.parquet --out eval.parquet \\\n"
+            "    --endpoint https://api.example.com/v1 --model my-model \\\n"
+            "    --max-tokens 1024 --api-key API_KEY --concurrency 8\n"
+            "  trlx sft --model MODEL --no-split \\\n"
+            "    --dataset train.jsonl --dataset-eval eval.jsonl \\\n"
+            "    --eval-strategy steps --eval-steps 5")
+    p.add_argument("--endpoint", required=True, metavar="URL",
+                   help="API base URL, including /v1 when required; /chat/completions is appended")
+    p.add_argument("--model", required=True, metavar="NAME",
+                   help="model name served by the endpoint")
+    p.add_argument("--max-tokens", type=int, required=True, metavar="TOKENS",
+                   help="positive integer completion-token limit per summary; does not limit source chunk size")
+    p.add_argument("--concurrency", type=int, default=ENDPOINT_CONCURRENCY, metavar="REQUESTS",
+                   help=f"maximum simultaneous requests; integer >= 1; default: {ENDPOINT_CONCURRENCY}")
+    p.add_argument("--timeout", type=float, default=ENDPOINT_TIMEOUT, metavar="SECONDS",
+                   help=f"finite positive timeout per request, in seconds; default: {ENDPOINT_TIMEOUT}")
+    p.add_argument("--retries", type=int, default=ENDPOINT_RETRIES, metavar="COUNT",
+                   help=f"integer retries after initial request, >= 0; exponential backoff; default: {ENDPOINT_RETRIES}")
+    p.add_argument("--api-key", metavar="ENVVAR",
+                   help="environment variable holding the API key; default: no Authorization header")
+    p.add_argument("--strip-reasoning-tags", action="store_true",
+                   help="discard a complete leading inline reasoning block; default: fail; unclosed blocks always fail")
 
     p = add("stats", "inspect token lengths; optionally score responses with a model", _cmd_stats,
             "Print count/min/mean/median/p90/max per column; no output file.\n"

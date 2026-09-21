@@ -170,6 +170,13 @@ def add_training_options(parser, method_name):
         ("--dataset-train", "dataset.dataset_train", str, "Training source with --no-split."),
         ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source with --no-split; omit for training only."),
     ]
+    if method_name == "sft":
+        wrapper.append(("--synthetic-dataset-eval", "dataset.synthetic_dataset_eval", bool,
+                        "CPT text only: generate one summary per source row with the starting model; "
+                        "use --max-length as the generation limit. Train on all source rows, skip startup "
+                        "eval inspection, and save synthetic-eval.jsonl in this run for evaluation and resume. "
+                        "Replaces configured eval sources; conflicts with explicit --split, --eval-fraction, "
+                        "or --dataset-eval. Default: disabled. check validates without generating."))
     if "teacher" in method.blocks:
         wrapper += [
             ("--teacher", "teacher.path", str, "Teacher model directory or ID; required for distillation."),

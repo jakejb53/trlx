@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, and training output improvements complete. Optional acceleration recommendations remain planned, awaiting approval.
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, and synthetic CPT evaluation complete. Optional acceleration recommendations remain planned. Synthetic evaluation execution validation remains with the operator.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -485,6 +485,29 @@ Completed: graceful cancellation (2026-09-21)
   Configuration and existing runs were unchanged.
 - Validation remains with the operator. No tests were updated or run; the GPU driver incident's
   connection to the previous cancellation behavior remains unproven.
+
+### Synthetic CPT evaluation (complete, 2026-09-21)
+
+- `trlx sft --synthetic-dataset-eval` supports raw CPT `text` rows. All primary rows train;
+  the loaded model generates one summary per row before step-zero evaluation, after distributed
+  placement. The existing positive `max_length` limits generated tokens. Replay rows are excluded.
+- Startup skips synthetic evaluation-data inspection. The flag replaces configured splitting or
+  evaluation sources while retaining the evaluation schedule; explicit conflicting CLI options fail.
+  `trlx check sft` validates without generating.
+- Rank zero saves `<run>/synthetic-eval.jsonl`. Evaluation and resume reuse it unchanged;
+  missing data prevents resume before rewind. No hashes or cross-run cache. Generation preserves
+  training state; incomplete summaries fail rather than becoming evaluation data.
+- Standalone `dataset eval-build INPUT --out OUTPUT --endpoint URL --model MODEL --max-tokens N`
+  remains available for JSONL, JSON, CSV, and Parquet. It preserves row order, uses existing reasoning
+  and publication policies, and requires `finish_reason="stop"` without changing the `Reply` contract.
+  Positive `N` limits completion tokens. `chat` and `eval-build` share optional concurrency 4,
+  timeout 120 seconds, retries 2: approved runtime-default exceptions.
+- Added `trlx/synthetic_eval.py` and `dataset/eval_build.py`; updated `trlx/train.py`, `config.py`,
+  `options.py`, `assessment.py`, `review.py`, `dataset/cli.py`, `dataset/endpoint.py`, `README.md`,
+  and `SPEC.md`. Runtime configuration files and existing runs were not modified.
+- Independent source review completed. The inherited generation-stopping issue was fixed and
+  re-reviewed with no remaining reported defects. No tests, endpoint requests, or training runs
+  were executed. Execution validation remains with the operator.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

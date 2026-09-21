@@ -87,7 +87,8 @@ Methods: `sft`, `dpo`, `grpo`, `kto`, `rloo`, `reward`, `distillation`. Stable T
 
 Training options use hyphenated field names; LoRA fields use `--lora-*` (`lora_alpha` becomes `--lora-alpha`). Boolean options have positive and negative forms; lists and tables use shell-quoted TOML. `--no-lora` and `--no-replay` remove those features for one run. Repeated `--reward` entries replace the reward list; distillation exposes `--teacher`. Conflicting explicit options are errors.
 
-Fresh and resumed training inspect model metadata, tokenizers, and all effective dataset rows, then
+Fresh and resumed training inspect model metadata, tokenizers, and all effective dataset rows
+(except synthetic evaluation rows, §2.2), then
 print curated tuning settings and an advisory assessment before weight loading, run allocation, or
 resume rewind. Metadata/data downloads and library cache writes may precede confirmation.
 Paths, launch/display controls, reporting, checkpoint storage, and routine infrastructure
@@ -113,9 +114,12 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 - `[teacher]`: `distillation` only. Same keys as `[model]`.
 - `[dataset]`:
   - `split = true`: `dataset` and `eval_fraction` strictly between 0 and 1. At load time, the final `ceil(row_count * eval_fraction)` rows evaluate; earlier rows train. Both sides must be nonempty. The old `train` key is rejected.
-  - `split = false`: `dataset_train`, optional `dataset_eval`. No `dataset_eval` disables evaluation and rejects `eval_*` fields.
+  - `split = false`: `dataset_train`, optional `dataset_eval`. Without `dataset_eval` or synthetic evaluation, evaluation is disabled and `eval_*` fields are rejected.
   - Key mismatch with `split` is an error.
-  - CLI `--dataset` selects the primary source in either mode. `--no-split` removes fractional-split keys; without `--dataset-eval`, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
+  - CLI `--dataset` selects the primary source in either mode. `--no-split` removes fractional-split keys; without a separate or synthetic evaluation source, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
+  - SFT CPT `text` rows only: `--synthetic-dataset-eval` / `synthetic_dataset_eval = true` replaces configured splitting and evaluation sources, trains on all primary rows, and retains the evaluation schedule. Explicit CLI `--split`, `--eval-fraction`, or `--dataset-eval` conflicts. The resolved snapshot uses `split = false`, `dataset_train`, and `synthetic_dataset_eval`.
+    Generate one factual prose summary per primary row from the loaded model after distributed placement, before the step-zero evaluation or optimizer updates; replay rows are excluded. The positive `max_length` is also the generated-token limit. Full prompts must fit the model context; no silent truncation. Model response templates separate reasoning; unparsed tagged responses, empty summaries, and token-limit exhaustion without EOS are fatal.
+    Rank zero saves `synthetic-eval.jsonl` in the run directory (§1.1 publication policy). All evaluations and resume reuse those summaries. Missing saved data prevents resume before rewind; no regeneration, hashes, or cross-run cache. Startup skips synthetic evaluation-data inspection; `check` validates without generating. Absence of this option disables the feature.
   - HF ids carry a split as `org/name:split`. Without one, a single-split repo is accepted; a multi-split repo is an error listing the splits.
 - `[peft]`: LoraConfig fields. Absent means full fine-tune.
 - `[ranges]`: expected interval per metric. Required. Missing block is a fatal error. Metrics named here are the display columns.
@@ -144,6 +148,7 @@ by `-`; leading/trailing punctuation is removed. Exact inputs remain in the snap
   preflight.json
   assessment.json  full pre-run scan, metadata, and recommendation evidence
   quality.jsonl    independent evaluation rounds with individual inputs, outputs, and scores
+  synthetic-eval.jsonl  optional run-owned CPT summaries, retained across resume
   verify.json
   checkpoint-N/    TRL checkpoint
 ```
@@ -256,7 +261,8 @@ Only `grpo` and `rloo` policy generation requires the TRL vLLM server (per-step 
 
 ### 2.11 Assessment
 
-All seven methods scan every training/evaluation row, including selected replay rows, before review.
+All seven methods scan every training/evaluation row, including selected replay rows, before review,
+except synthetic evaluation rows (§2.2).
 Findings identify measured facts, preparation projections, or heuristics, with evidence and recommendations.
 The trainer remains authoritative on prepared data; preflight checks projections against actual row counts.
 Startup and `check` display only warnings and errors, with relevant settings. Disabled ordinary evaluation
@@ -320,6 +326,25 @@ Replacing an existing output or input requires `--force`; writers support `--no-
 | `heal` | Deterministic JSON and JSONL repairs: truncated last line, trailing commas, unclosed final brace or bracket, single quotes, unquoted keys, Python literals, concatenated objects. Ambiguous errors are reported with line and column and left alone. Every repair is listed. |
 | `chat` | Text file to `messages` via endpoint. Pass 1: chunk plus instruction yields N questions. Pass 2: each question plus its chunk yields the answer. Each pass has its own endpoint and model flags, and a built-in instruction replaceable by `--prompt <file>`. Unparseable replies reported and skipped. Rows carry the answer's reasoning in a `reasoning` column, from the endpoint's reasoning field, `""` when it returns none. The endpoint must return reasoning in that field; a reply with reasoning inline in the content is fatal unless `--strip-reasoning-tags` removes it. |
 | `stats` | Token length distribution per column. With `--model`, per-token log-prob of response columns. |
+| `eval-build` | One factual prose summary per input `text` row via an OpenAI-compatible endpoint; writes ordered `text` rows for ordinary CPT evaluation. |
+
+`dataset eval-build INPUT --out OUTPUT --endpoint URL --model NAME --max-tokens N`
+requires nonempty string `text` in every row and a positive completion-token limit.
+It does not sample, re-chunk, or withhold source rows. Built-in instructions preserve key
+facts, names, numbers, and relationships without invented facts, commentary, or Q&A formatting.
+Inputs and destination are validated before requests. Empty, malformed, or incomplete
+responses fail with the source row number; every summary requires `finish_reason = "stop"`.
+No incomplete generation set is published. Separate reasoning is excluded; inline reasoning
+uses `chat`'s `--strip-reasoning-tags` policy. Publication follows §1.1.
+Train on all original chunks; generate summaries once and reuse them as `--dataset-eval`
+for the step-zero baseline and subsequent ordinary evaluations.
+
+For best results, generate summaries using the same model you'll use this data set to train.
+
+`chat` and `eval-build` share explicit runtime-default exceptions: concurrency 4,
+timeout 120 seconds, retries 2. Optional CLI overrides require positive integer concurrency,
+finite positive timeout, and nonnegative integer retries. `--api-key` names an environment
+variable; neither command needs `run.toml`.
 
 ## 4. Tests
 

@@ -387,12 +387,15 @@ def static_findings(cfg, profile, gpu_count, *, model_metadata=None, teacher_met
                                  "Compare primary-task and replay held-out results before adjusting replay fraction or KL regularization."))
     evaluation = profile.get("eval")
     strategy = getattr(args, "eval_strategy", "no")
-    disabled = not evaluation or strategy == "no"
+    synthetic = getattr(cfg.dataset, "synthetic_dataset_eval", False)
+    # An uninspected synthetic set is pending, not evidence that evaluation is off.
+    disabled = (not evaluation and not synthetic) or strategy == "no"
     findings.append(_finding("evaluation_coverage", "warning" if disabled else "info", "projected",
                              "Ordinary evaluation is disabled; its held-out metrics will not be recorded."
-                             if disabled else "Evaluation rows and loss-token coverage are projected from the full dataset scan.",
+                             if disabled else ("Synthetic evaluation data inspection is skipped; summaries belong to this run."
+                                               if synthetic else "Evaluation rows and loss-token coverage are projected from the full dataset scan."),
                              {"train_rows": profile["train"].get("effective_rows"),
-                              "eval_rows": evaluation.get("effective_rows") if evaluation else 0,
+                              "eval_rows": evaluation.get("effective_rows") if evaluation else (None if synthetic else 0),
                               "eval_loss_tokens": evaluation.get("loss_tokens") if evaluation else None,
                               "eval_strategy": str(strategy)},
                              "Enable evaluation with suitable held-out data to assess generalization."

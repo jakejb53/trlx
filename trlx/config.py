@@ -92,10 +92,12 @@ class DatasetSpec:
     source: DatasetRef
     eval_fraction: float | None
     eval_source: DatasetRef | None
+    synthetic_dataset_eval: bool = False
 
+    # Synthetic rows are generated after model placement, but evaluation is enabled now.
     @property
     def eval_enabled(self):
-        return self.split or self.eval_source is not None
+        return self.synthetic_dataset_eval or self.split or self.eval_source is not None
 
 
 # [preflight] block. `rows` is how many train rows the off-policy check scores
@@ -199,9 +201,18 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
             raise TrlxError(f"{path}: {method.name} requires a [{needed}] block")
 
     dataset = _dataset(path, blocks["dataset"])
+    if dataset.synthetic_dataset_eval and method_name != "sft":
+        raise TrlxError(f"{path}: synthetic_dataset_eval is supported only for sft with CPT text data")
     # Parsed before the TRL config: the KL term decides a forced field there.
     replay = _replay(path, blocks["replay"]) if "replay" in blocks else None
     args = _build_args(path, method, top, dataset.eval_enabled, fsdp, replay)
+    if dataset.synthetic_dataset_eval:
+        if isinstance(args.max_length, bool) or not isinstance(args.max_length, int) or args.max_length < 1:
+            raise TrlxError(f"{path}: --synthetic-dataset-eval requires a positive --max-length")
+        if args.dataset_text_field != "text" or args.assistant_only_loss or args.completion_only_loss:
+            raise TrlxError(f"{path}: --synthetic-dataset-eval requires CPT text rows with full-sequence loss")
+        if (args.dataset_kwargs or {}).get("skip_prepare_dataset"):
+            raise TrlxError(f"{path}: --synthetic-dataset-eval requires preparation of raw CPT text rows")
     return RunConfig(
         method=method,
         args=args,
@@ -334,6 +345,20 @@ def _apply_overrides(doc, overrides, path):
     # Changing split mode explicitly replaces its incompatible source keys.
     # A CLI source is applied afterwards, in the selected mode's vocabulary.
     dataset = doc.get("dataset", {})
+    if isinstance(dataset, dict) and dataset.get("synthetic_dataset_eval") is True:
+        conflicts = [key for key in ("dataset.dataset_eval", "dataset.eval_fraction") if key in overrides]
+        if overrides.get("dataset.split") is True:
+            conflicts.append("dataset.split")
+        if conflicts:
+            raise TrlxError(f"{path}: --synthetic-dataset-eval conflicts with explicit {', '.join(conflicts)}")
+        # The synthetic mode replaces configured evaluation sources and retains all
+        # primary rows. Persist the resolved form so workers and resume agree.
+        previous = dataset.pop("dataset", None)
+        if previous is not None:
+            dataset.setdefault("dataset_train", previous)
+        dataset["split"] = False
+        dataset.pop("eval_fraction", None)
+        dataset.pop("dataset_eval", None)
     if "dataset.split" in overrides and isinstance(dataset, dict):
         incompatible = ("dataset_train", "dataset_eval") if dataset["split"] else ("dataset", "eval_fraction")
         conflicts = [key for key in incompatible if "dataset." + key in overrides]
@@ -355,7 +380,8 @@ def _apply_overrides(doc, overrides, path):
             raise TrlxError(f"{path}: [dataset] must be a table")
         key = "dataset" if dataset.get("split") else "dataset_train"
         dataset[key] = source
-    if overrides.get("dataset.split") is False and not dataset.get("dataset_eval"):
+    if (overrides.get("dataset.split") is False and not dataset.get("dataset_eval")
+            and not dataset.get("synthetic_dataset_eval")):
         # --no-split without a separate eval source explicitly requests training
         # only. Remove the generated eval schedule, but reject contradictory CLI input.
         conflicts = [key for key in overrides if key.startswith("eval_") and
@@ -591,8 +617,13 @@ def _dataset(path, table):
     block = "[dataset]"
     if "train" in table:
         raise TrlxError(f"{path}: [dataset].train is no longer supported; use eval_fraction (for example 0.1)")
-    _check_keys(path, block, table, ("split", "dataset", "eval_fraction", "dataset_train", "dataset_eval"))
+    _check_keys(path, block, table, ("split", "dataset", "eval_fraction", "dataset_train", "dataset_eval",
+                                    "synthetic_dataset_eval"))
     split = _require(path, block, table, "split", bool)
+    synthetic = (_require(path, block, table, "synthetic_dataset_eval", bool)
+                 if "synthetic_dataset_eval" in table else False)
+    if synthetic and (split or "dataset_eval" in table):
+        raise TrlxError(f"{path}: synthetic_dataset_eval requires split = false without dataset_eval")
     # The two forms are exclusive; a key from the other form is an error rather
     # than silently ignored.
     if split:
@@ -611,7 +642,8 @@ def _dataset(path, table):
     if "dataset_train" not in table:
         raise TrlxError(f"{path}: [dataset] requires 'dataset_train'; supply --dataset or --dataset-train")
     eval_ref = dataset_ref(path, "[dataset].dataset_eval", table["dataset_eval"]) if "dataset_eval" in table else None
-    return DatasetSpec(False, dataset_ref(path, "[dataset].dataset_train", table["dataset_train"]), None, eval_ref)
+    return DatasetSpec(False, dataset_ref(path, "[dataset].dataset_train", table["dataset_train"]),
+                       None, eval_ref, synthetic)
 
 
 # PEFT validates field combinations after nullable CLI/config values are decoded.
