@@ -172,6 +172,10 @@ and present `[ranges]` metrics with change columns. Headings precede the first r
 repeat after interruptions or 20 rows, and change with the columns. Narrow terminals
 use labelled column groups without dropping values. Final trainer statistics appear
 as named summary values. Output is plain text and safe to pipe.
+Change columns are named `Change`; no repeated legend sentence accompanies the headers.
+Line displays always include `training_loss` and the latest measured `eval_loss`, with `eval_step`
+identifying that measurement. Evaluation values remain blank until measured and are retained across
+subsequent training rows, resume, and `show`. Other metrics continue to follow `[ranges]`.
 
 Preflight example text and trained-token text remain in `preflight.json`; terminal
 output retains token counts, mask information, and warnings. Checkpoint completion identifies the verified
@@ -258,6 +262,16 @@ checkpoint selection. Scores do not establish an optimal learning rate or univer
 At training completion, the same analysis produces a final report after any enabled quality checks.
 Reports appear inline and in `log.txt`; `metrics.jsonl` remains authoritative. Assessment performs no
 additional evaluation. Completion alone does not establish model improvement.
+Displayed assessments lead with a recommendation and only the measurements supporting it. Routine
+observations, analysis labels, and generic disclaimers are omitted; actionable problems remain visible.
+The final assessment states the whole-run outcome and next action, rather than repeating interim advice.
+Fresh runs with ordinary evaluation enabled first evaluate at step zero, before any optimizer update,
+using the trainer's normal held-out data and scoring. `eval_on_start` is managed by trlx, not a setting.
+The baseline stays in `metrics.jsonl` across resume; resumed runs do not replace it. Independent quality
+checks do not repeat their own baseline round for this ordinary step-zero evaluation.
+Loss assessments compare against the step-zero baseline and identify the best measured step. Suggested
+experiments name the changed flag and proposed value. An unevaluated endpoint is not presented as a
+measured final result; a small loss decrease alone does not establish success or justify longer training.
 
 `[assessment]` requires `quality_checks`,
 `quality_preset`, `quality_dataset` (both nullable using `"None"`), `quality_max_length` (at least 2),

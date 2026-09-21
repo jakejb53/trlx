@@ -4,6 +4,10 @@ The streaming display keeps headings beside their values and omits absent
 metrics. The fixed-layout helpers remain available to existing callers.
 """
 
+import dataclasses
+
+from trlx.ranges import Cell
+
 # Fixed widths for the progress columns. Wide enough for six-digit step counts
 # and two-decimal epochs; a wider value simply pushes the row right.
 STEP_WIDTH = 13
@@ -20,13 +24,17 @@ OUT_OF_RANGE = "!"
 EVAL_MARK = "eval"
 
 
+# Display names distinguish training loss without changing the stored metric key.
+def _metric_label(metric):
+    return "training_loss" if metric == "loss" else metric
+
+
 # Metric column width: at least the name, at least the widest plausible value.
 def _metric_width(metric):
-    return max(len(metric), MIN_METRIC_WIDTH)
+    return max(len(_metric_label(metric)), MIN_METRIC_WIDTH)
 
 
-# Header row naming every column. The change column is headed with a delta
-# sign so the pairing with its metric is visible.
+# Header row names each metric and its adjacent change column.
 def header(ranges):
     parts = [
         "step".rjust(STEP_WIDTH),
@@ -35,8 +43,8 @@ def header(ranges):
         "".ljust(EVAL_WIDTH),
     ]
     for metric in ranges:
-        parts.append(metric.rjust(_metric_width(metric)))
-        parts.append("chg".rjust(CHANGE_WIDTH))
+        parts.append(_metric_label(metric).rjust(_metric_width(metric)))
+        parts.append("Change".rjust(CHANGE_WIDTH))
     return "  ".join(parts).rstrip()
 
 
@@ -85,6 +93,23 @@ class Stream:
         self._layout = None
         self._rows = 0
         self._widths = {}
+        self._losses = {}
+
+    # Cache only measured losses. Resume seeds this state from retained records
+    # without printing history; carried evaluation values keep their original step.
+    def observe(self, record):
+        if "quality" in record or "train_runtime" in record["log"]:
+            return
+        for name in ("loss", "eval_loss"):
+            raw = record["log"].get(name)
+            if raw is None:
+                continue
+            value = float(raw)
+            previous = self._losses.get(name)
+            bounds = self.ranges.get(name)
+            cell = Cell(value, value - previous[0].value if previous else None,
+                        bounds is not None and not bounds[0] <= value <= bounds[1])
+            self._losses[name] = (cell, record["step"])
 
     # Any intervening terminal message invalidates the visible table heading.
     def interrupt(self):
@@ -92,6 +117,7 @@ class Stream:
 
     # Render the already-evaluated cells without replaying or modifying history.
     def record(self, record, row):
+        self.observe(record)
         if "quality" in record:
             context = record["quality"]
             self.emit(f"Independent quality: {context['phase']}, step {record['step']}, {context['preset']}")
@@ -110,20 +136,30 @@ class Stream:
             self.interrupt()
             return
 
-        names = [name for name in self.ranges if row.cells[name].value is not None]
-        if not names:
-            return
+        if not any(record["log"].get(name) is not None for name in {*self.ranges, "loss", "eval_loss"}):
+            return  # A bookkeeping-only metric event supplies no new table value.
+        blank = Cell(None, None, False)
+        # Training loss belongs to this log record. Evaluation loss is explicitly
+        # carried forward, with eval_step showing its age; neither becomes zero when absent.
+        loss = self._losses["loss"][0] if record["log"].get("loss") is not None else blank
+        evaluation, eval_step = self._losses.get("eval_loss", (blank, None))
+        cells = {"loss": loss, "eval_loss": evaluation,
+                 **{name: cell for name, cell in row.cells.items() if name not in {"loss", "eval_loss"}}}
+        row = dataclasses.replace(row, cells=cells)
+        names = ["loss", "eval_loss", *[name for name in self.ranges
+                  if name not in {"loss", "eval_loss"} and cells[name].value is not None]]
         progress = [f"{row.step}/{row.max_steps}",
                     f"{row.epoch:.2f}/{row.num_train_epochs:.2f}",
-                    f"{int(100 * row.step / row.max_steps) if row.max_steps else 0}%"]
-        labels = ["step", "epoch", "%"]
-        minimum = [2 * len(str(row.max_steps)) + 1, len(progress[1]), 4]
+                    f"{int(100 * row.step / row.max_steps) if row.max_steps else 0}%",
+                    str(eval_step) if eval_step is not None else ""]
+        labels = ["step", "epoch", "%", "eval_step"]
+        minimum = [2 * len(str(row.max_steps)) + 1, len(progress[1]), 4, len("eval_step")]
         for name, value, size in zip(labels, progress, minimum):
             self._widths[name] = max(self._widths.get(name, 0), len(name), len(value), size)
         for name in names:
             cell = row.cells[name]
             self._widths[(name, "value")] = max(
-                self._widths.get((name, "value"), 0), 5, len(name), len(format_value(cell)))
+                self._widths.get((name, "value"), 0), 5, len(_metric_label(name)), len(format_value(cell)))
             self._widths[(name, "change")] = max(
                 self._widths.get((name, "change"), 0), 6, len(format_change(cell)))
 
@@ -133,8 +169,6 @@ class Stream:
         heading = layout != self._layout or self._rows >= 20
         phase = "Evaluation" if row.eval else "Training"
         if heading:
-            self.emit(f"{phase} — chg: difference from previous logged value; "
-                      "!: outside configured range")
             self._rows = 0
         for index, group in enumerate(groups, 1):
             # Alternating wrapped layouts need their own headings on every row.
@@ -148,7 +182,7 @@ class Stream:
 
     # Keep each metric beside its change; unusually long names/values stay intact.
     def _groups(self, names, labels):
-        prefix = sum(self._widths[name] for name in labels) + 4
+        prefix = sum(self._widths[name] for name in labels) + 2 * (len(labels) - 1)
         groups = [[]]
         length = prefix
         for name in names:
@@ -163,10 +197,10 @@ class Stream:
     # The same width calculation formats headings and data, including wide values.
     def _columns(self, progress, names, row=None):
         parts = [value.rjust(self._widths[name])
-                 for name, value in zip(("step", "epoch", "%"), progress)]
+                 for name, value in zip(("step", "epoch", "%", "eval_step"), progress)]
         for name in names:
-            value = name if row is None else format_value(row.cells[name])
-            change = "chg" if row is None else format_change(row.cells[name])
+            value = _metric_label(name) if row is None else format_value(row.cells[name])
+            change = "Change" if row is None else format_change(row.cells[name])
             parts.extend([value.rjust(self._widths[(name, "value")]),
                           change.rjust(self._widths[(name, "change")])])
         return "  ".join(parts).rstrip()

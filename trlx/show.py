@@ -12,6 +12,7 @@ import dataclasses
 import json
 import pathlib
 import re
+import shutil
 import tomllib
 
 from dataset.progress import stage
@@ -180,7 +181,9 @@ def show_lines(run_dir, *, progress=None):
         records = metrics.read(pathlib.Path(run_dir) / metrics.FILENAME)
         activity.note(f"read {len(records)} metric records")
     with stage(progress, "rendering saved metrics"):
-        print(render_lines.render(ranges.evaluate(records, range_table), range_table))
+        stream = render_lines.Stream(range_table, print, width=shutil.get_terminal_size().columns)
+        for record, row in zip(records, ranges.evaluate(records, range_table)):
+            stream.record(record, row)
 
 
 # TUI mode: polls `load` until quit.

@@ -621,61 +621,35 @@ def render_assessment(report, cfg, *, will_publish=True, width=None):
 # Recommendations refer to existing controls; values still come from the completed trainer.
 _RUN_ASSESSMENT_SETTINGS = {
     "evaluation_missing": "eval_strategy",
-    "rising_training_loss": "learning_rate lr_scheduler_type warmup_steps max_grad_norm",
-    "rising_gradient_norm": "learning_rate max_grad_norm",
-    "possible_overfitting": "num_train_epochs max_steps weight_decay eval_strategy eval_steps",
-    "worsening_evaluation": "learning_rate eval_strategy eval_steps",
+    "evaluation_sparse": "eval_strategy eval_steps",
+    "rising_training_loss": "learning_rate",
+    "possible_overfitting": "num_train_epochs max_steps",
+    "worsening_evaluation": "num_train_epochs max_steps",
     "generation_cutoffs": "max_completion_length",
-    "policy_dynamics": "learning_rate beta temperature",
-    "final_numerical_issues": "learning_rate bf16 fp16 max_grad_norm",
+    "constant_reward": "temperature num_generations",
+    "zero_variance_groups": "temperature num_generations",
+    "quality_deterioration": "num_train_epochs max_steps",
+    "final_numerical_issues": "bf16 fp16",
 }
 
 
-# Internal fitting details are not operator controls. Summaries retain the full
-# observation count and extent; exact chronological measurements stay in metrics.jsonl.
-def _run_evidence(value):
-    if isinstance(value, dict):
-        if {"history", "overall", "recent", "direction"} <= value.keys():
-            history = value["history"]
-            values = history["values"]
-            first, last = history["step_range"]
-            return (f"{len(values)} observations, steps {first}–{last}; first {values[0]:.3f}, "
-                    f"latest {values[-1]:.3f}, range {min(values):.3f}–{max(values):.3f}")
-        return {key: _run_evidence(item) for key, item in value.items()}
-    return value
-
-
-# Evaluation and completion use the same readable conclusions and supporting measurements.
+# Lead with an action, then its evidence. Analysis details and routine metrics do
+# not compete with actual issues; exact values remain in the authoritative JSONL.
 def render_run_assessment(report, args, *, final=False, width=None):
     width = width if width is not None else shutil.get_terminal_size().columns
     available = {item.key: item for item in options.settings(report["method"])}
-    lines = ["Final training assessment:" if final else "Training assessment after evaluation:"]
-    count = report["evaluation_records"]
-    lines.extend(_assessment_paragraph(
-        f"Training {'ended at' if final else 'at'} update {report['completed_steps']}/{report['planned_steps']}; "
-        f"{count} recorded ordinary {'evaluation' if count == 1 else 'evaluations'}.", width))
-    if report["train_loss"] is not None:
-        value = report["train_loss"]
-        display = f"{value:.3f}" if isinstance(value, (int, float)) else _assessment_value(value)
-        lines.extend(_assessment_paragraph(f"Recorded average training loss: {display}.", width))
-    if report["evaluation_metrics"]:
-        lines.append(f"  Last recorded evaluation (step {report['evaluation_step']}):")
-        # Match metric-table precision in the summary; raw values remain unchanged in the report and JSONL.
-        values = {key: f"{value:.3f}" if isinstance(value, float) else value
-                  for key, value in report["evaluation_metrics"].items()}
-        lines.extend(_assessment_evidence(values, width))
-    if not report["metric_records"]:
-        lines.append("  No metrics were recorded; numerical health is unknown.")
-    elif not report["nonfinite_observations"]:
-        lines.extend(_assessment_paragraph("No non-finite values were found in the recorded metrics.", width))
-    for finding in sorted(report["findings"], key=lambda item: {"error": 0, "warning": 1, "info": 2}[item["severity"]]):
-        lines.append("")
-        lines.extend(_assessment_paragraph(f"{finding['summary']} ({finding['basis']})", width))
-        lines.extend(_assessment_evidence(_run_evidence(finding.get("evidence") or {}), width))
-        if finding.get("recommendation"):
-            lines.extend(_assessment_paragraph("Recommendation: " + finding["recommendation"], width, "    "))
+    title = "Final assessment" if final else "Assessment"
+    lines = [f"{title} — step {report['completed_steps']}"]
+    issues = report["final_issues"] if final else report["issues"]
+    if not issues:
+        decision = report["final_decision"] if final else report["decision"]
+        if decision == "No changes recommended." and not final:
+            decision = "Continue training. No changes recommended."
+        lines.extend(_assessment_paragraph(decision, width))
+    for issue in issues:
+        lines.extend(_assessment_paragraph(issue["message"], width))
         flags = []
-        for key in _RUN_ASSESSMENT_SETTINGS.get(finding["code"], "").split():
+        for key in _RUN_ASSESSMENT_SETTINGS.get(issue["code"], "").split():
             setting = available.get(key)
             if setting is None or not hasattr(args, key):
                 continue
@@ -689,10 +663,10 @@ def render_run_assessment(report, args, *, final=False, width=None):
             argument = _argument(setting, value)
             flags.append(argument if argument is not None else f"{setting.flag}: automatic/unset")
         if flags:
-            lines.append("    Relevant settings (current values):")
-            for flag in flags:
-                lines.extend(_assessment_paragraph(flag, width, "      "))
-    lines.extend(["", "  Evidence: metrics.jsonl. Completion alone does not establish model improvement."])
+            lines.extend(_assessment_paragraph("Current: " + "; ".join(flags), width))
+    support = report["final_support"] if final else report["support"]
+    if support:
+        lines.extend(_assessment_paragraph(support, width))
     return "\n".join(lines) + "\n"
 
 

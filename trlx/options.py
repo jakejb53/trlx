@@ -186,7 +186,7 @@ def add_training_options(parser, method_name):
     specific = parser.add_argument_group(f"{method_name} settings")
     shared_names = {field.name for field in dataclasses.fields(TrainingArguments)}
     hints = typing.get_type_hints(method.config_cls)
-    owned = set(config.MODEL_LOADING_FIELDS) | config.STRATEGY_FIELDS
+    owned = set(config.MODEL_LOADING_FIELDS) | config.STRATEGY_FIELDS | config.BASELINE_FIELDS
     if "rewards" in method.blocks:
         owned |= set(config.VLLM_FORCED)
     # These fields are resolved by the supervisor before TRL sees their values.

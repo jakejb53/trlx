@@ -41,6 +41,9 @@ MODEL_LOADING_FIELDS = {
 # sharding trlx chose.
 STRATEGY_FIELDS = {"fsdp"}
 
+# Baseline measurement is part of trlx's training lifecycle, not an operator toggle.
+BASELINE_FIELDS = {"eval_on_start"}
+
 # grpo and rloo generate through the TRL vLLM server, always (SPEC 2.10), so
 # these two are forced and an operator value is rejected. The server's
 # address (vllm_server_host, vllm_server_port, vllm_server_base_url) stays
@@ -411,6 +414,8 @@ def _build_args(path, method, top, eval_enabled, fsdp, replay):
             )
         if key in STRATEGY_FIELDS:
             raise TrlxError(f"{path}: '{key}' is not accepted at top level; the strategy is chosen by trlx or --strategy")
+        if key in BASELINE_FIELDS:
+            raise TrlxError(f"{path}: '{key}' is managed by trlx; fresh runs automatically evaluate the starting model when evaluation is enabled")
         if key in VLLM_FORCED and "rewards" in method.blocks:
             raise TrlxError(f"{path}: '{key}' is not accepted at top level; {method.name} always uses the TRL vLLM server")
         if key in REPLAY_KL_FORCED and kl_forced:
@@ -464,6 +469,9 @@ def _build_args(path, method, top, eval_enabled, fsdp, replay):
     # (absent eval_steps with eval_strategy = "steps" becomes logging_steps).
     if not save_steps_given and args.eval_strategy == "steps":
         args.save_steps = args.eval_steps
+    # The trainer's own startup evaluation runs after distributed preparation and
+    # before its first update. Resume keeps the original step-zero measurements.
+    args.eval_on_start = bool(eval_enabled and args.eval_strategy != "no" and not args.resume_from_checkpoint)
     return args
 
 

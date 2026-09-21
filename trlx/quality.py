@@ -593,6 +593,10 @@ def callback_class():
 
         # Follow ordinary evaluation events, including operator-selected step or epoch schedules.
         def on_evaluate(self, args, state, control, model=None, **kwargs):
+            # Step-zero quality was already attempted in on_train_begin; the new
+            # ordinary baseline must not repeat that potentially expensive round.
+            if state.global_step == 0:
+                return
             self._run("scheduled", args, state, model)
 
         # Completion is unconditional when checks are enabled, even with eval_strategy='no'.

@@ -154,10 +154,151 @@ def run_assessment(method, records, args, *, completed_steps, planned_steps, ran
     # Preserve exact evidence, but exclude throughput and cumulative counters from the conclusion.
     eval_values = {key: value for key, value in (latest_eval["log"] if latest_eval else {}).items() if key.startswith("eval_")
                    and key not in {"eval_runtime", "eval_samples_per_second", "eval_steps_per_second", "eval_num_tokens"}}
-    return {"method": method, "completed_steps": completed_steps, "planned_steps": planned_steps,
+    report = {"method": method, "completed_steps": completed_steps, "planned_steps": planned_steps,
             "train_loss": final_train, "evaluation_records": len(evaluation), "evaluation_metrics": eval_values,
             "evaluation_step": latest_eval["step"] if latest_eval else None,
             "metric_records": len(records), "nonfinite_observations": len(invalid), "findings": findings}
+    report.update(_run_recommendation(method, findings, training, evaluation, args, completed_steps, planned_steps))
+    return report
+
+
+# Metric summaries preserve small nonzero values instead of displaying a false zero.
+def _display_number(value):
+    return f"{value:.3g}" if value and abs(value) < .001 else f"{value:.3f}"
+
+
+# Select operator actions from established findings; routine observations remain
+# available in the report and raw metrics without competing with the recommendation.
+def _run_recommendation(method, findings, training, evaluation, args, completed_steps, planned_steps):
+    messages = {
+        "final_numerical_issues": "Numerical instability detected. Check the failed steps and precision settings before using this checkpoint.",
+        "possible_overfitting": "Likely overfitting. Shorten the next run or return to an earlier checkpoint.",
+        "worsening_evaluation": "Evaluation loss is getting worse. Don’t extend this run; compare an earlier checkpoint.",
+        "rising_training_loss": "Training loss is rising. Try a lower learning rate on the next run.",
+        "evaluation_missing": "No evaluation results. Enable evaluation before the next run.",
+        "generation_cutoffs": "Responses are being cut short. Increase --max-completion-length.",
+        "zero_variance_groups": "Some prompt groups produce identical rewards. Review reward scoring and response diversity.",
+    }
+    issues = []
+    for finding in findings:
+        code = finding["code"]
+        evidence = finding.get("evidence") or {}
+        # A resolved clipping/variance observation needs no current corrective action.
+        if code in {"generation_cutoffs", "zero_variance_groups"} and not evidence.get("values", [0])[-1]:
+            continue
+        if code in messages:
+            issues.append({"code": code, "message": messages[code]})
+        elif code.startswith("constant_reward:"):
+            metric = evidence["metric"]
+            issues.append({"code": "constant_reward", "message": f"{metric} is zero. Review reward scoring and response diversity."})
+        elif code.startswith("quality_deterioration:"):
+            issues.append({"code": "quality_deterioration", "message": f"{evidence['metric']} is deteriorating. Shorten the run or compare an earlier checkpoint."})
+        elif code.startswith("configured_range:"):
+            metric, value = evidence["metric"], evidence["values"][-1]
+            bounds = evidence["configured_bounds"]
+            issues.append({"code": "configured_range", "message": f"{metric} is {_display_number(value)}, outside {bounds}. Review this result and its configured range."})
+        elif finding["severity"] in {"error", "warning"} and not code.startswith("nonfinite:"):
+            issues.append({"code": code, "message": finding["summary"]})
+    # Numerical failures take priority; a duplicate current-nonfinite notice adds
+    # no action beyond the full-run numerical finding already selected above.
+    priority = {"final_numerical_issues": 0, "possible_overfitting": 1, "worsening_evaluation": 2}
+    issues.sort(key=lambda item: priority.get(item["code"], 3))
+    for issue in issues:
+        if issue["code"] == "rising_training_loss" and _finite(args.learning_rate) and args.learning_rate > 0:
+            issue["message"] = (f"Training loss is rising. Next experiment: --learning-rate {args.learning_rate / 2:.12g} "
+                                f"(currently {args.learning_rate:.12g}); keep the duration unchanged.")
+    points = _series(evaluation, "eval_loss")
+    baseline = next((point for point in points if point[0] == 0), None)
+    support = None
+    decision = "No changes recommended."
+    # SFT/preference objectives have meaningful held-out losses. Policy and
+    # distillation objectives do not inherit that interpretation merely by name.
+    if method in {"sft", "dpo", "kto", "reward"} and points:
+        current = points[-1][1]
+        if len(points) == 1:
+            if baseline is not None:
+                decision = "Starting-model baseline recorded. Training can begin."
+                support = f"Baseline evaluation loss: {_display_number(current)}."
+            else:
+                support = f"First evaluation: loss {_display_number(current)}."
+        else:
+            previous = points[-2][1]
+            reference = baseline[1] if baseline is not None else previous
+            relative = (current - reference) / abs(reference) if reference else None
+            change = (f" ({100 * relative:+.1f}%)" if not relative or abs(relative) >= .0005 else
+                      f" ({100 * relative:+.2g}%)") if relative is not None else ""
+            label = "Baseline → current evaluation loss" if baseline is not None else "Evaluation loss"
+            support = f"{label}: {_display_number(reference)} → {_display_number(current)}{change}."
+            if current < previous:
+                decision = "Evaluation loss improved. Continue this run without changing settings."
+            elif current > previous:
+                decision = "Evaluation loss rose at the last check. Watch the next evaluation before changing settings."
+            else:
+                decision = "Evaluation loss is unchanged. Continue to the next evaluation before changing settings."
+    # Completion judges the whole run, not just its last evaluation interval.
+    # A final recommendation must not ask the operator to wait for another eval.
+    final_issues = list(issues)
+    final_decision = "No setting changes recommended for the next run."
+    final_support = support
+    if method in {"sft", "dpo", "kto", "reward"} and points:
+        if baseline is None:
+            final_issues.append({"code": "baseline_missing",
+                                 "message": "No starting-model baseline was recorded. This run cannot establish total training gain; check the startup evaluation before rerunning."})
+        elif len(points) == 1:
+            final_issues.append({"code": "evaluation_sparse",
+                                 "message": "Only the starting-model baseline was measured. Evaluate during training before judging the result."})
+        else:
+            first, last = baseline[1], points[-1][1]
+            relative = (last - first) / abs(first) if first else None
+            change = (f" ({100 * relative:+.1f}%)" if not relative or abs(relative) >= .0005 else
+                      f" ({100 * relative:+.2g}%)") if relative is not None else ""
+            best = min(points, key=lambda point: point[1])
+            final_support = (f"Baseline → last evaluation loss: {_display_number(first)} → {_display_number(last)}{change}. "
+                             f"Best: {_display_number(best[1])} at step {best[0]}.")
+            direction = _trend(points, args.get_warmup_steps(planned_steps))["direction"]
+            # Only recommend an extension when the measured endpoint is the
+            # completed run and the full-history analysis still supports progress.
+            if points[-1][0] != completed_steps:
+                final_issues.append({"code": "evaluation_sparse",
+                                     "message": f"The final checkpoint was not evaluated; the last measurement is from step {points[-1][0]}. Next run, use --eval-strategy epoch to measure the epoch endpoint."})
+            elif completed_steps < planned_steps:
+                final_decision = f"Training stopped at {completed_steps}/{planned_steps} updates. Review why it stopped before increasing the budget."
+            elif best[0] == 0:
+                rate = args.learning_rate
+                action = (f"Next experiment: --learning-rate {rate / 2:.12g} (currently {rate:.12g}); keep the duration unchanged."
+                          if last > first and _finite(rate) and rate > 0 else
+                          "Do not add more epochs with the same setup; review the dataset and training objective.")
+                final_issues = [item for item in final_issues if item["code"] not in {"possible_overfitting", "worsening_evaluation", "rising_training_loss"}]
+                final_issues.append({"code": "starting_model_best", "message": "Training did not beat the starting model. Use the starting model. " + action})
+            elif best[1] < last and direction == "up":
+                final_issues = [item for item in final_issues if item["code"] not in {"possible_overfitting", "worsening_evaluation"}]
+                final_issues.append({"code": "shorter_run", "message": f"Evaluation is deteriorating after its best result at step {best[0]}. Next experiment: --max-steps {int(best[0])} (this run planned {planned_steps}); keep the other settings unchanged."})
+            elif last < first and direction == "down" and last == best[1]:
+                if args.max_steps > 0:
+                    budget = f"--max-steps {2 * args.max_steps} (currently {args.max_steps})"
+                else:
+                    budget = f"--num-train-epochs {args.num_train_epochs + 1:.12g} (currently {args.num_train_epochs:.12g})"
+                final_decision = ("Held-out loss improved and was still falling at the end. "
+                                  f"Next experiment: {budget}; keep learning rate and all other settings unchanged.")
+            elif last < first:
+                final_decision = "Held-out loss improved, but further improvement is not clear. Keep this checkpoint; do not extend the duration yet."
+            else:
+                final_decision = "Held-out loss did not improve. Do not train longer; review the data and learning rate first."
+    elif method in {"grpo", "rloo", "distillation"} and not issues:
+        key = "loss" if method == "distillation" else "reward"
+        values = _series(training, key)
+        if len(values) > 1:
+            first, last = values[0][1], values[-1][1]
+            improved = last < first if key == "loss" else last > first
+            objective = "distillation loss" if key == "loss" else "training reward"
+            final_decision = (f"The recorded {objective} improved. Keep this checkpoint; do not extend the run based on training metrics alone." if improved else
+                              f"The recorded {objective} did not improve. Revisit the objective and data before training longer.")
+            final_support = f"{objective.capitalize()}: {_display_number(first)} → {_display_number(last)}."
+        else:
+            final_decision = "The run recorded too little objective data to judge progress. Log training metrics more frequently next time."
+    return {"decision": decision, "support": support, "issues": issues,
+            "final_decision": final_decision, "final_support": final_support,
+            "final_issues": final_issues}
 
 
 # Report method-specific contracts of the installed trainers, not universal tuning targets.

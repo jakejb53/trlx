@@ -312,6 +312,7 @@ def _report_display_error(error, log_file, log_path):
 def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, printed=0):
     metrics_path = run_dir / metrics.FILENAME
     active = True
+    primed = False
 
     # Metric output remains stdout; diagnostic interruptions restore the next header.
     def metric_line(text):
@@ -330,7 +331,7 @@ def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, prin
 
     # Once a read or render fails, do not retry it on subsequent job polls.
     def tick():
-        nonlocal printed, active
+        nonlocal printed, active, primed
         if not active:
             return
         try:
@@ -338,6 +339,12 @@ def _supervise_lines(run_dir, range_table, log_path, job, on_display_error, prin
                 view.consume(event)
             if metrics_path.exists():
                 records = metrics.read(metrics_path)
+                if not primed:
+                    # Retained evaluation measurements remain visible on resume,
+                    # but earlier metric rows must not be printed a second time.
+                    for record in records[:printed]:
+                        stream.observe(record)
+                    primed = True
                 rows = ranges.evaluate(records, range_table)
                 stream.width = shutil.get_terminal_size().columns
                 for record, row in zip(records[printed:], rows[printed:]):

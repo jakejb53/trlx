@@ -458,6 +458,21 @@ Completed: assessment after every evaluation (2026-09-20)
 - Validation is left to the operator. No tests were updated or run for this revision; earlier test
   results do not validate it. Existing assessment tests still reference the removed controls.
 
+Completed: actionable guidance, visible evaluation loss, and baseline (2026-09-20)
+
+- Assessments lead with an action and supporting measurements. Final guidance compares with the
+  step-zero baseline, identifies the best measured step, and proposes specific next-run settings.
+  Routine narration, generic disclaimers, and isolated gradient increases are omitted; actionable problems remain.
+- Line-mode tables show `training_loss`, the latest measured `eval_loss`, and `eval_step` together.
+  Resume seeds display state from retained metrics; `show` uses the same renderer. Unmeasured losses
+  remain blank. Repeated legends are removed and change columns are named `Change`.
+- Fresh runs with ordinary evaluation enabled automatically evaluate before the first update.
+  `eval_on_start` is managed internally. Resume preserves the original baseline; independent quality
+  checks do not duplicate their baseline round at the step-zero ordinary evaluation.
+- Updated assessment, review, line rendering, supervisor, saved-run display, configuration, CLI
+  ownership, quality callbacks, `README.md`, and `SPEC.md`. `run.toml` and existing runs were unchanged.
+- Validation remains with the operator. No tests were updated or run for these changes.
+
 ### Additional TODO: optional acceleration recommendations (planned)
 
 - During `trlx init`, use GPU architecture and installed Python, PyTorch, and CUDA versions to recommend

@@ -170,6 +170,16 @@ runtime notices appear inline and in the TUI log pane. Training metrics remain i
 Startup shows only problems, including disabled evaluation. Assessments use the full chronological
 history, interpret recent behavior and warmup internally, and report uncertainty when evidence is
 sparse or noisy. They are retained in `log.txt` and add no evaluation passes.
+Reports lead with an action and its supporting measurements. The final assessment gives a whole-run
+conclusion and a recommendation for what to do next. Routine observations and generic disclaimers are omitted.
+Line-mode metric tables retain their column headers, use `Change` for differences, and omit repeated legend sentences.
+They show `training_loss`, the latest measured `eval_loss`, and its `eval_step` together, including on
+resume and in `trlx show`. Blank evaluation fields mean no evaluation has been recorded yet.
+
+When ordinary evaluation is enabled, fresh runs measure the starting model at step zero using the
+same held-out data as later evaluations. This adds one evaluation pass; resume keeps the original
+baseline. No extra flag or quality benchmark is needed. Final guidance compares with that baseline,
+reports the best measured step, and proposes specific next-run changes when the evidence supports them.
 
 Training and `check` require the following explicit block, supplied by new `trlx init` configurations.
 Add it to older configs; initialization with `--force` replaces the entire file.
