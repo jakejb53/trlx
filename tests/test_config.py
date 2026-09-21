@@ -87,6 +87,16 @@ class ConfigReadErrors(ConfigCase):
         self.assertIn("UTF-8", str(caught.exception))
 
 
+class RetiredVerification(ConfigCase):
+    def test_prompts_report_removed_feature(self):
+        self.assertRejected("[verify].prompts was removed with prompt-based verification",
+                            text=BASE + '\n[verify]\nprompts = "prompts.jsonl"\n')
+
+    def test_empty_legacy_verify_table_remains_valid(self):
+        cfg = self.load(text=BASE + "\n[verify]\n")
+        self.assertFalse(hasattr(cfg, "verify_prompts"))
+
+
 class TopLevelKeys(ConfigCase):
     def test_unknown_key_rejected(self):
         self.assertRejected("unknown key 'no_such_field'", "no_such_field = 1\n")

@@ -93,6 +93,10 @@ def _boolean_or_none(raw):
     raise argparse.ArgumentTypeError("expected true, false, or None")
 
 
+def removed_verification_prompts(value):
+    raise argparse.ArgumentTypeError("prompt-based verification was removed; remove this option")
+
+
 # One field maps its CLI spelling directly to an effective-config key.
 def _option(group, flag, key, hint, help_text, *, choices=None):
     # --dataset addresses the primary source in either split mode, not a TOML alias.
@@ -165,7 +169,6 @@ def add_training_options(parser, method_name):
         ("--split", "dataset.split", bool, "Split one source; --no-split uses separate files and removes eval_fraction."),
         ("--dataset-train", "dataset.dataset_train", str, "Training source with --no-split."),
         ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source with --no-split; omit for training only."),
-        ("--verify-prompts", "verify.prompts", str, "Prompts for post-training verification; a built-in set is used if absent."),
     ]
     if "teacher" in method.blocks:
         wrapper += [
@@ -176,6 +179,8 @@ def add_training_options(parser, method_name):
         ]
     for flag, key, hint, description in wrapper:
         _option(model, flag, key, hint, description)
+    # Recognize retired syntax only to explain its removal; never advertise or apply it.
+    model.add_argument("--verify-prompts", type=removed_verification_prompts, help=argparse.SUPPRESS)
 
     common = parser.add_argument_group("Training settings")
     specific = parser.add_argument_group(f"{method_name} settings")

@@ -167,12 +167,14 @@ class ExampleOutput(unittest.TestCase):
         report.flush(output)
         return report.to_dict(), output.getvalue()
 
-    # Fully trained examples display once without changing the machine-readable facts.
-    def test_all_tokens_trained_prints_text_once(self):
+    # Full examples stay in machine-readable facts while the terminal shows counts.
+    def test_all_tokens_trained_omits_text_and_preserves_facts(self):
         text = "Café\n\n雪"
         facts, output = self.example([1, 2], text, text)
-        self.assertIn("first row text:\n  Café\n  \n  雪", output)
-        self.assertEqual(output.count("Café"), 1)
+        self.assertIn("first row: 2 tokens, 2 trained", output)
+        self.assertNotIn("Café", output)
+        self.assertNotIn("雪", output)
+        self.assertNotIn("first row text:", output)
         self.assertIn("all tokens trained", output)
         self.assertNotIn("first row trained text:", output)
         self.assertEqual(facts["example"], {
@@ -180,17 +182,23 @@ class ExampleOutput(unittest.TestCase):
         })
 
     # Equal decoded text does not imply all tokens participate in the loss.
-    def test_partial_mask_retains_both_text_blocks(self):
+    def test_partial_mask_omits_text_and_preserves_facts(self):
         facts, output = self.example([-100, 2], "é", "é")
-        self.assertIn("first row text:\n  é", output)
-        self.assertIn("first row trained text:\n  é", output)
+        self.assertIn("first row: 2 tokens, 1 trained", output)
+        self.assertNotIn("é", output)
+        self.assertNotIn("first row text:", output)
+        self.assertNotIn("first row trained text:", output)
         self.assertNotIn("all tokens trained", output)
-        self.assertEqual(facts["example"]["trained_tokens"], 1)
+        self.assertEqual(facts["example"], {
+            "tokens": 2, "trained_tokens": 1, "text": "é", "trained_text": "é",
+        })
 
-    # Removing duplicate text must not hide the existing empty-label warning.
+    # Omitting example text must not hide the existing empty-label warning.
     def test_no_trained_tokens_keeps_warning(self):
         facts, output = self.example([-100, -100], "prompt", "")
-        self.assertIn("first row trained text:\n  \n", output)
+        self.assertIn("first row: 2 tokens, 0 trained", output)
+        self.assertNotIn("prompt", output)
+        self.assertNotIn("first row trained text:", output)
         self.assertIn("first row has no trained tokens in its label mask", output)
         self.assertNotIn("all tokens trained", output)
         self.assertEqual(facts["example"]["trained_text"], "")

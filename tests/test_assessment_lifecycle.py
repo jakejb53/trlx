@@ -218,3 +218,29 @@ class AssessmentLifecycleTests(unittest.TestCase):
         logs["new"] = "later callback mutation"
         self.assertEqual(callback.records[0]["log"], original)
         self.assertEqual(callback.records, metrics.read(self.directory / metrics.FILENAME))
+
+    # Completion reports include the final eval and quality round, print once, and preserve metric bytes.
+    def test_final_assessment_follows_all_evidence_and_does_not_rewrite_metrics(self):
+        from tests.test_review import configuration
+
+        cfg = configuration(extra={"eval_strategy": "epoch"})
+        settings = SimpleNamespace(runtime_window=20, runtime_min_evaluations=3, runtime_relative_change=.05)
+        callback = metrics.callback_class()(self.directory, settings, "sft", {})
+        state = SimpleNamespace(global_step=19, max_steps=19, epoch=1.0, num_train_epochs=1.0)
+        control = SimpleNamespace(should_training_stop=False)
+        with patch("builtins.print") as emitted:
+            callback.on_log(cfg.args, state, control, logs={"loss": 2.2})
+            callback.on_log(cfg.args, state, control, logs={"eval_loss": 2.28})
+            callback.quality(cfg.args, state, {"quality/accuracy": .75}, quality_context(19, "completion"))
+            path = self.directory / metrics.FILENAME
+            before = path.read_bytes()
+            callback.on_train_end(cfg.args, state, control)
+            callback.on_train_end(cfg.args, state, control)
+        text = [call.args[0] for call in emitted.call_args_list if call.args[0].startswith("Final training assessment:")]
+        self.assertEqual(len(text), 1)
+        self.assertIn("Eval loss: 2.28", text[0])
+        self.assertIn("--assessment-window 20", text[0])
+        self.assertIn("--assessment-min-evaluations 3", text[0])
+        self.assertIsNone(callback._file)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(control.should_training_stop)

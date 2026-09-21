@@ -54,7 +54,9 @@ config, model, dataset, or GPU. The sections below are reference and optional tu
 Both tools report their current operation, completed counts when available, retries,
 and final outcome to stderr. After ten seconds without feedback, a waiting notice
 shows elapsed time and the last measured progress; it does not claim work is advancing.
-Training also records feedback in `log.txt`, visible in the TUI's log pane.
+Training records feedback in `log.txt`, visible in the TUI's log pane. While workers train,
+waiting notices stay in the log so they do not interrupt metrics tables; other training-command
+phases use a 30-second terminal waiting interval. Preflight example text stays in `preflight.json`.
 
 ## Installing updates
 
@@ -113,7 +115,6 @@ trlx show RUN_DIR --tui
 
 # Verify a checkpoint or produce a merged model from an adapter.
 trlx verify CHECKPOINT --base BASE
-trlx verify CHECKPOINT --base BASE --prompts prompts.jsonl
 trlx merge --base BASE --adapter ADAPTER --out merged-model
 
 # Generate replay data locally.
@@ -165,6 +166,9 @@ All seven trainers provide a full pre-run scan and runtime recommendations. Find
 measurements, preparation projections, and heuristics, and include their evidence. They never change
 training settings, stop a run, or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
 runtime notices appear inline and in the TUI log pane. Training metrics remain in `metrics.jsonl`.
+Startup shows only problems, including disabled evaluation or a projected run too short for the
+configured assessment windows. At completion, a final assessment reports supported conclusions,
+missing evidence, and relevant settings. It is retained in `log.txt` and adds no evaluation passes.
 
 Training and `check` require the following explicit block, supplied by new `trlx init` configurations.
 Add it to older configs; initialization with `--force` replaces the entire file.
@@ -184,7 +188,9 @@ quality_batch_size = 1
 
 The runtime window counts logged observations. The relative-change threshold is heuristic sensitivity,
 not a confidence level. Override these with `--assessment-window`, `--assessment-min-evaluations`, and
-`--assessment-relative-change`. Missing metrics or insufficient observations do not establish a finding.
+`--assessment-relative-change`. Trend comparison needs two full windows: a window of 20 requires
+40 usable observations after warmup. Missing evidence is reported without inventing a trend.
+Ordinary evaluation and metric assessment do not require `--quality-checks`.
 
 Independent checks are optional and require a separate evaluation dataset and a built-in preset:
 
@@ -341,7 +347,8 @@ unknown keys are errors. Nullable trainer and LoRA fields accept the string `"No
 Other useful sections: `[run]` controls `gpus`, `strategy`, `tui`, and `verify`;
 `[peft]` controls LoRA. `[methods.METHOD.ranges]` selects displayed metrics and expected
 intervals. DPO/KTO `preflight` sections control off-policy warnings. Distillation's
-`teacher` section holds its teacher model. `[verify]` can set a `prompts` dataset.
+`teacher` section holds its teacher model. Verification checks loading, adapter integrity, and chat-template
+consistency. Prompt comparison is removed; delete `[verify].prompts`, `--verify-prompts`, or `verify --prompts` if present.
 
 ## Tutorial: evaluation and data sources
 

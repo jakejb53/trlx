@@ -68,6 +68,7 @@ class InitDefaults(unittest.TestCase):
     # The first-run preset trains adapters and produces evaluation/checkpoints in one epoch.
     def test_first_run_preset(self):
         document = self.document(Hardware(8, ()))
+        self.assertNotIn("verify", document)
         self.assertEqual(document["run"], {
             "gpus": "all", "strategy": "auto", "tui": False, "verify": True,
         })

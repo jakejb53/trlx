@@ -6,7 +6,7 @@ Design rule: do what makes sense, not what the HF/ML ecosystem does.
 
 Design rule: general-purpose. No model family, architecture, module name, path, device, or machine fact is assumed in source or tests. Model facts come from explicit inputs or model metadata; `init` obtains environment facts from hardware inspection. Section 5 records one test model, not assumptions the tools rely on.
 
-Project-specific runtime-default exceptions: absent trainer settings use TRL dataclass defaults; `run_name` uses the output directory's name; a step-based checkpoint interval follows the evaluation interval (§2.2); verification uses built-in prompts when none are supplied. Flat configs without `[run]` retain the original CLI defaults: all visible GPUs, automatic strategy, line display, and verification enabled. A present `[run]` requires all its keys. Other operational defaults are written explicitly by `init`.
+Project-specific runtime-default exceptions: absent trainer settings use TRL dataclass defaults; `run_name` uses the output directory's name; a step-based checkpoint interval follows the evaluation interval (§2.2). Flat configs without `[run]` retain the original CLI defaults: all visible GPUs, automatic strategy, line display, and verification enabled. A present `[run]` requires all its keys. Other operational defaults are written explicitly by `init`.
 
 ## 1. Repository
 
@@ -60,9 +60,10 @@ shows useful operations, measured progress, findings, and unknown output; intern
 bookkeeping stays in the log. Identical warnings and rank progress are consolidated,
 with warning counts and affected ranks retained. Library preparation bars come from
 rank zero; other ranks still report their phases and diagnostics. Only the known PyTorch
-`all_gather_into_tensor` FutureWarning is log-only. Training has one waiting notice
-after 30 seconds without substantive feedback, including optimizer steps between
-metric records. Notices identify active operations and available progress by rank.
+`all_gather_into_tensor` FutureWarning is log-only. Waiting notices are log-only
+while any worker is training, including evaluation and checkpoint pauses. Outside
+training, terminal notices follow 30 seconds without substantive feedback and
+identify active operations and available progress by rank.
 The TUI retains its log pane. Collection continues after display failure. Metrics
 remain authoritative in `metrics.jsonl`. Publication success follows publication
 and cleanup. Endpoint batches report completions as observed while preserving
@@ -78,7 +79,7 @@ input order in their returned results.
 | `trlx <method> [--config <path>] [--model <model>] [--dataset <data>] [options]` | Uses `run.toml` by default. Explicit CLI settings override this run only. Runs preflight, training, and verification. Model/data must come from config or CLI. |
 | `trlx show <run> [--tui]` | Renders a run's `metrics.jsonl` with the same renderers. |
 | `trlx check <method> [--config <path>] [options]` | Preflight only, with the same training-setting overrides. |
-| `trlx verify <checkpoint> --base <model> [--prompts <dataset>]` | Artifact checks only. |
+| `trlx verify <checkpoint> --base <model>` | Artifact checks only. |
 | `trlx merge --base <model> --adapter <dir> --out <dir>` | Merge with adapter-load check. |
 | `trlx replay-build --model <path\|name> [--endpoint <url>] --prompts <dataset> --out <path> --max-tokens <n>` | Samples a model on prompts, writes a `messages` dataset. `--model` is a local path or HF id, or with `--endpoint` the served model name; the endpoint takes the connection flags of `dataset chat`. |
 
@@ -121,7 +122,6 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 - `[preflight]`: `offpolicy_logp_per_token`, the per-token log-prob threshold for the off-policy warning, and `rows`, how many train rows it scores. `dpo` and `kto` only.
 - `[rewards]`: `grpo` and `rloo`. `funcs`: list of entries, each a bare name from `trl.rewards` or trlx built-ins, `{name, args}` for factories, an HF model path, or `module:function` / `path.py:function`.
 - `[replay]`: `sft` only. `dataset`, `fraction` (replay share of the mixed train set, in (0, 1)), `kl_coef`.
-- `[verify]`: `prompts` dataset for the post-training generation check.
 - `[assessment]`: required for training and `check`; explicit runtime evidence-window and quality-check
   settings per §2.11. Shared, method-specific, and CLI precedence applies. Missing required keys are errors.
 
@@ -173,9 +173,8 @@ repeat after interruptions or 20 rows, and change with the columns. Narrow termi
 use labelled column groups without dropping values. Final trainer statistics appear
 as named summary values. Output is plain text and safe to pipe.
 
-Preflight examples and every verification prompt/base/checkpoint comparison remain
-inline with readable Unicode and line breaks. A fully trained example prints once
-with an explicit mask statement. Checkpoint completion identifies the verified
+Preflight example text and trained-token text remain in `preflight.json`; terminal
+output retains token counts, mask information, and warnings. Checkpoint completion identifies the verified
 checkpoint directory; only the saving rank announces it. One final command outcome
 includes elapsed time, with artifact locations displayed alongside the results.
 
@@ -203,7 +202,7 @@ Fatal:
 Warnings:
 - Preference methods: mean per-token log-prob of chosen and rejected (`completion` for `kto`) under the starting model below the threshold in `[preflight]` (off-policy data), over the first `[preflight].rows` train rows.
 - Rows whose response is cut by `max_length`, with counts.
-- Rendered example with label mask; no assistant tokens in the mask.
+- First prepared example has no trained tokens in its label mask.
 - Pad token missing or equal to EOS.
 - Gradient checkpointing with `use_cache`.
 
@@ -216,11 +215,12 @@ Reported: resolved LoRA target modules counted per submodule path, and trainable
 Runs after training on the final checkpoint unless `--no-verify`, as its own process with every selected GPU visible. `trlx verify` is that process and runs it alone. The base is loaded per the run's `[model]` block when the checkpoint sits in a run directory, else at the checkpoint's own dtype.
 
 - Adapter loaded (LoRA checkpoints): `lora_B` tensor count and max magnitude in `adapter_model.safetensors` equal those in the loaded PeftModel.
-- Behaviour changed: generate from base and from checkpoint on `[verify].prompts` (built-in set if absent); report differing count. Zero differing is a failure. A model that cannot generate (`reward`) is compared on its scores.
+- Full checkpoints must load successfully. No prompt generation or reward-score comparison is performed.
 - Chat template in checkpoint equals the base's.
 
 Result written to `verify.json` in the run directory, or in the checkpoint directory when it is not in a run, and shown as the last output of the job. Nonzero exit on failure.
 Standalone verification requires `--force` to replace an existing report and supports `--no-staging` (§1.1).
+`verify --prompts`, training `--verify-prompts`, and `[verify].prompts` are rejected as removed settings.
 
 ### 2.8 Rewards
 
@@ -249,9 +249,15 @@ Only `grpo` and `rloo` policy generation requires the TRL vLLM server (per-step 
 All seven methods scan every training/evaluation row, including selected replay rows, before review.
 Findings identify measured facts, preparation projections, or heuristics, with evidence and recommendations.
 The trainer remains authoritative on prepared data; preflight checks projections against actual row counts.
+Startup and `check` display only warnings and errors, with relevant settings. Disabled ordinary evaluation
+and projected observation counts below assessment requirements are warnings; unknown counts remain unknown.
 Runtime advice reads all logged metrics, accounts for warmup and required observation windows, and
 coalesces repeated findings. It never changes settings, optimizer/scheduler state, control flags, or
 checkpoint selection. Scores do not establish an optimal learning rate or universally correct reward.
+At training completion, rank zero reports metric-based conclusions, evidence gaps, and recommendations
+once, after final evaluation and any enabled quality checks. The report appears inline and in `log.txt`;
+`metrics.jsonl` remains authoritative. It performs no additional evaluation and never relaxes configured
+evidence requirements. Completion alone does not establish model improvement.
 
 `[assessment]` requires `quality_checks`, `runtime_window` (at least 2 logs per comparison window),
 `runtime_min_evaluations` (at least 2), `runtime_relative_change` (finite positive heuristic sensitivity),

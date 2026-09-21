@@ -131,8 +131,6 @@ def _applicable(key, cfg, controls):
         return cfg.replay is not None
     if key.startswith("preflight."):
         return cfg.preflight is not None
-    if key.startswith("verify."):
-        return controls["verify"]
     if key.startswith("rewards."):
         return cfg.rewards is not None
     if key == "dataset.dataset_train":
@@ -225,8 +223,6 @@ def _value(key, cfg, controls):
     if block == "dataset":
         name = {"dataset_eval": "eval_source"}.get(name, name)
         return _reference(getattr(cfg.dataset, name))
-    if block == "verify":
-        return _reference(cfg.verify_prompts)
     if block == "rewards":
         return cfg.document["rewards"]["funcs"]
     return _reference(getattr(getattr(cfg, block), name))
@@ -405,6 +401,8 @@ _ASSESSMENT_SETTINGS = {
     "reward_filtered_pairs": "max_length",
     "replay_exposure": "replay.dataset replay.fraction replay.kl_coef",
     "evaluation_coverage": "dataset.split dataset.eval_fraction dataset.dataset_eval eval_strategy eval_steps",
+    "assessment_training_coverage": "assessment.runtime_window logging_strategy logging_steps warmup_steps num_train_epochs max_steps",
+    "assessment_evaluation_coverage": "assessment.runtime_min_evaluations eval_strategy eval_steps eval_delay num_train_epochs max_steps",
     "lora_scale": "peft.r peft.lora_alpha peft.use_rslora peft.rank_pattern peft.alpha_pattern",
     "model_context_budget": "max_length max_prompt_length max_completion_length generation_kwargs",
     "distillation_vocab_size": "model.path teacher.path",
@@ -499,7 +497,7 @@ def _assessment_finding(finding, profile):
     elif code == "training_budget":
         summary = f"Training duration: approximately {_assessment_value(evidence['updates'])} optimizer updates."
         evidence.pop("updates")
-    elif code == "evaluation_coverage":
+    elif code == "evaluation_coverage" and finding["severity"] == "info":
         summary = "Evaluation coverage"
     elif code == "lora_scale":
         divisor = "sqrt(rank)" if evidence.get("use_rslora") else "rank"
@@ -619,6 +617,74 @@ def render_assessment(report, cfg, *, will_publish=True, width=None):
                 lines.extend(_assessment_paragraph("Recommendation: " + finding["recommendation"], width, "    "))
             lines.append("")
     lines.extend(_assessment_paragraph("Advisory only." + (" Complete evidence will be saved in assessment.json after confirmation." if will_publish else ""), width))
+    return "\n".join(lines) + "\n"
+
+
+# Recommendations refer to existing controls; values still come from the completed trainer.
+_FINAL_SETTINGS = {
+    "final_training_coverage": "assessment.runtime_window logging_strategy logging_steps warmup_steps",
+    "final_evaluation_coverage": "assessment.runtime_min_evaluations eval_strategy eval_steps",
+    "final_evaluation_missing": "eval_strategy",
+    "rising_training_loss": "learning_rate lr_scheduler_type warmup_steps max_grad_norm",
+    "little_loss_change": "learning_rate lr_scheduler_type num_train_epochs max_steps",
+    "rising_gradient_norm": "learning_rate max_grad_norm",
+    "possible_overfitting": "num_train_epochs max_steps weight_decay eval_strategy eval_steps",
+    "worsening_evaluation": "learning_rate eval_strategy eval_steps",
+    "generation_cutoffs": "max_completion_length",
+    "policy_dynamics": "learning_rate beta temperature",
+    "final_numerical_issues": "learning_rate bf16 fp16 max_grad_norm",
+}
+
+
+# Final evidence stays readable; observations and exact metric values remain in metrics.jsonl.
+def render_final_assessment(report, args, assessment_settings, *, width=None):
+    width = width if width is not None else shutil.get_terminal_size().columns
+    available = {item.key: item for item in options.settings(report["method"])}
+    lines = ["Final training assessment:"]
+    count = report["evaluation_records"]
+    lines.extend(_assessment_paragraph(
+        f"Training ended at update {report['completed_steps']}/{report['planned_steps']}; "
+        f"{count} recorded ordinary {'evaluation' if count == 1 else 'evaluations'}.", width))
+    if report["train_loss"] is not None:
+        value = report["train_loss"]
+        display = f"{value:.3f}" if isinstance(value, (int, float)) else _assessment_value(value)
+        lines.extend(_assessment_paragraph(f"Recorded average training loss: {display}.", width))
+    if report["evaluation_metrics"]:
+        lines.append(f"  Last recorded evaluation (step {report['evaluation_step']}):")
+        # Match metric-table precision in the summary; raw values remain unchanged in the report and JSONL.
+        values = {key: f"{value:.3f}" if isinstance(value, float) else value
+                  for key, value in report["evaluation_metrics"].items()}
+        lines.extend(_assessment_evidence(values, width))
+    if not report["metric_records"]:
+        lines.append("  No metrics were recorded; numerical health is unknown.")
+    elif not report["nonfinite_observations"]:
+        lines.extend(_assessment_paragraph("No non-finite values were found in the recorded metrics.", width))
+    for finding in sorted(report["findings"], key=lambda item: {"error": 0, "warning": 1, "info": 2}[item["severity"]]):
+        lines.append("")
+        lines.extend(_assessment_paragraph(f"{finding['summary']} ({finding['basis']})", width))
+        lines.extend(_assessment_evidence(finding.get("evidence") or {}, width))
+        if finding.get("recommendation"):
+            lines.extend(_assessment_paragraph("Recommendation: " + finding["recommendation"], width, "    "))
+        flags = []
+        for key in _FINAL_SETTINGS.get(finding["code"], "").split():
+            setting = available.get(key)
+            owner, name = (assessment_settings, key.split(".", 1)[1]) if key.startswith("assessment.") else (args, key)
+            if setting is None or not hasattr(owner, name):
+                continue
+            if key == "eval_steps" and args.eval_strategy != "steps":
+                continue
+            if key == "logging_steps" and args.logging_strategy != "steps":
+                continue
+            if key == "num_train_epochs" and args.max_steps > 0 or key == "max_steps" and args.max_steps <= 0:
+                continue
+            value = _redact(_plain(getattr(owner, name)), name)
+            argument = _argument(setting, value)
+            flags.append(argument if argument is not None else f"{setting.flag}: automatic/unset")
+        if flags:
+            lines.append("    Relevant settings (current values):")
+            for flag in flags:
+                lines.extend(_assessment_paragraph(flag, width, "      "))
+    lines.extend(["", "  Evidence: metrics.jsonl. Completion alone does not establish model improvement."])
     return "\n".join(lines) + "\n"
 
 

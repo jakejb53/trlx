@@ -239,8 +239,7 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup, *, assessment_repo
             def start_verify():
                 with stage(progress, "starting post-training verification", visible=True):
                     checkpoint = _final_checkpoint(run_dir)
-                    prompts = _dataset_arg(cfg.verify_prompts)
-                    return launch.spawn_verify(checkpoint, cfg.model.path, prompts, physical, collector,
+                    return launch.spawn_verify(checkpoint, cfg.model.path, physical, collector,
                                                force=getattr(args, "force", False),
                                                no_staging=getattr(args, "no_staging", False))
 
@@ -420,13 +419,6 @@ def _final_checkpoint(run_dir):
     if not steps:
         raise TrlxError(f"{run_dir}: training finished but wrote no checkpoint; nothing to verify")
     return max(steps)[1]
-
-
-# A config.DatasetRef back in its config spelling, for a command line.
-def _dataset_arg(ref):
-    if ref is None:
-        return None
-    return ref.source if ref.split is None else f"{ref.source}:{ref.split}"
 
 
 # Worker side. Everything printed here lands in log.txt.

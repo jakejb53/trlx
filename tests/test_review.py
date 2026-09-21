@@ -73,7 +73,6 @@ class Rendering(unittest.TestCase):
             "save_strategy": "steps", "save_steps": 9, "save_total_limit": 2,
             "dataloader_num_workers": 0, "dataloader_pin_memory": True,
             "disable_tqdm": True, "push_to_hub": False,
-            "verify": {"prompts": "verify.jsonl"},
         }
         hidden = {
             "gpus", "strategy", "tui", "verify", "model", "trust-remote-code",
@@ -343,7 +342,7 @@ class AssessmentRendering(unittest.TestCase):
     def test_no_problems_omits_section_and_preserves_evidence(self):
         from trlx import assessment
 
-        cfg = configuration(extra={"peft": {"r": 16, "lora_alpha": 8, "use_rslora": True,
+        cfg = configuration(extra={"eval_strategy": "epoch", "peft": {"r": 16, "lora_alpha": 8, "use_rslora": True,
                                               "rank_pattern": {"Decoder.Q_proj$": 4}}})
         report = self.report()
         report["findings"] = assessment.static_findings(cfg, report["profile"], 1)

@@ -150,7 +150,6 @@ class RunConfig:
     preflight: PreflightSpec | None
     rewards: list | None
     replay: ReplaySpec | None
-    verify_prompts: DatasetRef | None
     # Selected method plus explicit CLI overrides, before launch-only fields.
     # Workers, resume comparison, and the run snapshot share these inputs.
     document: dict
@@ -191,6 +190,8 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
     for required in ("model", "dataset", "ranges"):
         if required not in blocks:
             raise TrlxError(f"{path}: missing required block [{required}]")
+    if "verify" in blocks:
+        _verify(path, blocks["verify"])
     # Blocks a method cannot run without: the trainer needs the teacher and
     # the reward functions as constructor arguments.
     for needed in ("teacher", "rewards"):
@@ -212,7 +213,6 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
         preflight=_preflight(path, blocks["preflight"]) if "preflight" in blocks else None,
         rewards=_rewards(path, blocks["rewards"]) if "rewards" in blocks else None,
         replay=replay,
-        verify_prompts=_verify(path, blocks["verify"]) if "verify" in blocks else None,
         document=doc,
         assessment=_assessment(path, blocks["assessment"], method_name) if "assessment" in blocks else None,
     )
@@ -677,11 +677,11 @@ def _replay(path, table):
     return ReplaySpec(dataset_ref(path, "[replay].dataset", table["dataset"]), fraction, kl_coef)
 
 
+# Keep empty legacy tables readable, but never silently ignore retired behavior.
 def _verify(path, table):
-    _check_keys(path, "[verify]", table, ("prompts",))
-    if "prompts" not in table:
-        return None
-    return dataset_ref(path, "[verify].prompts", table["prompts"])
+    if "prompts" in table:
+        raise TrlxError(f"{path}: [verify].prompts was removed with prompt-based verification; remove this setting")
+    _check_keys(path, "[verify]", table, ())
 
 
 # Inspection can represent a missing block, but executable training/check paths cannot invent defaults.

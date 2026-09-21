@@ -178,11 +178,9 @@ def running(procs):
 # command on the run's final checkpoint, with every selected device visible
 # so a model larger than one GPU can spread across them. Output joins
 # log.txt like the workers'.
-def spawn_verify(checkpoint, base, prompts, physical, collector, *, force=False, no_staging=False):
+def spawn_verify(checkpoint, base, physical, collector, *, force=False, no_staging=False):
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=",".join(physical))
     cmd = [sys.executable, "-m", "trlx.cli", "verify", str(checkpoint), "--base", base]
-    if prompts is not None:
-        cmd += ["--prompts", prompts]
     if force:
         cmd.append("--force")
     if no_staging:

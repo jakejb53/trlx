@@ -1,4 +1,4 @@
-"""Local generation shared by verify and replay-build.
+"""Local generation used by replay-build.
 
 Greedy decoding, one prompt at a time: the callers pass a few dozen prompts
 and want reproducible text, not throughput. A prompt is a string or a
@@ -11,13 +11,11 @@ import torch
 from dataset.progress import stage
 from trlx import TrlxError, data_load
 
-# Tokens generated per prompt. Enough for a behaviour difference to show; a
-# display-scale constant, the same accepted exception as POLL_MS.
+# Legacy helper default; replay-build supplies its explicit token budget.
 MAX_NEW_TOKENS = 64
 
-# Prompts used when the config names none ([verify].prompts absent, or
-# `trlx verify` without --prompts). Generic by design: they name no domain,
-# so any instruction-tuned model answers them and any fine-tune moves them.
+# Legacy helper prompts for callers passing None. Verification no longer uses
+# generation; replay-build supplies an explicit prompt dataset.
 BUILTIN_PROMPTS = [
     "Explain in two sentences why the sky is blue.",
     "Write a haiku about a river in winter.",

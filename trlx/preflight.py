@@ -358,15 +358,13 @@ def _check_example(cfg, trainer, tokenizer, report):
         "text": tokenizer.decode(ids),
         "trained_text": tokenizer.decode(trained),
     }
+    # Full text remains available in preflight.json without flooding the terminal.
     report.facts["example"] = example
     report.note(f"first row: {example['tokens']} tokens, {example['trained_tokens']} trained")
-    report.note("first row text:\n  " + example["text"].replace("\n", "\n  "))
     # Token counts, not decoded-text equality, establish whether the mask trains
     # every token; distinct token sequences can decode to identical text.
     if trained and len(trained) == len(ids):
         report.note("first row: all tokens trained")
-    else:
-        report.note("first row trained text:\n  " + example["trained_text"].replace("\n", "\n  "))
     if not trained:
         report.warn("first row has no trained tokens in its label mask")
 

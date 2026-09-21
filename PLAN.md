@@ -394,12 +394,13 @@ Completed: assessment readability (2026-09-20)
 
 - `trlx/feedback.py` separates typed worker feedback from raw output. The supervisor records both
   in `log.txt`, retains useful information inline, consolidates warnings and rank progress, and
-  issues one waiting notice after 30 seconds without substantive feedback. Unknown diagnostics
+  keeps waiting notices log-only while workers train; other phases retain 30-second notices. Unknown diagnostics
   remain visible; library preparation bars come from rank zero. Collection survives display failure.
 - Live metrics have nearby, repeated headings, separate training/evaluation tables, wrapped column
   groups, and named final statistics. `metrics.jsonl` remains authoritative, including resume deltas.
-- Preflight examples and all verification comparisons retain their content with readable Unicode
-  and line breaks. Fully trained examples print once. Checkpoint notices identify the saved directory.
+- Preflight example text remains in `preflight.json`; terminal output retains counts and mask warnings.
+  Verification checks loading, adapter integrity, and chat-template consistency without prompt comparisons.
+  Checkpoint notices identify the saved directory.
   Workers clean up initialized process groups without replacing an existing training failure.
 - Updated CLI help and `SPEC.md`; runtime configurations and existing runs were unchanged.
 - Verification: 208 focused tests passed, including CPU subprocess transport, concurrent output,
@@ -414,6 +415,32 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   tests.test_feedback tests.test_progress tests.test_metrics tests.test_train tests.test_cli \
   tests.test_preflight tests.test_verify tests.test_resolution tests.test_review tests.test_imports \
   tests.test_dataset_cli tests.test_data_load -q
+```
+
+Completed: training feedback and final assessment (2026-09-20)
+
+- Removed prompt generation/scoring from verification. Retired `verify --prompts`, training
+  `--verify-prompts`, and `[verify].prompts` produce explicit removal errors; existing configs are not rewritten.
+- Startup warns about disabled ordinary evaluation and projected observation counts below assessment
+  requirements. Unknown and resumed schedules do not receive definite coverage projections.
+- Rank zero emits one final assessment after evaluation and enabled quality checks, using existing
+  metrics and settings. It reports supported conclusions, evidence gaps, and relevant controls in
+  terminal output and `log.txt`; no extra evaluation or automatic setting changes occur.
+- Validation: 289 focused tests passed, then 78 checks after final edits. Independent review findings
+  were fixed and re-reviewed with no remaining blockers. No live GPU training was run.
+- Read-only validation against `runs/sft/20260920-5--jakejb53-qwen3.8-27b-heretic--books-cpt`
+  confirmed 19/40 required training observations and 1/3 required evaluations. Runtime configs and
+  existing run artifacts were unchanged. `SPEC.md`, `README.md`, and CLI help describe the new contract.
+
+From the repo root with the project Python:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_feedback tests.test_preflight tests.test_verify tests.test_cli tests.test_config \
+  tests.test_init tests.test_resolution tests.test_train tests.test_assessment tests.test_review \
+  tests.test_assessment_lifecycle tests.test_quality_callback tests.test_metrics -q
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_review tests.test_assessment_lifecycle tests.test_train tests.test_imports -q
 ```
 
 ### Additional TODO: optional acceleration recommendations (planned)

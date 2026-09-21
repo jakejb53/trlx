@@ -121,6 +121,7 @@ def callback_class():
             self.records = read(self.path) if assessment_settings is not None and self.path.exists() else []
             self._active_advice = set()
             self._assessment_failed = False
+            self._final_assessment_reported = False
 
         # Persist and flush each trainer record so live readers see progress immediately.
         def on_log(self, args, state, control, logs=None, **kwargs):
@@ -195,6 +196,19 @@ def callback_class():
                 except OSError as e:
                     raise TrlxError(f"{self.path}: cannot finish metrics: {e}; check available space") from e
                 self._file = None
+            # Rank zero runs this after completion quality callbacks. Close the
+            # authoritative stream first; reporting cannot alter training control.
+            if self.assessment_settings is not None and not self._final_assessment_reported:
+                self._final_assessment_reported = True
+                from trlx import assessment, review
+
+                try:
+                    result = assessment.final_assessment(self.method, self.records, args, self.assessment_settings,
+                                                         completed_steps=state.global_step, planned_steps=state.max_steps,
+                                                         ranges=self.ranges)
+                    print(review.render_final_assessment(result, args, self.assessment_settings), flush=True)
+                except Exception as error:
+                    print(f"final assessment unavailable: {type(error).__name__}: {error}; metrics remain in {self.path}", flush=True)
 
     return MetricsCallback
 

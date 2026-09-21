@@ -356,6 +356,13 @@ class View:
 
     # One notice reports each distinct active operation and the ranks still in it.
     def waiting(self):
+        # Training owns the metrics display until every rank leaves its step stage.
+        # Inspect whole stacks so nested evaluation/checkpoint pauses stay quiet too;
+        # collection has already retained the raw waiting diagnostics in log.txt.
+        if any(event.get("unit") == "steps"
+               for source, stack in self.stages.items() if source.startswith("rank ")
+               for event in stack):
+            return
         now = self.clock()
         if now - max(self.last_feedback, self.last_notice) < WAIT_SECONDS:
             return

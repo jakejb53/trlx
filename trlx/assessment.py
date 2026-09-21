@@ -135,6 +135,147 @@ def _batch_budget(cfg, profile, gpu_count):
     return findings
 
 
+# Final conclusions consume the same durable observations and rules as live advice.
+# No extra model evaluation, relaxed evidence window, or training mutation occurs here.
+def final_assessment(method, records, args, settings, *, completed_steps, planned_steps, ranges=None):
+    warmup = args.get_warmup_steps(planned_steps)
+    findings = runtime_findings(method, records, window=settings.runtime_window,
+                                min_evaluations=settings.runtime_min_evaluations,
+                                relative_change=settings.runtime_relative_change,
+                                warmup_steps=warmup, ranges=ranges)
+    training = [r for r in records if not r.get("eval") and not r.get("quality")]
+    evaluation = [r for r in records if r.get("eval") and not r.get("quality")]
+    points = _series(training, "loss", warmup)
+    trend = _trend(points, settings.runtime_window, settings.runtime_relative_change)
+    fixed_objective = method in {"sft", "dpo", "kto", "reward"}
+    if trend is None:
+        findings.append(_finding("final_training_coverage", "warning", "measured",
+                                 "Training-loss trend could not be assessed with the configured evidence window.",
+                                 {"usable_loss_observations": len(points), "required_observations": 2 * settings.runtime_window,
+                                  "warmup_updates": warmup},
+                                 "For future runs, review --assessment-window and --logging-steps against the planned duration; shorter windows give noisier evidence."))
+    elif fixed_objective and trend["direction"] == "down":
+        findings.append(_finding("final_training_progress", "info", "heuristic",
+                                 "Training loss decreased consistently across the two most recent comparison windows.",
+                                 {"loss": trend},
+                                 "Use held-out results to judge whether improved fitting of training data generalizes."))
+    elif fixed_objective and trend["direction"] == "mixed" and not any(f["code"] == "little_loss_change" for f in findings):
+        findings.append(_finding("final_training_progress", "info", "heuristic",
+                                 "Training loss fluctuated without a consistent increase or decrease across the comparison windows.",
+                                 {"loss": trend},
+                                 "Review batch composition and held-out results before changing learning rate or duration."))
+    if not fixed_objective:
+        findings.append(_finding("final_objective_limits", "info", "measured",
+                                 "This method trains on generated responses; its training loss alone cannot establish model improvement.", {},
+                                 "Interpret reward, KL, clipping, and any available held-out or independent quality results together."))
+
+    eval_points = _series(evaluation, "eval_loss", warmup)
+    if not evaluation:
+        findings.append(_finding("final_evaluation_missing", "warning", "measured",
+                                 "No ordinary evaluation metrics were recorded.", {},
+                                 "Review --eval-strategy and the held-out dataset configuration for future runs."))
+    elif fixed_objective and len(eval_points) < settings.runtime_min_evaluations:
+        findings.append(_finding("final_evaluation_coverage", "warning", "measured",
+                                 "Held-out loss trend could not be assessed with the configured evidence requirement.",
+                                 {"usable_evaluations": len(eval_points), "required_evaluations": settings.runtime_min_evaluations,
+                                  "warmup_updates": warmup},
+                                 "Evaluate more frequently with --eval-strategy and --eval-steps when a trend is needed; review --assessment-min-evaluations. A single final evaluation cannot establish improvement."))
+    elif fixed_objective:
+        selected = eval_points[-settings.runtime_min_evaluations:]
+        first, last = selected[0][1], selected[-1][1]
+        relative = (last - first) / abs(first) if first else None
+        improving = all(b[1] < a[1] for a, b in zip(selected, selected[1:]))
+        if improving and relative is not None and -relative >= settings.runtime_relative_change:
+            findings.append(_finding("final_evaluation_progress", "info", "heuristic",
+                                     "Held-out loss decreased consistently across the most recent evaluations.",
+                                     {"eval_loss": _observations(selected), "relative_change": relative,
+                                      "relative_change_threshold": settings.runtime_relative_change},
+                                     "This supports improvement on the evaluated objective during this run; it does not establish general task quality or improvement over an unmeasured base model."))
+        elif not any(f["code"] in {"possible_overfitting", "worsening_evaluation"} for f in findings):
+            findings.append(_finding("final_evaluation_progress", "info", "heuristic",
+                                     "Held-out loss shows no sustained change meeting the configured sensitivity.",
+                                     {"eval_loss": _observations(selected), "relative_change": relative,
+                                      "relative_change_threshold": settings.runtime_relative_change},
+                                     "Review held-out examples before deciding that more training or different settings would help."))
+
+    invalid = [{"step": r.get("step"), "metric": key, "value": str(value)}
+               for r in records for key, value in r.get("log", {}).items()
+               if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value)]
+    # A later finite value does not erase an earlier numerical failure from the run's conclusion.
+    if invalid:
+        findings.append(_finding("final_numerical_issues", "warning", "measured",
+                                 "Non-finite metric values occurred during this run.", {"observations": invalid},
+                                 "Inspect the affected steps before using this checkpoint; later recovery does not invalidate the earlier failure."))
+    final_train = next((r["log"]["train_loss"] for r in reversed(training) if "train_loss" in r["log"]), None)
+    latest_eval = evaluation[-1] if evaluation else None
+    # Preserve exact evidence, but exclude throughput and cumulative counters from the conclusion.
+    eval_values = {key: value for key, value in (latest_eval["log"] if latest_eval else {}).items() if key.startswith("eval_")
+                   and key not in {"eval_runtime", "eval_samples_per_second", "eval_steps_per_second", "eval_num_tokens"}}
+    return {"method": method, "completed_steps": completed_steps, "planned_steps": planned_steps,
+            "train_loss": final_train, "evaluation_records": len(evaluation), "evaluation_metrics": eval_values,
+            "evaluation_step": latest_eval["step"] if latest_eval else None,
+            "metric_records": len(records), "nonfinite_observations": len(invalid), "findings": findings}
+
+
+# Count scheduled observations after warmup without treating projections as trainer facts.
+def _scheduled_observations(args, kind, steps, warmup, updates_per_epoch):
+    strategy = getattr(args, f"{kind}_strategy", None)
+    strategy = getattr(strategy, "value", strategy)
+    delay = getattr(args, "eval_delay", None) if kind == "eval" else 0
+    if strategy == "no" or steps <= 0:
+        return 0
+    if delay is None:
+        return None  # Missing schedule metadata cannot establish an observation count.
+    if strategy == "steps":
+        interval = getattr(args, f"{kind}_steps", None)
+        if not _finite(interval) or interval <= 0:
+            return None
+        interval = math.ceil(interval * steps) if interval < 1 else math.ceil(interval)
+        lower = max(warmup, math.ceil(delay) - 1)
+        count = max(0, steps // interval - lower // interval)
+        if kind == "logging" and getattr(args, "logging_first_step", False) and warmup < 1 <= steps and interval != 1:
+            count += 1
+        return count
+    if strategy == "epoch" and updates_per_epoch:
+        first_epoch = max(warmup // updates_per_epoch + 1, math.ceil(delay), 1)
+        count = max(0, steps // updates_per_epoch - first_epoch + 1)
+        # Trainer emits an epoch-end event for a final partial epoch too. Its
+        # position is a projection, subject to the same dataloader uncertainty.
+        if steps % updates_per_epoch and steps > warmup and steps / updates_per_epoch >= delay:
+            count += 1
+        return count
+    return None
+
+
+# Warn about impossible evidence budgets; unknown or resumed schedules need actual records.
+def _coverage_findings(cfg, profile, budget):
+    settings = getattr(cfg, "assessment", None)
+    if settings is None or budget is None or getattr(cfg.args, "resume_from_checkpoint", None):
+        return []
+    steps, warmup = budget["updates"], budget["warmup_updates"]
+    findings = []
+    observations = _scheduled_observations(cfg.args, "logging", steps, warmup, budget["updates_per_epoch"])
+    required = 2 * settings.runtime_window
+    if observations is not None and observations < required:
+        findings.append(_finding("assessment_training_coverage", "warning", "projected",
+                                 f"Training-trend assessment needs {required} observations; this run is projected to produce {observations} after warmup.",
+                                 {"projected_observations": observations, "required_observations": required,
+                                  "runtime_window": settings.runtime_window, "warmup_updates": warmup,
+                                  "limitation": budget["limitation"]},
+                                 "Reduce --assessment-window or log more frequently with --logging-steps if trend assessment is needed for this run; shorter windows give noisier evidence."))
+    # Ordinary eval-loss trends exist only for fixed-data objectives. Quality
+    # benchmarks have their own matching-series rules and are not required here.
+    if cfg.method.name in {"sft", "dpo", "kto", "reward"} and profile.get("eval") and cfg.args.eval_strategy != "no":
+        evaluations = _scheduled_observations(cfg.args, "eval", steps, warmup, budget["updates_per_epoch"])
+        if evaluations is not None and evaluations < settings.runtime_min_evaluations:
+            findings.append(_finding("assessment_evaluation_coverage", "warning", "projected",
+                                     f"Evaluation-trend assessment needs {settings.runtime_min_evaluations} evaluations; this run is projected to perform {evaluations} after warmup.",
+                                     {"projected_evaluations": evaluations, "required_evaluations": settings.runtime_min_evaluations,
+                                      "warmup_updates": warmup, "limitation": budget["limitation"]},
+                                     "Evaluate more frequently with --eval-strategy and --eval-steps if a held-out trend is needed; review --assessment-min-evaluations without treating a single evaluation as a trend."))
+    return findings
+
+
 # Report method-specific contracts of the installed trainers, not universal tuning targets.
 def _objective(cfg, profile):
     args, method, train = cfg.args, cfg.method.name, profile["train"]
@@ -207,6 +348,8 @@ def static_findings(cfg, profile, gpu_count, *, model_metadata=None, teacher_met
         raise ValueError("assessment gpu_count must be a positive data-parallel worker count")
     findings = copy.deepcopy(profile.get("findings", []))
     findings.extend(_batch_budget(cfg, profile, gpu_count))
+    budget = next((item["evidence"] for item in findings if item["code"] == "training_budget"), None)
+    findings.extend(_coverage_findings(cfg, profile, budget))
     findings.extend(_objective(cfg, profile))
     args = cfg.args
     sources = profile["train"].get("sources")
@@ -221,14 +364,16 @@ def static_findings(cfg, profile, gpu_count, *, model_metadata=None, teacher_met
                                  "Compare primary-task and replay held-out results before adjusting replay fraction or KL regularization."))
     evaluation = profile.get("eval")
     strategy = getattr(args, "eval_strategy", "no")
-    findings.append(_finding("evaluation_coverage", "info", "projected",
-                             "Evaluation rows and loss-token coverage are projected from the full dataset scan.",
+    disabled = not evaluation or strategy == "no"
+    findings.append(_finding("evaluation_coverage", "warning" if disabled else "info", "projected",
+                             "Ordinary evaluation is disabled; its held-out metrics will not be recorded."
+                             if disabled else "Evaluation rows and loss-token coverage are projected from the full dataset scan.",
                              {"train_rows": profile["train"].get("effective_rows"),
                               "eval_rows": evaluation.get("effective_rows") if evaluation else 0,
                               "eval_loss_tokens": evaluation.get("loss_tokens") if evaluation else None,
                               "eval_strategy": str(strategy)},
                              "Enable evaluation with suitable held-out data to assess generalization."
-                             if not evaluation or strategy == "no" else None))
+                             if disabled else None))
     peft = getattr(cfg, "peft", None)
     if peft is not None:
         rank, alpha = peft.r, peft.lora_alpha

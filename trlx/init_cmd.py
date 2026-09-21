@@ -88,7 +88,8 @@ def render(system: Hardware) -> str:
     w.blank()
 
     w.comment("Use all visible GPUs and estimate the launch strategy from the model at training time. "
-              "Print line-based progress and run verification after training. CLI flags override these settings.")
+              "Print line-based progress and verify checkpoint loading, adapter integrity, and chat templates "
+              "after training. CLI flags override these settings.")
     w.table("run")
     for key, value in config.run_settings({}).items():
         w.key(key, value)

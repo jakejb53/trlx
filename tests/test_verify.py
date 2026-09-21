@@ -8,12 +8,11 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from dataset.progress import Progress
 from trlx import TrlxError, verify
 
 
 class VerifyOutput(unittest.TestCase):
-    # Only report I/O is real; deterministic model outputs avoid GPU requirements.
+    # Only report I/O is real; mocked model loads avoid GPU requirements.
     def setUp(self):
         self.directory = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent)))
         self.checkpoint = self.directory / "checkpoint"
@@ -22,50 +21,44 @@ class VerifyOutput(unittest.TestCase):
         self.enterContext(patch("trlx.verify.torch.cuda.is_available", return_value=True))
         self.enterContext(patch("trlx.verify._checkpoint_kind", return_value="causal"))
         self.load = self.enterContext(patch("trlx.verify.model_mod.load_model", return_value=Mock()))
-        self.enterContext(patch("trlx.verify.model_mod.load_processor", return_value=Mock()))
-        self.enterContext(patch("trlx.verify.generate.prompts_from", return_value=["question"]))
-        self.raw_outputs = verify._outputs
-        self.outputs = self.enterContext(patch("trlx.verify._outputs", side_effect=[["base"], ["trained"]]))
+        self.processor = self.enterContext(patch("trlx.verify.model_mod.load_processor", return_value=Mock()))
+        self.compare_template = verify._chat_template_equal
         self.enterContext(patch("trlx.verify._chat_template_equal", return_value=True))
 
-    # Multiline content and reasoning stay visible; JSON retains the exact originals.
-    def test_comparisons_are_readable_and_label_each_sample(self):
-        prompt = [{"role": "user", "content": "Bonjour\n雪"}]
-        base = "<think>réflexion\n\n</think>\nréponse"
-        trained = "<think>réflexion\n\n</think>\n新しい"
-        self.outputs.side_effect = [[base, "same"], [trained, "same"]]
-        output = io.StringIO()
-        with patch("trlx.verify.generate.prompts_from", return_value=[prompt, "second"]):
-            with contextlib.redirect_stdout(output):
-                result = verify.run(self.checkpoint, "base", None)
-        text = output.getvalue()
-        self.assertIn("sample 1/2: differs", text)
-        self.assertIn("sample 2/2: identical", text)
-        self.assertIn("prompt:\n    user: Bonjour\n    雪", text)
-        self.assertIn("base:\n    <think>réflexion\n    \n    </think>\n    réponse", text)
-        self.assertIn("checkpoint:\n    <think>réflexion\n    \n    </think>\n    新しい", text)
-        self.assertEqual(text.count("    same"), 2)
-        self.assertNotIn("\\u", text)
-        self.assertEqual(result.behaviour["samples"][0], {
-            "prompt": prompt, "base": base, "checkpoint": trained, "differs": True,
-        })
-        self.assertEqual(json.loads(self.report.read_text())["behaviour"], result.behaviour)
-
-    # Reward scores remain labelled comparisons rather than being treated as generated text.
-    def test_reward_scores_are_printed_without_json_quotes(self):
-        self.outputs.side_effect = [["score 0.25"], ["score 0.5"]]
+    # Verification loads both models but must never generate or score responses.
+    def test_full_checkpoint_only_performs_structural_checks(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            result = verify.run(self.checkpoint, "base", None)
-        self.assertIn("base:\n    score 0.25", output.getvalue())
-        self.assertIn("checkpoint:\n    score 0.5", output.getvalue())
-        self.assertTrue(result.behaviour["samples"][0]["differs"])
+            result = verify.run(self.checkpoint, "base")
+        self.assertTrue(result.ok)
+        self.assertEqual([call.args[0].path for call in self.load.call_args_list],
+                         ["base", str(self.checkpoint)])
+        self.assertEqual(self.load.return_value.mock_calls, [])
+        self.assertNotIn("behaviour", output.getvalue())
+        self.assertNotIn("sample", output.getvalue())
+        self.assertEqual(json.loads(self.report.read_text()), {
+            "checkpoint": str(self.checkpoint), "base": "base", "adapter": None,
+            "chat_template_equal": True, "failures": [], "ok": True,
+        })
+
+    # Template mismatch remains a verification failure after prompt comparison removal.
+    def test_chat_template_mismatch_is_reported(self):
+        base_processor, checkpoint_processor = Mock(), Mock()
+        base_processor.tokenizer.chat_template = "base template"
+        checkpoint_processor.tokenizer.chat_template = "different template"
+        self.processor.side_effect = [base_processor, checkpoint_processor]
+        with patch("trlx.verify._chat_template_equal", side_effect=self.compare_template):
+            result = verify.run(self.checkpoint, "base")
+        self.assertFalse(result.ok)
+        self.assertFalse(result.chat_template_equal)
+        self.assertEqual(result.failures, ["chat template differs from the base's"])
+        self.assertFalse(json.loads(self.report.read_text())["ok"])
 
     # Collision refusal preserves the report and avoids unnecessary model loads.
     def test_existing_report_refuses_before_loading(self):
         self.report.write_text("old")
         with self.assertRaisesRegex(TrlxError, "--force"):
-            verify.run(self.checkpoint, "base", None)
+            verify.run(self.checkpoint, "base")
         self.load.assert_not_called()
         self.assertEqual(self.report.read_text(), "old")
 
@@ -74,7 +67,7 @@ class VerifyOutput(unittest.TestCase):
         target = self.directory / "previous"
         target.write_text("old")
         self.report.symlink_to(target)
-        result = verify.run(self.checkpoint, "base", None, force=True)
+        result = verify.run(self.checkpoint, "base", force=True)
         self.assertTrue(result.ok)
         self.assertFalse(self.report.is_symlink())
         self.assertEqual(target.read_text(), "old")
@@ -84,42 +77,30 @@ class VerifyOutput(unittest.TestCase):
     def test_direct_mode_still_requires_force(self):
         self.report.write_text("old")
         with self.assertRaisesRegex(TrlxError, "--force"):
-            verify.run(self.checkpoint, "base", None, no_staging=True)
-        verify.run(self.checkpoint, "base", None, force=True, no_staging=True)
+            verify.run(self.checkpoint, "base", no_staging=True)
+        verify.run(self.checkpoint, "base", force=True, no_staging=True)
         self.assertTrue(json.loads(self.report.read_text())["ok"])
 
-    # The report is published only after the entire comparison succeeds.
-    def test_generation_failure_preserves_previous_report(self):
+    # A failed model load must not overwrite the previous complete report.
+    def test_loading_failure_preserves_previous_report(self):
         self.report.write_text("old")
-        self.outputs.side_effect = TrlxError("generation failed")
-        with self.assertRaisesRegex(TrlxError, "generation failed"):
-            verify.run(self.checkpoint, "base", None, force=True)
+        self.load.side_effect = [Mock(), TrlxError("checkpoint load failed")]
+        with self.assertRaisesRegex(TrlxError, "checkpoint load failed"):
+            verify.run(self.checkpoint, "base", force=True)
         self.assertEqual(self.report.read_text(), "old")
 
-    # Reward-model forward OOM is an operator-facing comparison failure.
-    def test_reward_score_oom_is_contextual(self):
-        model = Mock()
-        model.can_generate.return_value = False
-        model.parameters.return_value = iter([verify.torch.nn.Parameter(verify.torch.zeros(1))])
-        model.side_effect = verify.torch.cuda.OutOfMemoryError("allocation failed")
-        processor = Mock()
-        processor.tokenizer.return_value.to.return_value = {}
-        with patch("trlx.verify.generate._render", return_value=("prompt", False)):
-            with self.assertRaisesRegex(TrlxError, "CUDA memory exhausted comparing reward-model scores"):
-                self.raw_outputs(model, processor, ["prompt"])
-
-    # Successful scores alone advance the prompt counter, leaving returned scores unchanged.
-    def test_reward_scoring_reports_completed_prompts(self):
-        lines = []
-        model = Mock()
-        model.can_generate.return_value = False
-        model.parameters.return_value = iter([verify.torch.nn.Parameter(verify.torch.zeros(1))])
-        model.return_value.logits = verify.torch.tensor([[0.25]])
-        processor = Mock()
-        processor.tokenizer.return_value.to.return_value = {}
-        with patch("trlx.verify.generate._render", return_value=("prompt", False)):
-            with Progress("verify", emit=lines.append) as progress:
-                scores = self.raw_outputs(model, processor, ["first", "second"], progress=progress)
-        self.assertEqual(scores, ["score 0.25", "score 0.25"])
-        self.assertTrue(any("scoring verification prompts; 0/2 prompts" in line for line in lines))
-        self.assertTrue(any("scoring verification prompts; 2/2 prompts; finished" in line for line in lines))
+    # Adapter integrity still determines the verdict without requiring changed output.
+    def test_adapter_integrity_remains_required_without_generation(self):
+        (self.checkpoint / verify.adapter_check.ADAPTER_FILE).touch()
+        for model_count in (1, 0):
+            check = verify.adapter_check.AdapterCheck(1, 0.5, model_count, 0.5)
+            with self.subTest(model_count=model_count), \
+                 patch("trlx.verify.adapter_check.task_type", return_value="CAUSAL_LM"), \
+                 patch("trlx.verify.adapter_check.check", return_value=check) as inspect, \
+                 patch("trlx.verify.PeftModel.from_pretrained", return_value=Mock()) as load_adapter:
+                result = verify.run(self.checkpoint, "base", force=True)
+            inspect.assert_called_once_with(self.checkpoint, load_adapter.return_value)
+            self.assertEqual(load_adapter.return_value.mock_calls, [])
+            self.assertEqual(result.ok, model_count == 1)
+            self.assertEqual(result.adapter["ok"], model_count == 1)
+            self.assertNotIn("behaviour", result.to_dict())

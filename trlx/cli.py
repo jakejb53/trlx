@@ -7,7 +7,7 @@ from dataset.env import load as load_env
 from dataset.io import DatasetError
 from dataset.progress import Progress, stage
 from trlx import TrlxError
-from trlx.options import HelpFormatter, add_run_settings, add_training_options, overrides
+from trlx.options import HelpFormatter, add_run_settings, add_training_options, overrides, removed_verification_prompts
 
 # Stable TRL trainers only. Order is the order shown in --help.
 METHODS = ["sft", "dpo", "grpo", "kto", "rloo", "reward", "distillation"]
@@ -63,10 +63,9 @@ def _cmd_check(args):
 # Exit 1 when a verify check fails: the report has already been printed and
 # written, so no message is added here.
 def _cmd_verify(args):
-    from trlx import config, verify
+    from trlx import verify
 
-    prompts = config.dataset_ref("trlx verify", "--prompts", args.prompts) if args.prompts else None
-    return 0 if verify.run(args.checkpoint, args.base, prompts,
+    return 0 if verify.run(args.checkpoint, args.base,
                           force=args.force, no_staging=args.no_staging, progress=args.progress).ok else 1
 
 
@@ -123,8 +122,9 @@ def build_parser(method=None):
                "Settings: CLI overrides > selected method section > shared run.toml settings.\n"
                "CLI overrides apply to one run; edit run.toml for persistent changes.\n"
                "Progress goes to stderr; training also records it in log.txt.\n"
-               "Training coordinates waiting notices after 30 seconds without substantive feedback;\n"
-               "other commands report after 10 seconds. Training diagnostics remain in log.txt.\n"
+               "During loading and verification, training commands show waiting notices after 30 seconds\n"
+               "without substantive feedback. Notices stay in log.txt while workers are training.\n"
+               "Other commands report waiting after 10 seconds.\n"
                "Inspect a command: trlx sft --help, trlx check sft --help, trlx merge --help.\n"
                "Help never requires a config file, model, dataset, or GPU.",
     )
@@ -193,15 +193,14 @@ def build_parser(method=None):
     p.set_defaults(func=_cmd_check)
 
     p = sub.add_parser("verify", help="verify a saved checkpoint against its base", formatter_class=HelpFormatter,
-                       description="Check adapter loading, changed outputs/scores, and chat-template equality. "
+                       description="Check checkpoint loading, adapter integrity, and chat-template equality. "
                                    "Writes verify.json; returns nonzero when a check fails.",
-                       epilog="Examples:\n  trlx verify CHECKPOINT --base BASE\n"
-                              "  trlx verify CHECKPOINT --base BASE --prompts prompts.jsonl\n\n"
+                       epilog="Examples:\n  trlx verify CHECKPOINT --base BASE\n\n"
                               "For checkpoints inside a run, --base must match its saved model path. "
                               "All visible GPUs may be used.")
     p.add_argument("checkpoint", help="checkpoint directory")
     p.add_argument("--base", required=True, help="base model path")
-    p.add_argument("--prompts", help="prompt/messages dataset for comparison (default: built-in prompts)")
+    p.add_argument("--prompts", type=removed_verification_prompts, help=argparse.SUPPRESS)
     p.add_argument("--force", action="store_true", help="replace an existing verify.json report")
     p.add_argument("--no-staging", action="store_true", help="write the report directly; failure can discard the old report")
     p.set_defaults(func=_cmd_verify)

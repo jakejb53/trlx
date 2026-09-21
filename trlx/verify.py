@@ -1,15 +1,13 @@
-"""`trlx verify <checkpoint> --base <model> [--prompts <dataset>]` (SPEC 2.7).
+"""`trlx verify <checkpoint> --base <model>` (SPEC 2.7).
 
 One code path for the standalone command and the end of a run: the
 supervisor spawns this command as its own process once every worker has
 exited, with every selected GPU visible, and the model loads with
 device_map="auto" so a checkpoint too large for one GPU still verifies.
 
-Three checks:
+Structural checks only; these do not measure training quality:
+- base and checkpoint load successfully.
 - adapter loaded (LoRA checkpoints only): adapter_check on a fresh load.
-- behaviour changed: outputs from base and checkpoint on the prompts must
-  differ on at least one. A model that cannot generate (a reward model) is
-  compared on its scores instead.
 - chat template: the checkpoint's equals the base's.
 
 The result is written to verify.json in the run directory when the checkpoint
@@ -27,7 +25,7 @@ from peft import PeftModel
 
 from dataset.io import DatasetError, validate_output, write_text
 from dataset.progress import stage
-from trlx import TrlxError, adapter_check, config as config_mod, generate, model as model_mod, show
+from trlx import TrlxError, adapter_check, config as config_mod, model as model_mod, show
 
 
 # The verify record: verify.json is this object plus `ok`. `failures` lists
@@ -38,8 +36,6 @@ class Result:
     base: str
     # adapter_check.AdapterCheck as a dict, None for a full fine-tune.
     adapter: dict | None
-    # prompt count, differing count, and every prompt with both outputs.
-    behaviour: dict
     chat_template_equal: bool
     failures: list
 
@@ -52,9 +48,8 @@ class Result:
         return {**dataclasses.asdict(self), "ok": self.ok}
 
 
-# Runs the checks and returns the Result. `prompts_ref` is a config.DatasetRef
-# or None for the built-in prompts.
-def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progress=None):
+# Runs structural checks without generating responses or scoring prompts.
+def run(checkpoint, base, *, force=False, no_staging=False, progress=None):
     ckpt = pathlib.Path(checkpoint)
     if not ckpt.is_dir():
         raise TrlxError(f"{checkpoint}: not a directory")
@@ -68,7 +63,6 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progres
         raise TrlxError("verify needs a CUDA device and none is available")
     with stage(progress, "reading verification settings"):
         spec = _base_spec(run_dir, base)
-    prompts = generate.prompts_from(prompts_ref, progress=progress)
     failures = []
 
     if (ckpt / adapter_check.ADAPTER_FILE).is_file():
@@ -90,12 +84,6 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progres
         adapter = dataclasses.asdict(check) | {"ok": check.ok}
         if not check.ok:
             failures.append("adapter check failed")
-        # Same weights, adapters off: the base's behaviour without a second
-        # copy of the model in memory.
-        with stage(progress, "checking base behaviour", visible=True) as activity, peft_model.disable_adapter():
-            base_outputs = _outputs(peft_model, processor, prompts, progress=activity)
-        with stage(progress, "checking checkpoint behaviour", visible=True) as activity:
-            ckpt_outputs = _outputs(peft_model, processor, prompts, progress=activity)
     else:
         # A full fine-tune: the checkpoint is a whole model, and its own
         # config says which kind (a reward model was saved as sequence
@@ -107,35 +95,15 @@ def run(checkpoint, base, prompts_ref, *, force=False, no_staging=False, progres
         base_model = model_mod.load_model(spec, kind, device_map="auto", progress=progress)
         processor = model_mod.load_processor(spec, progress=progress)
         print(f"loaded {type(base_model).__name__} from {base}", flush=True)
-        with stage(progress, "checking base behaviour", visible=True) as activity:
-            base_outputs = _outputs(base_model, processor, prompts, progress=activity)
         del base_model
         torch.cuda.empty_cache()
         ckpt_model = model_mod.load_model(ckpt_spec, kind, device_map="auto", progress=progress)
         print(f"loaded {type(ckpt_model).__name__} from {checkpoint}", flush=True)
-        with stage(progress, "checking checkpoint behaviour", visible=True) as activity:
-            ckpt_outputs = _outputs(ckpt_model, processor, prompts, progress=activity)
-
-    samples = [
-        {"prompt": p, "base": b, "checkpoint": c, "differs": b != c}
-        for p, b, c in zip(prompts, base_outputs, ckpt_outputs)
-    ]
-    differing = sum(s["differs"] for s in samples)
-    behaviour = {"prompts": len(prompts), "differing": differing, "samples": samples}
-    print(f"behaviour: {differing} of {len(prompts)} outputs differ between base and checkpoint", flush=True)
-    for index, s in enumerate(samples, 1):
-        print(f"\n  sample {index}/{len(samples)}: {'differs' if s['differs'] else 'identical'}", flush=True)
-        # Indentation is presentation only: retain full generated text (including
-        # reasoning and blank lines), with the untouched values in verify.json.
-        for label, value in (("prompt", _text(s["prompt"])), ("base", s["base"]), ("checkpoint", s["checkpoint"])):
-            print(f"  {label}:\n    " + str(value).replace("\n", "\n    "), flush=True)
-    if differing == 0:
-        failures.append("behaviour unchanged: every output equals the base's")
 
     with stage(progress, "checking chat template") as activity:
         template_equal = _chat_template_equal(spec, ckpt, processor, failures, progress=activity)
 
-    result = Result(str(ckpt), base, adapter, behaviour, template_equal, failures)
+    result = Result(str(ckpt), base, adapter, template_equal, failures)
     try:
         write_text(path, json.dumps(result.to_dict(), indent=1) + "\n", force=force,
                    no_staging=no_staging, progress=progress)
@@ -180,28 +148,6 @@ def _checkpoint_kind(ckpt_spec, *, progress=None):
     return model_mod.SEQUENCE_CLASSIFICATION if architectures[:1] == [seq_cls.__name__] else model_mod.CAUSAL
 
 
-# Text outputs for the prompts: generated completions, or for a model that
-# cannot generate (a sequence-classification reward model) its score per
-# prompt, formatted so equal scores compare equal as strings.
-def _outputs(model, processor, prompts, *, progress=None):
-    if model.can_generate():
-        return generate.generate(model, processor, prompts, progress=progress)
-    tokenizer = getattr(processor, "tokenizer", processor)
-    device = next(model.parameters()).device
-    scores = []
-    try:
-        with stage(progress, "scoring verification prompts", total=len(prompts), unit="prompts") as activity, torch.no_grad():
-            for prompt in prompts:
-                text, templated = generate._render(tokenizer, prompt)
-                encoded = tokenizer(text, return_tensors="pt", add_special_tokens=not templated).to(device)
-                scores.append(f"score {model(**encoded).logits[0, 0].item():.6g}")
-                activity.advance()
-    except torch.cuda.OutOfMemoryError as e:
-        raise TrlxError("CUDA memory exhausted comparing reward-model scores; "
-                        "free GPU memory or shorten verification prompts") from e
-    return scores
-
-
 # The checkpoint's saved chat template against the base's. A checkpoint
 # without a saved tokenizer has no template to compare, which fails the check
 # rather than passing it silently.
@@ -218,11 +164,3 @@ def _chat_template_equal(spec, ckpt, base_processor, failures, *, progress=None)
     if not equal:
         failures.append("chat template differs from the base's")
     return equal
-
-
-# Readable form of a prompt for the printed report; messages become
-# "role: content" lines.
-def _text(prompt):
-    if isinstance(prompt, str):
-        return prompt
-    return "\n".join(f"{m.get('role', '')}: {m.get('content', '')}" for m in prompt)

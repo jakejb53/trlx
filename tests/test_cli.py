@@ -11,6 +11,24 @@ from trlx import TrlxError, cli, config, hardware, model, options, train
 
 
 class Interface(unittest.TestCase):
+    # Retired prompt flags fail explicitly instead of silently skipping requested behavior.
+    def test_verification_prompt_options_explain_removal(self):
+        commands = [(["verify", "checkpoint", "--base", "base"], "--prompts")]
+        commands += [([method], "--verify-prompts") for method in cli.METHODS]
+        commands += [(["check", method], "--verify-prompts") for method in cli.METHODS]
+        for command, flag in commands:
+            with self.subTest(command=command):
+                error = io.StringIO()
+                with contextlib.redirect_stderr(error), self.assertRaises(SystemExit) as caught:
+                    cli.parse_args([*command, flag, "prompts.jsonl"])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(flag, error.getvalue())
+                self.assertIn("prompt-based verification was removed", error.getvalue())
+                help_output = io.StringIO()
+                with contextlib.redirect_stdout(help_output), self.assertRaises(SystemExit):
+                    cli.parse_args([*command, "--help"])
+                self.assertNotIn(flag, help_output.getvalue())
+
     # Initialization has no task inputs; the settings filename is conventional.
     def test_init_needs_no_method(self):
         args = cli.parse_args(["init"])

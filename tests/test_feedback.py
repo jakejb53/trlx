@@ -199,8 +199,8 @@ class Presentation(unittest.TestCase):
         self.assertIn("vocabulary assumption", self.lines[1])
         self.assertIn(known, self.lines[-1])
 
-    # Measured optimizer steps reset liveness even when no metric row is due yet.
-    def test_measured_steps_reset_quiet_timer_without_duplicate_progress_lines(self):
+    # Long steps stay quiet while measured counts still maintain progress state.
+    def test_training_suppresses_waiting_without_losing_measured_progress(self):
         fields = {"label": "trainer running", "visible": True, "completed": 0, "total": 19, "unit": "steps"}
         self.view.consume(self.event("start", "training", **fields))
         self.now = 29
@@ -210,19 +210,49 @@ class Presentation(unittest.TestCase):
         self.now = 58
         self.view.waiting()
         self.assertEqual(self.lines, ["training"])
-        self.now = 59
+        self.now = 300
         self.view.waiting()
+        self.assertEqual(self.lines, ["training"])
+        self.assertEqual(self.view.last_feedback, 29)
+        self.assertEqual(self.view.stages["rank 0"][0]["completed"], 1)
+
+    # A finished rank cannot re-enable notices while another rank trains or evaluates.
+    def test_nested_pauses_stay_quiet_until_all_training_ranks_finish(self):
+        training = {"label": "trainer running", "unit": "steps", "visible": False}
+        for source in ("rank 0", "rank 1"):
+            self.view.consume(self.event("start", "training", source=source, **training))
+        self.view.consume(self.event("end", "training finished", **training))
+        for label in ("evaluating", "saving checkpoint"):
+            pause = {"label": label, "unit": "batches", "visible": False}
+            self.view.consume(self.event("start", label, source="rank 1", **pause))
+            self.now += 60
+            self.view.waiting()
+            self.assertEqual(self.lines, [])
+            self.view.consume(self.event("end", label, source="rank 1", **pause))
+        self.view.consume(self.event("warning", "kernel fallback", logger="library", level="WARNING"))
+        self.view.consume(self.event("raw", "unexpected diagnostic"))
         self.assertEqual(len(self.lines), 2)
-        self.assertIn("trainer running; 1/19 steps [rank 0]", self.lines[-1])
-        self.assertIn("30s ago", self.lines[-1])
-        self.assertNotIn("no measured progress", self.lines[-1])
-        self.now = 88
-        self.view.waiting()
-        self.assertEqual(len(self.lines), 2)
-        self.now = 89
+        self.view.consume(self.event("end", "training finished", source="rank 1", **training))
+        self.view.consume(self.event("start", "checking checkpoint", source="verify",
+                                     label="checking checkpoint", visible=False))
+        self.now += 30
         self.view.waiting()
         self.assertEqual(len(self.lines), 3)
-        self.assertIn("60s ago", self.lines[-1])
+        self.assertIn("waiting: checking checkpoint [verify]", self.lines[-1])
+
+    # Presentation filtering happens after log persistence, including raw heartbeats.
+    def test_training_waiting_diagnostics_remain_in_log(self):
+        log = io.BytesIO()
+        collector = feedback.Collector(log, "log.txt")
+        collector.accept("rank 0", {"kind": "start", "message": "training",
+                                  "label": "trainer running", "unit": "steps", "visible": False})
+        collector.accept("rank 0", {"kind": "waiting", "message": "trainer heartbeat"})
+        for event in collector.take():
+            self.view.consume(event)
+        self.now = 60
+        self.view.waiting()
+        self.assertEqual(self.lines, [])
+        self.assertIn("[rank 0] trainer heartbeat\n", log.getvalue().decode())
 
     # Equivalent starts are consolidated while a quiet notice identifies diverging ranks.
     def test_rank_stages_are_consolidated_and_divergence_is_visible(self):

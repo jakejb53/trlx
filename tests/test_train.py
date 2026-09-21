@@ -74,7 +74,7 @@ class Supervisor(unittest.TestCase):
         cfg = self.cfg = types.SimpleNamespace(
             args=types.SimpleNamespace(run_name="memory", resume_from_checkpoint=None),
             ranges={"loss": (0, 2)}, document={}, method=types.SimpleNamespace(name="sft"),
-            model=types.SimpleNamespace(path="memory-model"), verify_prompts=None,
+            model=types.SimpleNamespace(path="memory-model"),
             assessment=train.config_mod._assessment("memory.toml", dict(init_cmd.ASSESSMENT_DEFAULTS), "sft"),
         )
         self._patch("trlx.train.config_mod.resolve", side_effect=self._resolved)
@@ -249,6 +249,46 @@ class Supervisor(unittest.TestCase):
         self.assertIn("starting post-training verification", log)
         self.assertIn("failed: verify exited with code 7", log)
         self.assertFalse(progress._thread.is_alive())
+
+    # Slow steps retain one table heading; raw waits stay logged and the final eval is drained.
+    def test_slow_steps_keep_table_and_final_evaluation_visible(self):
+        clock = Mock(return_value=0.0)
+        view_class = train.feedback.View
+        self._patch("trlx.train.feedback.View", side_effect=lambda emit: view_class(emit, clock=clock))
+        collector = train.feedback.Collector(self.log, pathlib.Path("memory-run/log.txt"))
+        fields = {"label": "trainer running", "unit": "steps", "completed": 0, "total": 19, "visible": True}
+        collector.accept("rank 0", {"kind": "start", "message": "trainer running", **fields})
+        first = {"step": 1, "max_steps": 19, "epoch": .05, "num_train_epochs": 1,
+                 "eval": False, "log": {"loss": 2.2}}
+        second = {**first, "step": 2, "epoch": .1, "log": {"loss": 2.1}}
+        evaluation = {**first, "step": 19, "epoch": 1.0, "eval": True, "log": {"eval_loss": 2.28}}
+
+        # Every tick uses the real reader-to-renderer path with deterministic worker timing.
+        def wait(tick):
+            self.records.return_value = [first]
+            tick()
+            clock.return_value = 60.0
+            collector.accept("rank 0", {"kind": "waiting", "message": "waiting: trainer running", **fields})
+            tick()
+            self.records.return_value = [first, second]
+            tick()
+            clock.return_value = 120.0
+            tick()
+            self.records.return_value = [first, second, evaluation]
+            tick()
+            return None
+
+        job = types.SimpleNamespace(feedback=collector, wait=wait)
+        failed = Mock()
+        train._supervise_lines(pathlib.Path("memory-run"), {"loss": (0, 5), "eval_loss": (0, 5)},
+                               pathlib.Path("memory-run/log.txt"), job, failed)
+        text = self.stdout.getvalue()
+        self.assertEqual(text.count("Training —"), 1)
+        self.assertEqual(text.count("Evaluation —"), 1)
+        self.assertIn("2.280", text)
+        self.assertNotIn("waiting:", self.stderr.buffer.getvalue().decode())
+        self.assertIn(b"waiting: trainer running", self.log.getvalue())
+        failed.assert_not_called()
 
     # Both reporter lifetimes must respect curses ownership while the job continues logging.
     def test_tui_reporters_write_waiting_feedback_to_log_without_touching_terminal(self):
