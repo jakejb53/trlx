@@ -31,6 +31,20 @@ RANGES = {
     "distillation": {"loss": [0, 5], "eval_loss": [0, 5], "grad_norm": [0, 10]},
 }
 
+
+# These defaults are emitted into operator configuration, never filled in silently at runtime.
+ASSESSMENT_DEFAULTS = {
+    "quality_checks": False,
+    "runtime_window": 20,
+    "runtime_min_evaluations": 3,
+    "runtime_relative_change": 0.05,
+    "quality_preset": "None",
+    "quality_dataset": "None",
+    "quality_max_length": 2048,
+    "quality_max_new_tokens": 256,
+    "quality_batch_size": 1,
+}
+
 # These are visible starting values, not a claim that a particular model fits.
 # Native BF16 is a hardware fact; batch sizes require later model/data tuning.
 def render(system: Hardware) -> str:
@@ -78,6 +92,15 @@ def render(system: Hardware) -> str:
     w.table("run")
     for key, value in config.run_settings({}).items():
         w.key(key, value)
+    w.blank()
+
+    w.comment("Full pre-run scan and advisory runtime findings; no automatic training changes. "
+              "Relative change is a heuristic sensitivity threshold, not statistical confidence.")
+    w.table("assessment")
+    for key, value in ASSESSMENT_DEFAULTS.items():
+        w.key(key, value)
+    w.comment("Quality checks require a built-in preset and separate evaluation data. "
+              "They run at baseline, scheduled evaluations, and completion, even with evaluation disabled.")
     w.blank()
 
     w.comment("Supply the base model with --model, or persist its local path / Hub id here.")

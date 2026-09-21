@@ -1,7 +1,7 @@
 """metrics.jsonl: the callback that writes it and the reader that parses it.
 
 The file is the only metric source (SPEC 2.3). One JSON object per line, one
-line per Trainer.log call:
+line per Trainer.log call or completed independent quality round:
 
     {"step": 10, "max_steps": 100, "epoch": 0.5, "num_train_epochs": 2.0,
      "eval": false, "time": 1758200000.0, "log": {"loss": 1.234, ...}}
@@ -9,7 +9,9 @@ line per Trainer.log call:
 `log` is the trainer's dict verbatim; trlx never renames or drops its keys.
 The top-level fields are trlx's, taken from TrainerState. `eval` is true when
 the call carried eval_-prefixed keys, which is how transformers reports an
-evaluation pass. `time` is wall-clock seconds for correlating with log.txt.
+evaluation pass. Independent quality records also set `eval`, carry a `quality`
+context (phase, preset, series, status), and use `quality/` metric names; they do
+not call Trainer.log or change its scheduling. `time` correlates with log.txt.
 
 The callback imports transformers lazily so `show` never pays for it.
 """
@@ -110,24 +112,80 @@ def callback_class():
     # most one partial line, which the reader skips.
     class MetricsCallback(TrainerCallback):
         # Delay opening until the first record; rank zero owns this run's metric stream.
-        def __init__(self, run_dir):
+        def __init__(self, run_dir, assessment_settings=None, method=None, ranges=None):
             self.path = pathlib.Path(run_dir) / FILENAME
             self._file = None
+            self.assessment_settings = assessment_settings
+            self.method = method
+            self.ranges = ranges
+            self.records = read(self.path) if assessment_settings is not None and self.path.exists() else []
+            self._active_advice = set()
+            self._assessment_failed = False
 
         # Persist and flush each trainer record so live readers see progress immediately.
         def on_log(self, args, state, control, logs=None, **kwargs):
             if logs is None:
                 return
+            self._append(record(state, logs, time.time()))
+            self._advise(args, state)
+
+        # Quality results share this writer without calling Trainer.log or changing its counters.
+        def quality(self, args, state, logs, context):
+            item = record(state, logs, time.time())
+            item["eval"] = True
+            item["quality"] = dict(context)
+            self._append(item)
+            self._advise(args, state, quality_complete=context.get("status") == "complete")
+
+        # Resume comparisons require the same dataset/scorer series, not merely the same metric name.
+        def has_baseline(self, series):
+            return any(item.get("quality", {}).get("series") == series
+                       and item["quality"].get("phase") == "baseline"
+                       and item["quality"].get("status") == "complete" for item in self.records)
+
+        # Publish first, then expose the record to advice; evidence always points at durable metrics.
+        def _append(self, item):
             if self._file is None:
                 try:
                     self._file = open(self.path, "a", encoding="utf-8")
                 except OSError as e:
                     raise TrlxError(f"{self.path}: cannot open for writing: {e.strerror or e}")
             try:
-                self._file.write(json.dumps(record(state, logs, time.time())) + "\n")
+                serialized = json.dumps(item)
+                self._file.write(serialized + "\n")
                 self._file.flush()
             except OSError as e:
                 raise TrlxError(f"{self.path}: cannot append metrics: {e}; check available space and permissions") from e
+            if self.assessment_settings is not None:
+                # Later trainer callbacks may mutate logs; advice must match the durable evidence.
+                self.records.append(json.loads(serialized))
+
+        # Repeated active findings are coalesced; advisory failures cannot take ownership of training.
+        def _advise(self, args, state, *, quality_complete=False):
+            if self.assessment_settings is None or self._assessment_failed:
+                return
+            from trlx import assessment, review
+
+            settings = self.assessment_settings
+            try:
+                findings = assessment.runtime_findings(
+                    self.method, self.records, window=settings.runtime_window,
+                    min_evaluations=settings.runtime_min_evaluations,
+                    relative_change=settings.runtime_relative_change,
+                    warmup_steps=args.get_warmup_steps(state.max_steps), ranges=self.ranges,
+                )
+                active = {item["code"] for item in findings}
+                for finding in findings:
+                    # Each completed quality round deserves a fresh comparison;
+                    # ordinary training logs still coalesce unchanged advice.
+                    refresh = quality_complete and finding["code"].startswith("quality_baseline:")
+                    if refresh or finding["code"] not in self._active_advice:
+                        print(review.format_finding(finding), flush=True)
+                self._active_advice = active
+            except Exception as error:
+                self._assessment_failed = True
+                print(f"assessment unavailable: {type(error).__name__}: {error}; training metrics remain in {self.path}",
+                      flush=True)
 
         # Surface final flush/close failures before reporting a completed metrics stream.
         def on_train_end(self, args, state, control, **kwargs):
@@ -184,4 +242,12 @@ def _parse(path, number, line):
         raise TrlxError(f"{path}: line {number}: record missing {', '.join(missing)}")
     if not isinstance(rec["log"], dict):
         raise TrlxError(f"{path}: line {number}: 'log' is not an object")
+    if "quality" in rec:
+        context = rec["quality"]
+        if not isinstance(context, dict):
+            raise TrlxError(f"{path}: line {number}: 'quality' is not an object")
+        if context.get("phase") not in ("baseline", "scheduled", "completion"):
+            raise TrlxError(f"{path}: line {number}: quality.phase must be baseline, scheduled, or completion")
+        if not isinstance(context.get("preset"), str) or not context["preset"]:
+            raise TrlxError(f"{path}: line {number}: quality.preset must name the evaluation preset")
     return rec

@@ -1,15 +1,15 @@
 """`trlx <method> [options]`: supervisor and worker sides of a training run.
 
-Supervisor (no --_rank): select GPUs -> validate the config -> review settings
-and await consent -> choose strategy -> allocate or rewind the selected run ->
-write config.toml -> spawn workers (launch.py) -> display and propagate exit.
+Supervisor (no --_rank): select GPUs -> validate configuration -> inspect metadata
+and fully scan datasets -> review settings/assessment and await consent -> choose
+strategy -> allocate or rewind -> write snapshot/assessment -> spawn workers.
 The supervisor owns the directory through verification; workers never allocate it.
-It never loads a model. It does hold a CUDA context on the first selected
+It never loads model weights. It does hold a CUDA context on the first selected
 device, because transformers validates bf16 against a real device when the
 config is instantiated.
 
 Worker (--_rank r): load the config, the model, the datasets, and train.
-Rank 0 owns metrics.jsonl and the preflight report. The supervisor drains
+Rank 0 owns metrics.jsonl, quality evidence, and the preflight report. The supervisor drains
 raw output and typed feedback separately, recording both in log.txt.
 
 Preflight runs in stages where its inputs exist: the config-only checks in
@@ -24,6 +24,7 @@ useful feedback; complete diagnostics remain in log.txt for the TUI and inspecti
 """
 
 import contextlib
+import json
 import logging
 import os
 import pathlib
@@ -33,13 +34,16 @@ import sys
 from dataset.progress import Progress, stage
 from trlx import (
     TrlxError,
+    assessment,
     config as config_mod,
     data_load,
+    data_profile,
     feedback,
     launch,
     metrics,
     model as model_mod,
     preflight,
+    quality,
     ranges,
     render_lines,
     review,
@@ -80,9 +84,11 @@ def _supervise(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(physical)
     with stage(progress, "validating trainer settings"):
         cfg = config_mod.from_document(document, args.command, path=source)
-    # Consent precedes model inspection and all run allocation/resume mutation.
+    config_mod.require_assessment(cfg, source)
+    assessment_report = _assess(cfg, len(physical), progress=progress)
+    # Metadata and full data scans inform consent; weights and run mutation still wait.
     # Workers consume the saved snapshot later and never repeat this prompt.
-    if not review.confirm(cfg, progress=progress):
+    if not review.confirm(cfg, progress=progress, assessment=assessment_report):
         if progress is not None:
             progress.finish("cancelled")
         return 0
@@ -99,10 +105,61 @@ def _supervise(args):
     # rewind files while this job's workers or verification are still using them.
     with stage(progress, f"acquiring run ownership: {run_dir}"), run_dirs.locked(run_dir):
         try:
-            return _run_job(args, cfg, run_dir, physical, strategy, startup)
+            return _run_job(args, cfg, run_dir, physical, strategy, startup, assessment_report=assessment_report)
         except OSError as e:
             raise TrlxError(f"{e.filename or run_dir}: training supervisor I/O failed: {e}; "
                             "check available space and permissions") from e
+
+
+# Text-config facts are explicit metadata, not inferred capabilities or estimates of learning quality.
+def _assessment_metadata(model_config):
+    text = model_config.get_text_config()
+    names = ("model_type", "vocab_size", "max_position_embeddings", "rope_scaling")
+    return {name: getattr(text, name, None) for name in names}
+
+
+# Read and profile every effective row before confirmation; model weights remain worker-owned.
+def _assess(cfg, gpu_count, *, progress=None):
+    metadata = _assessment_metadata(model_mod.load_config(cfg.model, progress=progress))
+    processor = model_mod.assessment_processor(cfg, progress=progress)
+    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    primary_rows = train_set.num_rows
+    train_set = _mix_replay(cfg, train_set, progress=progress)
+    profile = data_profile.scan(cfg, processor, train_set, eval_set, primary_rows=primary_rows, progress=progress)
+    teacher_metadata = None
+    teacher_findings = []
+    if cfg.teacher is not None:
+        teacher_metadata = _assessment_metadata(model_mod.load_config(cfg.teacher, progress=progress))
+        teacher_processor = model_mod.load_processor(cfg.teacher, progress=progress)
+        student = getattr(processor, "tokenizer", processor).get_vocab()
+        teacher = getattr(teacher_processor, "tokenizer", teacher_processor).get_vocab()
+        mismatches = [{"token": token, "student_id": student.get(token), "teacher_id": teacher.get(token)}
+                      for token in sorted(student.keys() | teacher.keys()) if student.get(token) != teacher.get(token)]
+        if mismatches:
+            teacher_findings.append({"code": "distillation_token_ids", "severity": "warning", "basis": "measured",
+                                     "summary": "Teacher and student token-to-ID mappings differ.",
+                                     "evidence": {"mismatches": mismatches},
+                                     "recommendation": "Use compatible token-ID meanings for token-level distillation; equal vocabulary sizes are insufficient."})
+    findings = assessment.static_findings(cfg, profile, gpu_count, model_metadata=metadata,
+                                         teacher_metadata=teacher_metadata) + teacher_findings
+    report = {"version": 1, "method": cfg.method.name, "profile": profile,
+              "model": metadata, "teacher": teacher_metadata, "findings": findings, "quality": None}
+    if cfg.assessment.quality_checks:
+        independent = quality.load_data(cfg.assessment, progress=progress)
+        report["quality"] = {"preset": cfg.assessment.quality_preset, "rows": independent.num_rows,
+                             "fingerprint": data_profile.fingerprint(independent),
+                             "overlap": data_profile.compare_sources(train_set, independent, cfg.method.name,
+                                                                       train_exclude_columns=("replay",) if _replay_kl_on(cfg) else ())}
+        inputs = quality.inspect_inputs(cfg.assessment, processor, independent, metadata, progress=progress)
+        findings.extend(inputs.pop("findings"))
+        report["quality"].update(inputs)
+        overlap = report["quality"]["overlap"]
+        if overlap["identical_examples"] or overlap["prompts"]:
+            findings.append({"code": "quality_overlap", "severity": "warning", "basis": "measured",
+                             "summary": "Independent evaluation data overlaps the training inputs.",
+                             "evidence": overlap,
+                             "recommendation": "Use held-out task examples; exact prompt overlap and identical examples are reported separately."})
+    return report
 
 
 # Startup feedback reaches the terminal until the supervisor starts its display.
@@ -127,7 +184,7 @@ def _job_feedback(args, collector):
 
 
 # The directory is owned and config preflight has passed before history is changed.
-def _run_job(args, cfg, run_dir, physical, strategy, startup):
+def _run_job(args, cfg, run_dir, physical, strategy, startup, *, assessment_report=None):
     log_path = run_dir / show.LOG_FILENAME
     with open(log_path, "ab") as log_file, \
             feedback.Collector(log_file, log_path, display=not args.tui) as collector, \
@@ -142,6 +199,11 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup):
         with stage(progress, "writing resolved configuration snapshot"):
             snapshot = _write_snapshot(cfg, run_dir, physical, strategy,
                                        no_staging=getattr(args, "no_staging", False))
+        if assessment_report is not None:
+            # Publication follows confirmation and resume rewind; workers see exactly the reviewed evidence.
+            run_dirs.write_atomic(run_dir / show.ASSESSMENT_FILENAME,
+                                  json.dumps(assessment_report, ensure_ascii=False, indent=1) + "\n",
+                                  no_staging=getattr(args, "no_staging", False))
         try:
             log_file.write((startup + "\n").encode("utf-8"))
             log_file.flush()
@@ -403,6 +465,7 @@ def _train_worker(args):
     with stage(progress, "loading resolved worker configuration"):
         cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
                               overrides=getattr(args, "overrides", None), resolved=True)
+    settings = config_mod.require_assessment(cfg, args.config)
     run_dir = pathlib.Path(cfg.args.output_dir)
     _attach_logging(progress)
     feedback.configure_worker_progress(rank)
@@ -421,14 +484,25 @@ def _train_worker(args):
     report = preflight.Report()
     callbacks = [preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
                                             no_staging=getattr(args, "no_staging", False), progress=progress)]
+    writer = metrics.callback_class()(run_dir, settings, cfg.method.name, cfg.ranges) if rank == 0 else None
+    quality_callback = None
+    if settings.quality_checks:
+        quality_callback = quality.callback_class()(settings, run_dir, writer, rank,
+                                                    no_staging=getattr(args, "no_staging", False), progress=progress)
+        callbacks.append(quality_callback)
     if rank == 0:
-        callbacks.append(metrics.callback_class()(run_dir))
+        # Completion quality must publish before this callback closes the sole metrics writer.
+        callbacks.append(writer)
     trainer = build_trainer(cfg, model, processor, train_set, eval_set, callbacks, progress=progress)
+    if quality_callback is not None:
+        quality_callback.bind(trainer)
     if rank == 0:
         # Flushed even when a check is fatal: the lines already noted (the
         # LoRA breakdown, say) are the context for the failure.
         try:
-            preflight.check_trainer(cfg, trainer, train_set, report, progress=progress)
+            preview = show._read_json(run_dir / show.ASSESSMENT_FILENAME)
+            preflight.check_trainer(cfg, trainer, train_set, report, progress=progress,
+                                    profile=preview["profile"] if preview is not None else None)
         finally:
             report.flush()
         report.write(run_dir, no_staging=getattr(args, "no_staging", False), progress=progress)
@@ -473,6 +547,9 @@ def check(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = physical[0]
     with stage(progress, "validating trainer settings"):
         cfg = config_mod.from_document(document, args.method, path=source)
+    config_mod.require_assessment(cfg, source)
+    assessment_report = _assess(cfg, 1, progress=progress)
+    print(review.render_assessment(assessment_report, will_publish=False), flush=True)
     print(f"check: one process on GPU {physical[0]}", file=sys.stderr)
     preflight.check_config(cfg, source, None, progress=progress)
     print("preflight: config checks passed", file=sys.stderr)
@@ -489,7 +566,7 @@ def check(args):
     existed = run_dir.exists()
     try:
         trainer = build_trainer(cfg, model, processor, train_set, eval_set, [], progress=progress)
-        preflight.check_trainer(cfg, trainer, train_set, report, progress=progress)
+        preflight.check_trainer(cfg, trainer, train_set, report, progress=progress, profile=assessment_report["profile"])
         preflight.check_offpolicy(cfg, trainer.model, processor, train_set, report, progress=progress)
     except torch.cuda.OutOfMemoryError:
         raise TrlxError(

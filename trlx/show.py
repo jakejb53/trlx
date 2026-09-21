@@ -21,6 +21,8 @@ CONFIG_FILENAME = "config.toml"
 LOG_FILENAME = "log.txt"
 PREFLIGHT_FILENAME = "preflight.json"
 VERIFY_FILENAME = "verify.json"
+ASSESSMENT_FILENAME = "assessment.json"
+QUALITY_FILENAME = "quality.jsonl"
 CHECKPOINT_DIR = re.compile(r"^checkpoint-(\d+)$")
 
 # Bytes read from the end of log.txt for the tail pane. A bound so a

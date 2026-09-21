@@ -231,6 +231,32 @@ def add_training_options(parser, method_name):
         _option(extra, "--replay-kl-coef", "replay.kl_coef", float, "Nonnegative KL coefficient; zero is plain mixing.")
         extra.add_argument("--no-replay", action="store_true", help="Disable configured replay for this run.")
 
+    assessment = parser.add_argument_group("Advisory assessment and built-in independent quality checks")
+    fields = [
+        ("--quality-checks", "quality_checks", bool,
+         "Run built-in quality checks at baseline, evaluation points, and completion, even with evaluation disabled; advisory only."),
+        ("--assessment-window", "runtime_window", int, "Logged observations per runtime comparison window; at least 2."),
+        ("--assessment-min-evaluations", "runtime_min_evaluations", int, "Comparable evaluation observations needed for trend advice; at least 2."),
+        ("--assessment-relative-change", "runtime_relative_change", float, "Positive relative-change sensitivity; a heuristic threshold, not statistical confidence."),
+        ("--quality-preset", "quality_preset", str | None,
+         "Built-in preset: language_modeling, qa, classification, multiple_choice, json, preference, instruction_following, or writing."),
+        ("--quality-dataset", "quality_dataset", str | None, "Separate evaluation dataset; required when quality checks are enabled."),
+        ("--quality-max-length", "quality_max_length", int, "Quality input/window token limit; at least 2. LM windows overlap by one token; generation prompts are not silently truncated."),
+        ("--quality-max-new-tokens", "quality_max_new_tokens", int, "Positive generation token budget per quality example."),
+        ("--quality-batch-size", "quality_batch_size", int, "Positive quality generation batch size; LM/preference rows are scored individually."),
+    ]
+    for flag, key, hint, description in fields:
+        _option(assessment, flag, "assessment." + key, hint, description)
+    for key, hint, description in (
+        ("url", str | None, "OpenAI-compatible judge API base; judging presets only."),
+        ("model", str | None, "Served judge model name; judging presets only."),
+        ("api_key", str | None, "Judge credential environment-variable name, or None for no authentication; never a literal key."),
+        ("timeout", float, "Positive timeout seconds per judge request."),
+        ("retries", int, "Nonnegative retry count for transient judge request failures."),
+        ("max_tokens", int, "Positive judge response token budget."),
+    ):
+        _option(assessment, "--quality-judge-" + key.replace("_", "-"), "assessment.judge." + key, hint, description)
+
 
 # Namespace -> explicit overrides; parser defaults are deliberately excluded.
 def overrides(args):

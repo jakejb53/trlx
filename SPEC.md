@@ -42,8 +42,8 @@ ancestors and unrelated contents. Nonempty directory replacement and split's two
 are not atomic transactions; failures identify changed destinations and any recovery paths.
 Split validates both destinations before either write and, when staging, prepares both before publication.
 Fresh training allocates a new run; checkpoint resume retains its automatic rewind behavior (§2.3).
-Training's `--no-staging` controls config snapshots, resume metric rewrites, preflight reports, and
-verification reports. Trainer checkpoints are saved directly in either mode.
+Training's `--no-staging` controls config snapshots, resume metric rewrites, assessment and quality
+evidence, preflight reports, and verification reports. Trainer checkpoints are saved directly in either mode.
 
 ### 1.2 Command feedback
 
@@ -86,9 +86,10 @@ Methods: `sft`, `dpo`, `grpo`, `kto`, `rloo`, `reward`, `distillation`. Stable T
 
 Training options use hyphenated field names; LoRA fields use `--lora-*` (`lora_alpha` becomes `--lora-alpha`). Boolean options have positive and negative forms; lists and tables use shell-quoted TOML. `--no-lora` and `--no-replay` remove those features for one run. Repeated `--reward` entries replace the reward list; distillation exposes `--teacher`. Conflicting explicit options are errors.
 
-Fresh and resumed training print a curated set of training tuning settings for the selected method
-to stdout after config validation, before model inspection, dataset loading, run allocation, or resume
-rewind. Paths, launch/display controls, reporting, checkpoint storage, and routine infrastructure
+Fresh and resumed training inspect model metadata, tokenizers, and all effective dataset rows, then
+print curated tuning settings and an advisory assessment before weight loading, run allocation, or
+resume rewind. Metadata/data downloads and library cache writes may precede confirmation.
+Paths, launch/display controls, reporting, checkpoint storage, and routine infrastructure
 settings are omitted even when explicitly configured. Each override
 uses CLI syntax with aligned description/type comments; inactive settings are omitted, automatic
 values are explained, and secrets are redacted. Forced tuning settings appear as explanatory comments.
@@ -121,6 +122,8 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 - `[rewards]`: `grpo` and `rloo`. `funcs`: list of entries, each a bare name from `trl.rewards` or trlx built-ins, `{name, args}` for factories, an HF model path, or `module:function` / `path.py:function`.
 - `[replay]`: `sft` only. `dataset`, `fraction` (replay share of the mixed train set, in (0, 1)), `kl_coef`.
 - `[verify]`: `prompts` dataset for the post-training generation check.
+- `[assessment]`: required for training and `check`; explicit runtime evidence-window and quality-check
+  settings per §2.11. Shared, method-specific, and CLI precedence applies. Missing required keys are errors.
 
 Dataset files: JSONL, JSON array, CSV, Parquet, by extension. Applies everywhere a dataset is named.
 
@@ -139,6 +142,8 @@ by `-`; leading/trailing punctuation is removed. Exact inputs remain in the snap
   metrics.jsonl    one record per log step, written by the trlx callback; the only metric source
   log.txt          complete operational and library diagnostics, with child source attribution
   preflight.json
+  assessment.json  full pre-run scan, metadata, and recommendation evidence
+  quality.jsonl    independent evaluation rounds with individual inputs, outputs, and scores
   verify.json
   checkpoint-N/    TRL checkpoint
 ```
@@ -151,8 +156,10 @@ it is reserved for snapshots. One supervisor owns the run through verification.
 `resume_from_checkpoint` selects an existing run and loads its saved snapshot, then applies explicit CLI
 overrides. Explicit CLI resume does not read the operator's config. Only the current snapshot schema is
 supported. After config and checkpoint metadata validation, resume automatically removes metrics and
-checkpoint directories beyond the saved `trainer_state.json` global_step, and clears stale preflight and
-verification reports. Records through that step remain. Logs are preserved with an appended resume marker.
+checkpoint directories and quality rounds beyond the saved `trainer_state.json` global_step, and clears
+stale assessment, preflight, and verification reports. Records through that step remain. Logs are
+preserved with an appended resume marker. Assessment settings may change on resume; quality baselines
+are reused only when dataset, tokenizer, scorer, and evaluation conditions match.
 The selected checkpoint is preserved; no `--force` is required for this rewind. Live line output starts
 at the continuation; `show` and the TUI retain access to historical metrics. Check-only execution never rewinds.
 
@@ -191,7 +198,7 @@ Fatal:
 - `grpo`/`rloo`: TRL vLLM server unreachable, or the server answering is not the TRL server.
 - `[replay]` with `kl_coef > 0` alongside `use_liger_kernel`, `packing`, or `padding_free`.
 - `save_strategy = "no"`: nothing would be left to verify or merge.
-- Resume from a different method or changed effective training settings, including CLI overrides. `resume_from_checkpoint`, `output_dir`, display/launch controls, and the GPU list are excluded; actual sharding is compared except under `trlx check`, which chooses no strategy.
+- Resume from a different method or changed effective training settings, including CLI overrides. `resume_from_checkpoint`, `output_dir`, display/launch controls, assessment settings, and the GPU list are excluded; actual sharding is compared except under `trlx check`, which chooses no strategy.
 
 Warnings:
 - Preference methods: mean per-token log-prob of chosen and rejected (`completion` for `kto`) under the starting model below the threshold in `[preflight]` (off-policy data), over the first `[preflight].rows` train rows.
@@ -235,7 +242,38 @@ Built into trlx, resolved by bare name alongside `trl.rewards`, each a factory t
 
 ### 2.10 Endpoints
 
-Only `grpo` and `rloo` policy generation requires the TRL vLLM server (per-step weight sync). Every other generation over a network (`llm_judge`, `dataset chat`, `replay-build --endpoint`) accepts any OpenAI-compatible endpoint.
+Only `grpo` and `rloo` policy generation requires the TRL vLLM server (per-step weight sync). Every other generation over a network (`llm_judge`, independent quality judging, `dataset chat`, `replay-build --endpoint`) accepts any OpenAI-compatible endpoint.
+
+### 2.11 Assessment
+
+All seven methods scan every training/evaluation row, including selected replay rows, before review.
+Findings identify measured facts, preparation projections, or heuristics, with evidence and recommendations.
+The trainer remains authoritative on prepared data; preflight checks projections against actual row counts.
+Runtime advice reads all logged metrics, accounts for warmup and required observation windows, and
+coalesces repeated findings. It never changes settings, optimizer/scheduler state, control flags, or
+checkpoint selection. Scores do not establish an optimal learning rate or universally correct reward.
+
+`[assessment]` requires `quality_checks`, `runtime_window` (at least 2 logs per comparison window),
+`runtime_min_evaluations` (at least 2), `runtime_relative_change` (finite positive heuristic sensitivity),
+`quality_preset`, `quality_dataset` (both nullable using `"None"`), `quality_max_length` (at least 2),
+`quality_max_new_tokens`, and `quality_batch_size` (both positive). `init` writes explicit defaults;
+quality checks start disabled. CLI overrides include `--quality-checks` / `--no-quality-checks`.
+
+Independent checks require a separate dataset and a built-in preset: `language_modeling`, `qa`,
+`classification`, `multiple_choice`, `json`, `preference`, `instruction_following`, or `writing`.
+Only reward training uses `preference`; the other presets assess generative models. No custom scorer
+or authored rubric is required. Judging presets require `[assessment.judge]`: explicit `url`, `model`,
+`api_key` (environment-variable name or `"None"`), positive `timeout`, nonnegative `retries`, and positive
+`max_tokens`. Judge results are model judgments. Invalid judge output is a failed check, not a zero score.
+
+When enabled, quality checks run before the first update, at ordinary evaluation events, and at completion
+even if ordinary evaluation is disabled. Every benchmark row is assessed; generation is greedy and input
+limits never silently discard examples. LM loss is token-weighted over full sequences with one-token
+window overlap. Expected scoring failures are reported without changing training control.
+Evaluation preserves per-module modes, generation-configuration ownership, and random-number state;
+distributed ranks coordinate forwards, while rank zero scores and publishes results.
+Aggregate quality metrics use `metrics.jsonl`; `quality.jsonl` retains individual and partial failure evidence.
+Reports use staged publication by default, with `--no-staging` selecting direct writing.
 
 ## 3. dataset
 

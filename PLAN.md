@@ -6,8 +6,8 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, and training output improvements complete. Optional acceleration recommendations remain planned, awaiting approval.
-Phase 8, startup settings review, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
+Current status: Phases 1-8, startup settings review, settings assessment, and training output improvements complete. Optional acceleration recommendations remain planned, awaiting approval.
+Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
 
@@ -322,8 +322,8 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
 - Fresh and resumed training show curated tuning settings for the selected trainer on stdout as CLI
   overrides with aligned description/type comments. Values include resolved defaults; automatic
   and forced settings are explained, inactive controls omitted, and credentials redacted.
-- After config validation, Enter continues and `q` cancels before model inspection, dataset loading,
-  run allocation, or resume rewind. Both display modes prompt; workers and `check` do not.
+- After config validation and the full assessment scan, Enter continues and `q` cancels before weight
+  loading, run allocation, or resume rewind. Both display modes prompt; workers and `check` do not.
   EOF or review I/O failure stops startup. Progress pauses while awaiting input; post-launch
   display failures retain existing supervision behavior.
 - Files: new `trlx/review.py` and `tests/test_review.py`; updated `trlx/options.py`, `trlx/train.py`,
@@ -352,6 +352,24 @@ Completed: tuning-only review (2026-09-20)
   ```sh
   PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest tests.test_review -q
   ```
+
+### Settings assessment (complete, 2026-09-20)
+
+- All seven trainers scan model metadata, tokenizers, and all effective train/eval/replay rows before
+  confirmation. Method-specific findings distinguish measurements, projections, and heuristics.
+- Runtime recommendations use explicit evidence windows and never change training settings or control.
+- Optional built-in quality presets cover language modeling, QA, classification, multiple choice, JSON,
+  reward preferences, instruction following, and writing; the last two use a configured judge and shipped rubrics.
+  Checks run at baseline, scheduled evaluations, and completion even when ordinary evaluation is disabled.
+- Added the approved `[assessment]` defaults to `run.toml` and `trlx init`, with CLI overrides;
+  quality checks default off. Training and `check` require the block, including older configs/snapshots.
+- `assessment.json` retains pre-run evidence, `quality.jsonl` retains sample evidence, and `metrics.jsonl`
+  holds quality aggregates. Resume trims evidence to the checkpoint and compares only matching baselines.
+- Core additions: `trlx/data_profile.py`, `trlx/assessment.py`, `trlx/quality_scorers.py`, and `trlx/quality.py`;
+  configuration, trainer callbacks, review/display, resume, tests, `SPEC.md`, and `README.md` updated.
+- Validation covered 367 tests; stale assertions were corrected and affected tests passed on rerun.
+  Synthetic CPU, single-GPU, DDP, and LoRA/FSDP checks preserved training state and the next update,
+  including FSDP generation-error cleanup. No full-scale model run or live judge endpoint was tested.
 
 ### Training output improvements (complete, 2026-09-20)
 

@@ -161,13 +161,37 @@ def write_atomic(path, text, *, no_staging=False):
             temporary.unlink(missing_ok=True)
 
 
+# Validate optional quality rounds before any rewind mutation, preserving only retained steps.
+def _quality_at_step(directory, step):
+    path = directory / show.QUALITY_FILENAME
+    if not path.exists():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise TrlxError(f"{path}: cannot read independent quality evidence before resume: {error}") from error
+    retained = []
+    for number, line in enumerate(lines, 1):
+        try:
+            item = json.loads(line)
+            value = item["quality"]["step"]
+            if type(value) is not int or value < 0:
+                raise ValueError("quality.step must be a nonnegative integer")
+        except (ValueError, KeyError, TypeError) as error:
+            raise TrlxError(f"{path}: line {number}: invalid quality evidence; repair it before resuming: {error}") from error
+        if value <= step:
+            retained.append(line + "\n")
+    return "".join(retained)
+
+
+# Rewind all step-indexed evidence together; the selected checkpoint remains untouched.
 # A checkpoint selection authorizes discarding its abandoned continuation, not its logs.
-# Validate all metric records before changing anything. Multi-file cleanup is not atomic;
-# failures name the affected path and leave the selected checkpoint available for retry.
+# Validate evidence before mutation. Multi-file cleanup is not atomic; failures name the affected path.
 def rewind(resume, *, no_staging=False):
     directory = resume.directory
     metric_path = directory / metrics.FILENAME
     records = metrics.read(metric_path) if metric_path.exists() else []
+    quality_text = _quality_at_step(directory, resume.step)
     retained = []
     for number, record in enumerate(records, 1):
         step = record["step"]
@@ -188,12 +212,15 @@ def rewind(resume, *, no_staging=False):
             else:
                 shutil.rmtree(path)
             removed.append(path.name)
-        for filename in (show.PREFLIGHT_FILENAME, show.VERIFY_FILENAME):
+        for filename in (show.PREFLIGHT_FILENAME, show.VERIFY_FILENAME, show.ASSESSMENT_FILENAME):
             path = directory / filename
             path.unlink(missing_ok=True)
         path = metric_path
         if metric_path.exists():
             write_atomic(metric_path, text, no_staging=no_staging)
+        if quality_text is not None:
+            path = directory / show.QUALITY_FILENAME
+            write_atomic(path, quality_text, no_staging=no_staging)
     except OSError as error:
         raise TrlxError(
             f"{path}: resume cleanup failed: {error}; cleanup may be partial; "
@@ -201,5 +228,5 @@ def rewind(resume, *, no_staging=False):
         ) from error
     message = (f"resume: {resume.checkpoint} at step {resume.step}; "
                f"discarded {len(records) - len(retained)} later metric records and {len(removed)} later checkpoints; "
-               "cleared preflight and verify reports")
+               "rewound quality evidence; cleared assessment, preflight, and verify reports")
     return len(retained), message

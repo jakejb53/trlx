@@ -30,8 +30,9 @@ runs one epoch by default, and saves each run in its own directory under `runs/M
 For example: `runs/sft/20260920-1--qwen-qwen3.8-27b--chunks/`. Training prints the actual
 directory at startup; use that path wherever `RUN_DIR` appears below.
 
-Before loading models or datasets, training prints relevant settings as CLI overrides with aligned
-description/type comments. Press Enter to continue or `q` to quit before any run files change.
+Training first inspects model metadata/tokenizers and scans every effective dataset row. It then prints
+tuning settings and an assessment with supporting evidence. Press Enter to load weights and continue,
+or `q` to quit before run files change. Metadata/data downloads and library cache writes can occur first.
 This review also applies to `--tui` and resume. EOF or failed review I/O stops startup with an error;
 `--force` does not skip the review. Quit and relaunch with different overrides to change settings.
 
@@ -147,8 +148,8 @@ Existing destinations still require `--force`; `--no-staging` does not grant rep
 Merge requires disk staging when replacing its base, adapter, or a directory containing either.
 For those in-place merges, omit `--no-staging`; an incompatible request is rejected before loading inputs.
 Directory replacement and publishing both split outputs are not atomic transactions.
-Training also accepts `--no-staging` for its config snapshot, resume metric rewrite, preflight reports,
-and verification report. Trainer checkpoints are saved directly in either mode.
+Training also accepts `--no-staging` for its config snapshot, resume evidence rewrites, assessment,
+quality, preflight, and verification reports. Trainer checkpoints are saved directly in either mode.
 
 ```sh
 # Replace a separate old merge directly; MERGED must not contain BASE or ADAPTER.
@@ -157,6 +158,75 @@ trlx merge --base BASE --adapter ADAPTER --out MERGED --force --no-staging
 # Replace the base model using default disk staging.
 trlx merge --base BASE --adapter ADAPTER --out BASE --force
 ```
+
+## Settings assessment and independent quality checks
+
+All seven trainers provide a full pre-run scan and runtime recommendations. Findings distinguish
+measurements, preparation projections, and heuristics, and include their evidence. They never change
+training settings, stop a run, or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
+runtime notices appear inline and in the TUI log pane. Training metrics remain in `metrics.jsonl`.
+
+Training and `check` require the following explicit block, supplied by new `trlx init` configurations.
+Add it to older configs; initialization with `--force` replaces the entire file.
+
+```toml
+[assessment]
+quality_checks = false
+runtime_window = 20
+runtime_min_evaluations = 3
+runtime_relative_change = 0.05
+quality_preset = "None"
+quality_dataset = "None"
+quality_max_length = 2048
+quality_max_new_tokens = 256
+quality_batch_size = 1
+```
+
+The runtime window counts logged observations. The relative-change threshold is heuristic sensitivity,
+not a confidence level. Override these with `--assessment-window`, `--assessment-min-evaluations`, and
+`--assessment-relative-change`. Missing metrics or insufficient observations do not establish a finding.
+
+Independent checks are optional and require a separate evaluation dataset and a built-in preset:
+
+```sh
+trlx sft --model MODEL --dataset DATA --quality-checks \
+  --quality-preset qa --quality-dataset HELDOUT
+```
+
+`HELDOUT` is a supported dataset file or Hub reference with the columns below. `prompt` accepts text
+or text messages; generative presets also accept `messages` instead. No custom scorer or rubric is needed.
+
+| Preset | Evaluation rows | Reported evidence |
+| --- | --- | --- |
+| `language_modeling` | `text`, `messages`, or `prompt` + `completion` | Full-sequence loss and token-weighted perplexity |
+| `qa` | `prompt` + `answer` string or `answers` list | Normalized exact match and whitespace-token F1 |
+| `classification` | `prompt`, `labels` list, correct `label` | Accuracy, per-class counts/results, invalid/ambiguous answers |
+| `multiple_choice` | `prompt`, `choices` mapping labels to text, correct `answer` label | Accuracy, per-class results, invalid/ambiguous answers |
+| `json` | `prompt`; optional `required_fields` list and `reference` object | JSON validity, required fields, supplied reference-value correctness |
+| `preference` | `chosen`, `rejected`; optional `prompt` | Reward-model ranking accuracy, ties, and margins; reward trainer only |
+| `instruction_following`, `writing` | `prompt` | Built-in rubric ratings and rationale from a configured judge |
+
+QA normalization uses Unicode normalization, case folding, punctuation boundaries, and whitespace.
+Classification requires a complete permitted label; multiple choice also permits label-only forms such
+as `(A)` or `Answer: A`. JSON parsing requires a complete JSON response, with no duplicate keys or
+non-finite numbers; supplied reference fields must match recursively. Extra top-level fields are allowed.
+Generation adds preset format instructions and supplied choices/labels, never the expected answer.
+These text presets do not assess image/audio content. Repetition, empty outputs, and token-limit cutoffs
+are diagnostics, not universal quality scores.
+
+Checks run at baseline, ordinary evaluation points, and completion—even with ordinary evaluation disabled.
+All evaluation rows are used. `--quality-max-length` controls input/window size; LM uses one-token-overlap
+windows, while generation/preference inputs exceeding the limit fail visibly instead of being truncated.
+`--quality-max-new-tokens` bounds greedy generation and `--quality-batch-size` controls generation batches.
+Individual observations and failed-check evidence are retained in `quality.jsonl`; aggregate metrics use
+the `quality/` prefix in `metrics.jsonl`. Scorer failures remain unavailable evidence, not zero scores.
+Resume reuses a baseline only for matching data, tokenizer semantics, scorer, and evaluation settings.
+
+Judging presets additionally require `[assessment.judge]` with explicit `url`, `model`, `api_key`,
+`timeout`, `retries`, and `max_tokens`, or their `--quality-judge-*` CLI forms. `api_key` names a credential
+environment variable; use `"None"` for an unauthenticated endpoint. Timeout must be positive, retries
+nonnegative, and the response token budget positive. Judge ratings are model judgments, not ground truth.
+Quality checks add inference/scoring work; `--no-quality-checks` disables them for one run.
 
 ## Dataset cheat sheet
 

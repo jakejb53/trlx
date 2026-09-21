@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import pathlib
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from dataset.progress import Progress
-from trlx import TrlxError, cli, launch, render_tui, run_dirs, train
+from trlx import TrlxError, cli, init_cmd, launch, render_tui, run_dirs, train
 
 
 # A process that finishes after several polls, so the real Job exercises its
@@ -74,9 +75,16 @@ class Supervisor(unittest.TestCase):
             args=types.SimpleNamespace(run_name="memory", resume_from_checkpoint=None),
             ranges={"loss": (0, 2)}, document={}, method=types.SimpleNamespace(name="sft"),
             model=types.SimpleNamespace(path="memory-model"), verify_prompts=None,
+            assessment=train.config_mod._assessment("memory.toml", dict(init_cmd.ASSESSMENT_DEFAULTS), "sft"),
         )
         self._patch("trlx.train.config_mod.resolve", side_effect=self._resolved)
         self._patch("trlx.train.config_mod.from_document", return_value=cfg)
+        self.assessment_report = {"version": 1, "method": "sft", "model": {}, "teacher": None,
+                                  "profile": {"train": {"rows": 3, "effective_rows": 3}, "eval": None},
+                                  "findings": [], "quality": None}
+        self.assess = self._patch("trlx.train._assess", return_value=self.assessment_report)
+        self.publish = self._patch("trlx.train.run_dirs.write_atomic")
+        self.weights = self._patch("trlx.train.model_mod.load_model")
         self.original_confirm = train.review.confirm
         self.confirm = self._patch("trlx.train.review.confirm", return_value=True)
         self.check_config = self._patch("trlx.train.preflight.check_config")
@@ -121,6 +129,12 @@ class Supervisor(unittest.TestCase):
     # Display failure must retain ownership through verification and reaping.
     def _assert_completed(self, expected=0):
         self.assertEqual(train.run(self.args), expected)
+        self.assess.assert_called_once_with(self.cfg, 1, progress=getattr(self.args, "progress", None))
+        self.assertIs(self.confirm.call_args.kwargs["assessment"], self.assessment_report)
+        self.publish.assert_called_once()
+        self.assertEqual(self.publish.call_args.args[0], pathlib.Path("memory-run/assessment.json"))
+        self.assertEqual(json.loads(self.publish.call_args.args[1]), self.assessment_report)
+        self.weights.assert_not_called()
         self.assertEqual(self.spawn.call_args.args[1], str(self.snapshot_path))
         self.spawn_verify.assert_called_once()
         self.assertEqual((self.worker.kills, self.verify.kills), (0, 0))
@@ -129,11 +143,11 @@ class Supervisor(unittest.TestCase):
     # Exercise real consent while other supervisor tests isolate already-started jobs.
     def _review_input(self, response):
         self.confirm.side_effect = self.original_confirm
-        self._patch("trlx.review.render", return_value="Settings applied to this run:\n")
+        self._patch("trlx.review.render", return_value="Training tuning settings:\n")
         self.enterContext(patch.object(sys, "stdin", io.StringIO(response)))
 
-    # Both UI modes and resumes must quit before model inspection or any persistent mutation.
-    def test_review_quit_precedes_model_inspection_and_run_writes(self):
+    # Metadata/data assessment precedes review, but cancellation prevents weights and run writes.
+    def test_review_quit_follows_assessment_but_precedes_weights_and_run_writes(self):
         self._review_input("q\n" * 4)
         rewind = self._patch("trlx.run_dirs.rewind")
         for tui in (False, True):
@@ -142,21 +156,26 @@ class Supervisor(unittest.TestCase):
                     self.args.tui = tui
                     self.cfg.args.resume_from_checkpoint = resume
                     self.assertEqual(train.run(self.args), 0)
-        for operation in (self.strategy, self.check_config, self.create_run, self.snapshot, self.spawn, rewind):
+        self.assertEqual(self.assess.call_count, 4)
+        self.assertTrue(all(call.kwargs["assessment"] is self.assessment_report for call in self.confirm.call_args_list))
+        for operation in (self.weights, self.strategy, self.check_config, self.create_run,
+                          self.snapshot, self.publish, self.spawn, rewind):
             operation.assert_not_called()
         self.tui.assert_not_called()
         self.assertEqual(self.stdout.getvalue().count("Press Enter to continue or q to quit:"), 4)
 
-    # Confirmation happens once and precedes strategy choice even when the TUI is requested.
-    def test_review_enter_precedes_strategy_and_tui(self):
+    # A full assessment reaches confirmation before allocation, publication, and worker/TUI startup.
+    def test_assessment_precedes_review_and_review_precedes_job(self):
         self.args.tui = True
         self._review_input("\n")
         events = Mock()
-        for name, operation in (("review", self.confirm), ("strategy", self.strategy),
-                                ("allocate", self.create_run), ("spawn", self.spawn), ("tui", self.tui)):
+        for name, operation in (("assess", self.assess), ("review", self.confirm), ("strategy", self.strategy),
+                                ("allocate", self.create_run), ("publish", self.publish),
+                                ("spawn", self.spawn), ("tui", self.tui)):
             events.attach_mock(operation, name)
         self._assert_completed()
-        self.assertEqual([call[0] for call in events.mock_calls], ["review", "strategy", "allocate", "spawn", "tui"])
+        self.assertEqual([call[0] for call in events.mock_calls],
+                         ["assess", "review", "strategy", "allocate", "publish", "spawn", "tui"])
 
     # Consent is never inferred from EOF or loss of the startup stdout stream.
     def test_review_io_failure_starts_no_job(self):
@@ -167,7 +186,27 @@ class Supervisor(unittest.TestCase):
             train.run(self.args)
         self.strategy.assert_not_called()
         self.create_run.assert_not_called()
+        self.publish.assert_not_called()
+        self.weights.assert_not_called()
         self.spawn.assert_not_called()
+
+    # Missing explicit assessment settings fail before the full scan or any job ownership.
+    def test_missing_assessment_stops_before_scan_and_job(self):
+        self.cfg.assessment = None
+        job = self._patch("trlx.train._run_job")
+        with self.assertRaisesRegex(TrlxError, r"require \[assessment\]"):
+            train.run(self.args)
+        for operation in (self.assess, self.confirm, self.weights, self.strategy,
+                          self.create_run, self.publish, self.spawn, job):
+            operation.assert_not_called()
+
+    # An unsuccessful full scan supplies no evidence to confirm or publish.
+    def test_assessment_failure_prevents_review_and_job(self):
+        self.assess.side_effect = TrlxError("cannot profile dataset")
+        with self.assertRaisesRegex(TrlxError, "cannot profile dataset"):
+            train.run(self.args)
+        for operation in (self.confirm, self.weights, self.create_run, self.publish, self.spawn):
+            operation.assert_not_called()
 
     # Runtime publication controls cross process boundaries without entering snapshots.
     def test_output_controls_reach_workers_and_verify(self):
@@ -431,6 +470,7 @@ class Supervisor(unittest.TestCase):
         self.create_run.assert_not_called()
         rewind.assert_not_called()
         self.snapshot.assert_not_called()
+        self.publish.assert_not_called()
         self.spawn.assert_not_called()
         self.assertEqual(self.log.getvalue(), b"")
 
@@ -444,22 +484,24 @@ class Supervisor(unittest.TestCase):
             train.run(self.args)
         rewind.assert_not_called()
         self.snapshot.assert_not_called()
+        self.publish.assert_not_called()
         self.spawn.assert_not_called()
         self.assertEqual(self.log.getvalue(), b"old history\n")
 
-    # Workers cannot append progress until cleanup and the replacement snapshot finish.
-    def test_resume_cleanup_precedes_snapshot_and_worker_spawn(self):
+    # Reviewed evidence is published only after consent, rewind, and snapshot replacement.
+    def test_resume_consent_and_cleanup_precede_assessment_publication_and_workers(self):
         self.cfg.args.resume_from_checkpoint = "memory-run/checkpoint-20"
         resume = run_dirs.Resume(pathlib.Path(self.cfg.args.resume_from_checkpoint), 20)
         inspect = self._patch("trlx.run_dirs.inspect_checkpoint", return_value=resume)
         rewind = self._patch("trlx.run_dirs.rewind", return_value=(0, "resume marker"))
         calls = Mock()
-        for name, mocked in (("inspect", inspect), ("rewind", rewind),
-                             ("snapshot", self.snapshot), ("spawn", self.spawn)):
+        for name, mocked in (("assess", self.assess), ("review", self.confirm),
+                             ("inspect", inspect), ("rewind", rewind),
+                             ("snapshot", self.snapshot), ("publish", self.publish), ("spawn", self.spawn)):
             calls.attach_mock(mocked, name)
         self._assert_completed()
         self.assertEqual([call[0] for call in calls.mock_calls],
-                         ["inspect", "rewind", "snapshot", "spawn"])
+                         ["assess", "review", "inspect", "rewind", "snapshot", "publish", "spawn"])
         rewind.assert_called_once_with(resume, no_staging=False)
         self.assertIn(b"resume marker", self.log.getvalue())
 

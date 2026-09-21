@@ -92,6 +92,17 @@ class Stream:
 
     # Render the already-evaluated cells without replaying or modifying history.
     def record(self, record, row):
+        if "quality" in record:
+            context = record["quality"]
+            self.emit(f"Independent quality: {context['phase']}, step {record['step']}, {context['preset']}")
+            for name, value in record["log"].items():
+                if name.startswith("quality/metric_rows/"):
+                    continue
+                count = record["log"].get("quality/metric_rows/" + name.removeprefix("quality/"))
+                suffix = f" ({count} rows)" if count is not None else ""
+                self.emit(f"  {name.removeprefix('quality/')}: {value}{suffix}")
+            self.interrupt()
+            return
         if "train_runtime" in record["log"]:
             self.emit("Training summary:")
             for name, value in record["log"].items():

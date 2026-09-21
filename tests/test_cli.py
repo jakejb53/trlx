@@ -135,20 +135,24 @@ class Interface(unittest.TestCase):
         self.assertEqual(args._strategy, "fsdp")
         self.assertEqual(options.overrides(args), {})
 
-    # Actual parsing, config defaults, rendering, and input precede every expensive boundary.
+    # After the full scan, actual parsing/rendering and q still precede weights and run writes.
     def test_quit_from_real_review_loads_no_model_or_run(self):
+        from trlx.init_cmd import ASSESSMENT_DEFAULTS
+
         document = {
             "output_dir": "runs/untouched", "bf16": False,
             "model": {"path": "unloaded-model", "dtype": "float32"},
             "dataset": {"split": False, "dataset_train": "unread.jsonl"},
             "ranges": {"loss": [0, 5]},
+            "assessment": dict(ASSESSMENT_DEFAULTS),
         }
+        report = {"profile": {"train": {"rows": 3}, "eval": None}, "findings": [], "quality": None}
         for mode in ("--tui", "--no-tui"):
             with self.subTest(mode=mode), patch.object(cli, "load_env"), \
                  patch.dict(train.os.environ), patch.object(config, "_read_toml", return_value=document), \
                  patch.object(train.launch, "select_gpus", return_value=([0], 1)), \
                  patch.object(train.launch, "physical_ids", return_value=["synthetic-device"]), \
-                 patch.object(model, "load_config", side_effect=AssertionError("inspected model")), \
+                 patch.object(train, "_assess", return_value=report) as assess, \
                  patch.object(model, "load_model", side_effect=AssertionError("loaded model")), \
                  patch.object(train.data_load, "load", side_effect=AssertionError("loaded dataset")), \
                  patch.object(train, "_create_run_dir", side_effect=AssertionError("allocated run")), \
@@ -156,7 +160,8 @@ class Interface(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()) as stdout, \
                  contextlib.redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(cli.main(["sft", "--use-cpu", mode]), 0)
-            self.assertIn("Settings applied to this run:", stdout.getvalue())
+            assess.assert_called_once()
+            self.assertIn("Training tuning settings:", stdout.getvalue())
             self.assertIn("--learning-rate 2e-05", stdout.getvalue())
             self.assertIn("Press Enter to continue or q to quit:", stdout.getvalue())
             self.assertIn("cancelled", stderr.getvalue())

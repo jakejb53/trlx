@@ -1,8 +1,9 @@
-"""Review relevant, overridable settings before training can load or publish anything."""
+"""Review tuning settings and full-scan evidence before weights load or run files change."""
 
 import contextlib
 import dataclasses
 import enum
+import json
 import re
 import shlex
 import shutil
@@ -325,7 +326,7 @@ def render(cfg, *, width=None):
     rows = []
     # Only forced tuning controls belong here; launch/display policy is omitted.
     forced = {}
-    if cfg.method.name == "sft" and cfg.args.packing and cfg.args.packing_strategy == "bfd":
+    if cfg.method.name == "sft" and cfg.args.packing and cfg.args.packing_strategy in {"bfd", "bfd_split"}:
         forced["padding_free"] = True
     if cfg.replay is not None and cfg.replay.kl_coef > 0:
         forced.update(config.REPLAY_KL_FORCED)
@@ -351,7 +352,8 @@ def render(cfg, *, width=None):
     if cfg.peft is None:
         rows.append(("--no-lora", "Full fine-tuning; LoRA is disabled. Type: bool."))
     for key, value in forced.items():
-        rows.append(("", f"{key} = {value!r}; set by trlx and cannot be overridden for this run."))
+        source = "TRL packing" if key == "padding_free" else "trlx"
+        rows.append(("", f"{key} = {value!r}; set by {source} and cannot be overridden for this run."))
 
     column = max((len(argument) for argument, _ in rows), default=0) + 3
     terminal_width = width if width is not None else shutil.get_terminal_size().columns
@@ -366,15 +368,52 @@ def render(cfg, *, width=None):
     return "\n".join(lines) + "\n"
 
 
+# Large row-index lists remain in the report; terminal previews state their full size.
+def _evidence_preview(value):
+    if isinstance(value, dict):
+        return {key: _evidence_preview(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        preview = [_evidence_preview(item) for item in value[:5]]
+        return {"count": len(value), "first": preview} if len(value) > 5 else preview
+    return value
+
+
+# Each notice carries its basis and evidence, without turning a heuristic into a verdict.
+def format_finding(finding):
+    text = f"assessment [{finding['basis']}]: {finding['summary']}"
+    if finding.get("evidence"):
+        text += "\n  Evidence: " + json.dumps(_evidence_preview(finding["evidence"]), ensure_ascii=False)
+    if finding.get("recommendation"):
+        text += "\n  Recommendation: " + finding["recommendation"]
+    return text
+
+
+# Pre-run advice supplements the tuning list; full row evidence is published after confirmation.
+def render_assessment(report, *, will_publish=True):
+    profile = report["profile"]
+    train, evaluation = profile["train"], profile.get("eval")
+    lines = ["", "Settings assessment:",
+             f"  Full scan: {train['rows']} training rows; {evaluation['rows'] if evaluation else 0} evaluation rows."]
+    lines.extend(format_finding(finding) for finding in report["findings"])
+    quality = report.get("quality")
+    if quality is not None:
+        lines.append(f"  Independent quality checks: {quality['preset']}, {quality['rows']} rows; "
+                     "baseline, scheduled evaluations, and completion (including when evaluation is disabled).")
+    lines.append("  Advisory only." + (" Complete evidence will be saved in assessment.json after confirmation." if will_publish else ""))
+    return "\n".join(lines) + "\n"
+
+
 # No durable run state exists yet. Missing consent or failed review I/O must stop
 # startup, unlike a display failure after workers are already owned by the supervisor.
-def confirm(cfg, *, progress=None):
+def confirm(cfg, *, progress=None, assessment=None):
     suspended = progress.suspended() if progress is not None else contextlib.nullcontext()
     with suspended:
         try:
             if sys.stdout is None or sys.stdin is None:
                 raise TrlxError("settings review requires readable stdin and writable stdout; training was not started")
             sys.stdout.write(render(cfg))
+            if assessment is not None:
+                sys.stdout.write(render_assessment(assessment))
             while True:
                 sys.stdout.write("\nPress Enter to continue or q to quit: ")
                 sys.stdout.flush()

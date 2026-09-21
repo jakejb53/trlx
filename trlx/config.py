@@ -120,6 +120,21 @@ class ReplaySpec:
     kl_coef: float
 
 
+# Assessment controls are explicit operational settings; None below denotes an absent optional input.
+@dataclasses.dataclass(frozen=True)
+class AssessmentSpec:
+    quality_checks: bool
+    runtime_window: int
+    runtime_min_evaluations: int
+    runtime_relative_change: float
+    quality_preset: str | None
+    quality_dataset: DatasetRef | None
+    quality_max_length: int
+    quality_max_new_tokens: int
+    quality_batch_size: int
+    judge: dict | None
+
+
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     method: trainers.Method
@@ -139,6 +154,8 @@ class RunConfig:
     # Selected method plus explicit CLI overrides, before launch-only fields.
     # Workers, resume comparison, and the run snapshot share these inputs.
     document: dict
+    # Library-only config inspection can omit the block; training/check enforce it before startup work.
+    assessment: AssessmentSpec | None = None
 
 
 # Loads and validates a run config for `method_name`. `fsdp` is the value for
@@ -197,6 +214,7 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
         replay=replay,
         verify_prompts=_verify(path, blocks["verify"]) if "verify" in blocks else None,
         document=doc,
+        assessment=_assessment(path, blocks["assessment"], method_name) if "assessment" in blocks else None,
     )
 
 
@@ -522,7 +540,10 @@ def _typed(path, where, table, key, kind):
     value = table[key]
     bool_where_not_wanted = isinstance(value, bool) and kind is not bool
     if bool_where_not_wanted or not isinstance(value, kind):
-        want = "a number" if isinstance(kind, tuple) else kind.__name__
+        if isinstance(kind, tuple):
+            want = "a number" if kind == (int, float) else " or ".join(item.__name__ for item in kind)
+        else:
+            want = kind.__name__
         raise TrlxError(f"{path}: {where}.{key} must be {want}, got {type(value).__name__}")
     return value
 
@@ -661,3 +682,92 @@ def _verify(path, table):
     if "prompts" not in table:
         return None
     return dataset_ref(path, "[verify].prompts", table["prompts"])
+
+
+# Inspection can represent a missing block, but executable training/check paths cannot invent defaults.
+def require_assessment(cfg, path):
+    if cfg.assessment is None:
+        raise TrlxError(f"{path}: training and check require [assessment]; add its explicit settings. "
+                        "Use trlx init --out <unused-path> to generate an example without replacing this file")
+    return cfg.assessment
+
+
+# Nullable wrapper strings use the same visible 'None' spelling as trainer overrides.
+def _assessment_string(path, where, table, key):
+    value = _require(path, where, table, key, (str, type(None)))
+    return None if value in (None, "None") else value
+
+
+# Every operational assessment setting is required explicitly, even while independent checks are disabled.
+def _assessment(path, table, method):
+    import math
+    from trlx.quality_scorers import PRESETS
+
+    where = "[assessment]"
+    _check_keys(path, where, table, {field.name for field in dataclasses.fields(AssessmentSpec)})
+    values = {"quality_checks": _require(path, where, table, "quality_checks", bool)}
+    minimums = {"runtime_window": 2, "runtime_min_evaluations": 2, "quality_max_length": 2,
+                "quality_max_new_tokens": 1, "quality_batch_size": 1}
+    for key, minimum in minimums.items():
+        value = _require(path, where, table, key, int)
+        if value < minimum:
+            raise TrlxError(f"{path}: {where}.{key} must be at least {minimum}")
+        values[key] = value
+    change = _require(path, where, table, "runtime_relative_change", (int, float))
+    if not math.isfinite(change) or change <= 0:
+        raise TrlxError(f"{path}: {where}.runtime_relative_change must be finite and positive")
+    values["runtime_relative_change"] = float(change)
+    preset = _assessment_string(path, where, table, "quality_preset")
+    if preset is not None and preset not in PRESETS:
+        raise TrlxError(f"{path}: {where}.quality_preset must be None or one of {', '.join(PRESETS)}")
+    source = _assessment_string(path, where, table, "quality_dataset")
+    values["quality_preset"] = preset
+    values["quality_dataset"] = dataset_ref(path, where + ".quality_dataset", source) if source is not None else None
+    values["judge"] = _assessment_judge(path, table["judge"]) if "judge" in table else None
+    if values["quality_checks"]:
+        if preset is None or source is None:
+            raise TrlxError(f"{path}: {where}.quality_checks requires quality_preset and quality_dataset")
+        if (method == "reward") != (preset == "preference"):
+            raise TrlxError(f"{path}: the reward trainer requires the preference quality preset; "
+                            "generative trainers require a generative or language_modeling preset")
+        if preset in {"instruction_following", "writing"}:
+            judge = values["judge"]
+            if judge is None or not judge["url"] or not judge["model"]:
+                raise TrlxError(f"{path}: {preset} quality checks require [assessment.judge] with an endpoint URL and model")
+            # Validate connection/credential input without contacting the service or running a judge.
+            import os
+            from dataset.endpoint import Endpoint
+            from dataset.io import DatasetError
+
+            name = judge["api_key"]
+            key = os.environ.get(name) if name is not None else None
+            if name is not None and not key:
+                raise TrlxError(f"{path}: [assessment.judge].api_key: environment variable {name} is not set")
+            try:
+                Endpoint(judge["url"], judge["model"], key, judge["timeout"], judge["retries"])
+            except DatasetError as error:
+                raise TrlxError(f"{path}: [assessment.judge]: {error}") from error
+    return AssessmentSpec(**values)
+
+
+# Judge connection values are operator inputs; built-in rubric definitions live with the scorers.
+def _assessment_judge(path, table):
+    import math
+
+    where = "[assessment.judge]"
+    if not isinstance(table, dict):
+        raise TrlxError(f"{path}: {where} must be a table")
+    _check_keys(path, where, table, {"url", "model", "api_key", "timeout", "retries", "max_tokens"})
+    values = {key: _assessment_string(path, where, table, key) for key in ("url", "model", "api_key")}
+    if values["api_key"] is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", values["api_key"]) is None:
+        raise TrlxError(f"{path}: {where}.api_key must name an environment variable, never contain a credential")
+    timeout = _require(path, where, table, "timeout", (int, float))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise TrlxError(f"{path}: {where}.timeout must be finite positive seconds")
+    values["timeout"] = float(timeout)
+    for key, minimum in (("retries", 0), ("max_tokens", 1)):
+        value = _require(path, where, table, key, int)
+        if value < minimum:
+            raise TrlxError(f"{path}: {where}.{key} must be at least {minimum}")
+        values[key] = value
+    return values

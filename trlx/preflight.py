@@ -145,6 +145,7 @@ def _check_resume(cfg, config_path, strategy):
 # human-readable lines; empty means the same run. Set aside before comparing:
 # `resume_from_checkpoint` on both sides (the operator must set it to resume
 # at all), `output_dir` (the checkpoint selects the actual run), `[run]` controls,
+# and `[assessment]` (observational only; quality series track changed criteria),
 # the snapshot's `[launch]` table (compared on
 # sharding: an FSDP checkpoint and an unsharded one differ in format, while
 # single and ddp are both unsharded and a different GPU set resumes fine),
@@ -160,6 +161,8 @@ def compare_snapshot(current, snapshot, strategy):
     snapshot.pop("output_dir", None)
     current.pop("run", None)
     snapshot.pop("run", None)
+    current.pop("assessment", None)
+    snapshot.pop("assessment", None)
     launch = snapshot.pop("launch", None) or {}
     if current.get("run_name") in (None, "None"):
         current.pop("run_name", None)
@@ -226,7 +229,7 @@ def _check_vllm(cfg, *, progress=None):
 
 # Checks on the built trainer, before training. Fatal ones raise; the rest
 # go to `report`.
-def check_trainer(cfg, trainer, train_set, report, *, progress=None):
+def check_trainer(cfg, trainer, train_set, report, *, progress=None, profile=None):
     model = trainer.model
     tokenizer = _tokenizer(trainer.processing_class)
     with stage(progress, "checking trainable parameters and LoRA targets"):
@@ -234,7 +237,12 @@ def check_trainer(cfg, trainer, train_set, report, *, progress=None):
     with stage(progress, "checking tokenizer and model cache settings"):
         _check_pad_token(tokenizer, report)
         _check_use_cache(cfg, model, report)
-    _check_truncation(cfg, train_set, tokenizer, report, progress=progress)
+    projected = _check_truncation(cfg, train_set, trainer.processing_class, report, progress=progress, profile=profile)
+    actual_rows = trainer.train_dataset.num_rows
+    report.facts["assessment_validation"] = {"projected_rows": projected["effective_rows"], "prepared_rows": actual_rows}
+    if projected["effective_rows"] is not None and actual_rows != projected["effective_rows"]:
+        report.warn(f"assessment projected {projected['effective_rows']} prepared rows; the trainer prepared {actual_rows}. "
+                    "Use the trainer count; projected update/token estimates need review")
     with stage(progress, "checking prepared training example"):
         _check_example(cfg, trainer, tokenizer, report)
 
@@ -303,99 +311,32 @@ def _check_use_cache(cfg, model, report):
         report.warn("gradient_checkpointing with use_cache = true; the cache is wasted work under checkpointing")
 
 
-# Rows longer than max_length, measured on the raw rows (`train_set`)
-# because the trainer has already truncated its own copy, and what the
-# trainer does to them: sft, dpo, and kto keep the first max_length tokens
-# (`truncation_mode = "keep_start"`, cutting the response, which is the tail
-# of every row shape) or the last (`"keep_end"`, cutting the prompt); sft
-# with packing does not truncate; reward drops the row. sft rows are
-# rendered as TRL renders them (chat template for conversational rows, the
-# text plus EOS otherwise); preference and unpaired rows as prompt and
-# response tokenized separately then joined. Prompt-only methods have no
-# response to cut; `text` rows have no response either and are counted as
-# over-length only.
-def _check_truncation(cfg, train_set, tokenizer, report, *, progress=None):
-    max_length = getattr(cfg.args, "max_length", None)
-    if max_length is None:
-        return
-    if cfg.method.name == "sft" and getattr(cfg.args, "packing", False):
-        report.note("packing = true: rows are not truncated to max_length")
-        return
-    if cfg.method.name == "sft":
-        over = cut = 0
-        with stage(progress, "checking training row truncation", total=train_set.num_rows, unit="rows") as activity:
-            for row in train_set:
-                length, has_response = _sft_length(row, tokenizer)
-                if length > max_length:
-                    over += 1
-                    cut += has_response
-                activity.advance()
-    elif cfg.method.dataset_format in ("preference", "unpaired preference"):
-        over = 0
-        with stage(progress, "checking training row truncation", total=train_set.num_rows, unit="rows") as activity:
-            for row in train_set:
-                if any(len(p) + len(r) > max_length for p, r in _response_pairs(row, tokenizer)):
-                    over += 1
-                activity.advance()
-        cut = over
-    else:
-        return
-    rows = train_set.num_rows
-    facts = {"rows": rows, "over_max_length": over, "response_cut": cut}
-    report.facts["truncation"] = facts
-    if not over:
-        report.note(f"no row is longer than max_length = {max_length} ({rows} rows)")
-    elif cfg.method.name == "reward":
-        report.warn(f"{over} of {rows} rows are longer than max_length = {max_length} and are dropped by the trainer")
-    elif getattr(cfg.args, "truncation_mode", "keep_start") == "keep_end":
-        report.warn(f"{over} of {rows} rows are longer than max_length = {max_length}; their prompt is cut from the start")
-    elif cut:
-        report.warn(f"{cut} of {rows} rows have their response cut by max_length = {max_length}")
-    else:
-        report.warn(f"{over} of {rows} rows are longer than max_length = {max_length}")
+# Reuse the full-scan preparation contract; packing, filtering, and token boundaries are method-specific.
+def _check_truncation(cfg, train_set, processor, report, *, progress=None, profile=None):
+    from trlx import data_profile
 
-
-# Token length of one sft row before truncation and whether it has a
-# response (an assistant turn or a completion) that truncation would cut.
-# Non-conversational rows get the EOS TRL appends before tokenizing.
-def _sft_length(row, tokenizer):
-    from trl.data_utils import is_conversational
-
-    if "messages" in row:
-        if is_conversational(row):
-            text = tokenizer.apply_chat_template(row["messages"], tokenize=False)
-            return len(tokenizer(text, add_special_tokens=False)["input_ids"]), True
-        return 0, False
-    if "prompt" in row:
-        example = {"prompt": row["prompt"], "completion": row["completion"]}
-        if is_conversational(example):
-            text = tokenizer.apply_chat_template(example["prompt"] + example["completion"], tokenize=False)
-            return len(tokenizer(text, add_special_tokens=False)["input_ids"]), True
-        return len(tokenizer(_with_eos(example["prompt"] + example["completion"], tokenizer))["input_ids"]), True
-    return len(tokenizer(_with_eos(row["text"], tokenizer))["input_ids"]), False
-
-
-# TRL's add_eos: the EOS token appended unless the text already ends in it.
-def _with_eos(text, tokenizer):
-    eos = tokenizer.eos_token or ""
-    return text if text.endswith(eos) else text + eos
-
-
-# (prompt_ids, response_ids) per response in a preference or unpaired row,
-# rendered through the tokenizer's chat template when conversational. Special
-# tokens are not added: a templated string already carries them, and TRL's
-# own tokenization for these methods does the same.
-def _response_pairs(row, tokenizer):
-    from trl.data_utils import maybe_apply_chat_template
-
-    if "completion" in row:
-        keys, responses = ("prompt", "completion"), ("completion",)
-    else:
-        keys, responses = ("prompt", "chosen", "rejected"), ("chosen", "rejected")
-    example = {k: row[k] for k in keys if k in row}
-    rendered = maybe_apply_chat_template(example, tokenizer)
-    prompt_ids = tokenizer(rendered.get("prompt", ""), add_special_tokens=False)["input_ids"]
-    return [(prompt_ids, tokenizer(rendered[r], add_special_tokens=False)["input_ids"]) for r in responses]
+    replay = getattr(cfg, "replay", None)
+    excluded = ("replay",) if replay is not None and replay.kl_coef > 0 else ()
+    try:
+        identity = data_profile.fingerprint(train_set, exclude_columns=excluded)
+    except ValueError as error:
+        identity = None
+        report.warn(f"assessment source identity could not be verified: {error}")
+    if profile is None or identity is None or profile["train"]["fingerprint"] != identity:
+        report.note("profiling current worker inputs; no matching pre-run source fingerprint is available")
+        profile = data_profile.scan(cfg, processor, train_set, None, progress=progress)
+    measured = profile["train"]
+    report.facts["dataset_profile"] = measured
+    if measured["errors"]:
+        report.warn(f"dataset preparation assessment has {len(measured['errors'])} unresolved rows; "
+                    "see dataset_profile.errors in preflight.json")
+    for key, action in (("truncated_rows", "truncated"), ("dropped_rows", "dropped"), ("zero_loss_rows", "left without loss-bearing tokens")):
+        rows = measured[key]
+        if rows:
+            report.warn(f"assessment projects {len(rows)} of {measured['rows']} input rows {action} by {cfg.method.name} preparation")
+    report.note(f"dataset preparation projection: {measured['effective_rows']} rows; "
+                f"{measured['loss_tokens']} loss-bearing tokens (None means not established)")
+    return measured
 
 
 # First train row as the trainer prepared it, with its label mask: TRL
@@ -436,12 +377,13 @@ def _check_example(cfg, trainer, tokenizer, report):
 # which is what off-policy data looks like. Runs on every rank (see module
 # docstring); the model is put in eval mode for the forwards and restored.
 def check_offpolicy(cfg, model, processor, train_set, report, *, progress=None):
+    from trlx import data_profile
+
     if "preflight" not in cfg.method.blocks:
         return
     if cfg.preflight is None:
         report.note("off-policy check skipped: no [preflight] block")
         return
-    tokenizer = _tokenizer(processor)
     threshold = cfg.preflight.offpolicy_logp_per_token
     count = min(cfg.preflight.rows, train_set.num_rows)
     max_length = getattr(cfg.args, "max_length", None)
@@ -452,7 +394,8 @@ def check_offpolicy(cfg, model, processor, train_set, report, *, progress=None):
     try:
         with stage(progress, "checking off-policy responses", total=count, unit="rows") as activity, torch.no_grad():
             for row in train_set.select(range(count)):
-                pairs = _response_pairs(row, tokenizer)
+                # Use the same concatenated tokenization and prefix slicing as training and the full scan.
+                pairs = data_profile.response_pairs(processor, row, cfg.method.name)
                 names = ("completion",) if len(pairs) == 1 else ("chosen", "rejected")
                 for name, (prompt_ids, response_ids) in zip(names, pairs):
                     value = _mean_logp(model, prompt_ids, response_ids, max_length, keep_end)
