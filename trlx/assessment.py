@@ -135,69 +135,12 @@ def _batch_budget(cfg, profile, gpu_count):
     return findings
 
 
-# Final conclusions consume the same durable observations and rules as live advice.
-# No extra model evaluation, relaxed evidence window, or training mutation occurs here.
-def final_assessment(method, records, args, settings, *, completed_steps, planned_steps, ranges=None):
+# Evaluation and completion share one assessment of all durable observations.
+def run_assessment(method, records, args, *, completed_steps, planned_steps, ranges=None):
     warmup = args.get_warmup_steps(planned_steps)
-    findings = runtime_findings(method, records, window=settings.runtime_window,
-                                min_evaluations=settings.runtime_min_evaluations,
-                                relative_change=settings.runtime_relative_change,
-                                warmup_steps=warmup, ranges=ranges)
+    findings = runtime_findings(method, records, warmup_steps=warmup, ranges=ranges)
     training = [r for r in records if not r.get("eval") and not r.get("quality")]
     evaluation = [r for r in records if r.get("eval") and not r.get("quality")]
-    points = _series(training, "loss", warmup)
-    trend = _trend(points, settings.runtime_window, settings.runtime_relative_change)
-    fixed_objective = method in {"sft", "dpo", "kto", "reward"}
-    if trend is None:
-        findings.append(_finding("final_training_coverage", "warning", "measured",
-                                 "Training-loss trend could not be assessed with the configured evidence window.",
-                                 {"usable_loss_observations": len(points), "required_observations": 2 * settings.runtime_window,
-                                  "warmup_updates": warmup},
-                                 "For future runs, review --assessment-window and --logging-steps against the planned duration; shorter windows give noisier evidence."))
-    elif fixed_objective and trend["direction"] == "down":
-        findings.append(_finding("final_training_progress", "info", "heuristic",
-                                 "Training loss decreased consistently across the two most recent comparison windows.",
-                                 {"loss": trend},
-                                 "Use held-out results to judge whether improved fitting of training data generalizes."))
-    elif fixed_objective and trend["direction"] == "mixed" and not any(f["code"] == "little_loss_change" for f in findings):
-        findings.append(_finding("final_training_progress", "info", "heuristic",
-                                 "Training loss fluctuated without a consistent increase or decrease across the comparison windows.",
-                                 {"loss": trend},
-                                 "Review batch composition and held-out results before changing learning rate or duration."))
-    if not fixed_objective:
-        findings.append(_finding("final_objective_limits", "info", "measured",
-                                 "This method trains on generated responses; its training loss alone cannot establish model improvement.", {},
-                                 "Interpret reward, KL, clipping, and any available held-out or independent quality results together."))
-
-    eval_points = _series(evaluation, "eval_loss", warmup)
-    if not evaluation:
-        findings.append(_finding("final_evaluation_missing", "warning", "measured",
-                                 "No ordinary evaluation metrics were recorded.", {},
-                                 "Review --eval-strategy and the held-out dataset configuration for future runs."))
-    elif fixed_objective and len(eval_points) < settings.runtime_min_evaluations:
-        findings.append(_finding("final_evaluation_coverage", "warning", "measured",
-                                 "Held-out loss trend could not be assessed with the configured evidence requirement.",
-                                 {"usable_evaluations": len(eval_points), "required_evaluations": settings.runtime_min_evaluations,
-                                  "warmup_updates": warmup},
-                                 "Evaluate more frequently with --eval-strategy and --eval-steps when a trend is needed; review --assessment-min-evaluations. A single final evaluation cannot establish improvement."))
-    elif fixed_objective:
-        selected = eval_points[-settings.runtime_min_evaluations:]
-        first, last = selected[0][1], selected[-1][1]
-        relative = (last - first) / abs(first) if first else None
-        improving = all(b[1] < a[1] for a, b in zip(selected, selected[1:]))
-        if improving and relative is not None and -relative >= settings.runtime_relative_change:
-            findings.append(_finding("final_evaluation_progress", "info", "heuristic",
-                                     "Held-out loss decreased consistently across the most recent evaluations.",
-                                     {"eval_loss": _observations(selected), "relative_change": relative,
-                                      "relative_change_threshold": settings.runtime_relative_change},
-                                     "This supports improvement on the evaluated objective during this run; it does not establish general task quality or improvement over an unmeasured base model."))
-        elif not any(f["code"] in {"possible_overfitting", "worsening_evaluation"} for f in findings):
-            findings.append(_finding("final_evaluation_progress", "info", "heuristic",
-                                     "Held-out loss shows no sustained change meeting the configured sensitivity.",
-                                     {"eval_loss": _observations(selected), "relative_change": relative,
-                                      "relative_change_threshold": settings.runtime_relative_change},
-                                     "Review held-out examples before deciding that more training or different settings would help."))
-
     invalid = [{"step": r.get("step"), "metric": key, "value": str(value)}
                for r in records for key, value in r.get("log", {}).items()
                if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value)]
@@ -215,65 +158,6 @@ def final_assessment(method, records, args, settings, *, completed_steps, planne
             "train_loss": final_train, "evaluation_records": len(evaluation), "evaluation_metrics": eval_values,
             "evaluation_step": latest_eval["step"] if latest_eval else None,
             "metric_records": len(records), "nonfinite_observations": len(invalid), "findings": findings}
-
-
-# Count scheduled observations after warmup without treating projections as trainer facts.
-def _scheduled_observations(args, kind, steps, warmup, updates_per_epoch):
-    strategy = getattr(args, f"{kind}_strategy", None)
-    strategy = getattr(strategy, "value", strategy)
-    delay = getattr(args, "eval_delay", None) if kind == "eval" else 0
-    if strategy == "no" or steps <= 0:
-        return 0
-    if delay is None:
-        return None  # Missing schedule metadata cannot establish an observation count.
-    if strategy == "steps":
-        interval = getattr(args, f"{kind}_steps", None)
-        if not _finite(interval) or interval <= 0:
-            return None
-        interval = math.ceil(interval * steps) if interval < 1 else math.ceil(interval)
-        lower = max(warmup, math.ceil(delay) - 1)
-        count = max(0, steps // interval - lower // interval)
-        if kind == "logging" and getattr(args, "logging_first_step", False) and warmup < 1 <= steps and interval != 1:
-            count += 1
-        return count
-    if strategy == "epoch" and updates_per_epoch:
-        first_epoch = max(warmup // updates_per_epoch + 1, math.ceil(delay), 1)
-        count = max(0, steps // updates_per_epoch - first_epoch + 1)
-        # Trainer emits an epoch-end event for a final partial epoch too. Its
-        # position is a projection, subject to the same dataloader uncertainty.
-        if steps % updates_per_epoch and steps > warmup and steps / updates_per_epoch >= delay:
-            count += 1
-        return count
-    return None
-
-
-# Warn about impossible evidence budgets; unknown or resumed schedules need actual records.
-def _coverage_findings(cfg, profile, budget):
-    settings = getattr(cfg, "assessment", None)
-    if settings is None or budget is None or getattr(cfg.args, "resume_from_checkpoint", None):
-        return []
-    steps, warmup = budget["updates"], budget["warmup_updates"]
-    findings = []
-    observations = _scheduled_observations(cfg.args, "logging", steps, warmup, budget["updates_per_epoch"])
-    required = 2 * settings.runtime_window
-    if observations is not None and observations < required:
-        findings.append(_finding("assessment_training_coverage", "warning", "projected",
-                                 f"Training-trend assessment needs {required} observations; this run is projected to produce {observations} after warmup.",
-                                 {"projected_observations": observations, "required_observations": required,
-                                  "runtime_window": settings.runtime_window, "warmup_updates": warmup,
-                                  "limitation": budget["limitation"]},
-                                 "Reduce --assessment-window or log more frequently with --logging-steps if trend assessment is needed for this run; shorter windows give noisier evidence."))
-    # Ordinary eval-loss trends exist only for fixed-data objectives. Quality
-    # benchmarks have their own matching-series rules and are not required here.
-    if cfg.method.name in {"sft", "dpo", "kto", "reward"} and profile.get("eval") and cfg.args.eval_strategy != "no":
-        evaluations = _scheduled_observations(cfg.args, "eval", steps, warmup, budget["updates_per_epoch"])
-        if evaluations is not None and evaluations < settings.runtime_min_evaluations:
-            findings.append(_finding("assessment_evaluation_coverage", "warning", "projected",
-                                     f"Evaluation-trend assessment needs {settings.runtime_min_evaluations} evaluations; this run is projected to perform {evaluations} after warmup.",
-                                     {"projected_evaluations": evaluations, "required_evaluations": settings.runtime_min_evaluations,
-                                      "warmup_updates": warmup, "limitation": budget["limitation"]},
-                                     "Evaluate more frequently with --eval-strategy and --eval-steps if a held-out trend is needed; review --assessment-min-evaluations without treating a single evaluation as a trend."))
-    return findings
 
 
 # Report method-specific contracts of the installed trainers, not universal tuning targets.
@@ -348,8 +232,6 @@ def static_findings(cfg, profile, gpu_count, *, model_metadata=None, teacher_met
         raise ValueError("assessment gpu_count must be a positive data-parallel worker count")
     findings = copy.deepcopy(profile.get("findings", []))
     findings.extend(_batch_budget(cfg, profile, gpu_count))
-    budget = next((item["evidence"] for item in findings if item["code"] == "training_budget"), None)
-    findings.extend(_coverage_findings(cfg, profile, budget))
     findings.extend(_objective(cfg, profile))
     args = cfg.args
     sources = profile["train"].get("sources")
@@ -415,18 +297,16 @@ def static_findings(cfg, profile, gpu_count, *, model_metadata=None, teacher_met
 
 
 # Read the authoritative nested metrics payload; no [ranges] selection limits analysis.
-def _series(records, key, warmup_steps=0):
+def _series(records, key):
     points = {}
     for record in records:
         step = record.get("step")
         value = record.get("log", {}).get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value):
-            # Recovery starts a new observation interval; do not bridge a numerical
-            # failure with earlier values or count repeated logs as extra updates.
-            points.clear()
-        if _finite(step) and step > warmup_steps and _finite(value):
+        # Invalid values are reported separately, not grounds to erase earlier
+        # history. Repeated logs at one optimizer step are not new observations.
+        if _finite(step) and _finite(value):
             points[step] = (step, value, record.get("time"))
-    return list(points.values())
+    return [points[step] for step in sorted(points)]
 
 
 # Persist raw observations as well as summaries so a recommendation can be audited.
@@ -437,28 +317,50 @@ def _observations(points):
             "median": statistics.median(p[1] for p in points)}
 
 
-# Two non-overlapping windows avoid comparing overlapping moving averages.
-def _trend(points, window, relative_change):
-    if len(points) < 2 * window:
+# Weighted least squares separates drift from observed scatter. Recency weights
+# decay over the recorded step span: the oldest point retains 1/16 the newest's
+# weight. This is a descriptive heuristic, never a statistical confidence claim.
+def _fit(points, *, recent=False):
+    if len(points) < 2:
+        return {"direction": "unknown", "observations": len(points)}
+    span = points[-1][0] - points[0][0]
+    xs = [(point[0] - points[0][0]) / span for point in points]
+    ys = [point[1] for point in points]
+    weights = [2 ** (4 * (x - 1)) if recent else 1.0 for x in xs]
+    total = sum(weights)
+    mean_x = sum(w * x for w, x in zip(weights, xs)) / total
+    mean_y = sum(w * y for w, y in zip(weights, ys)) / total
+    variance = sum(w * (x - mean_x) ** 2 for w, x in zip(weights, xs))
+    change = sum(w * (x - mean_x) * (y - mean_y) for w, x, y in zip(weights, xs, ys)) / variance
+    noise = math.sqrt(sum(w * (y - mean_y - change * (x - mean_x)) ** 2
+                          for w, x, y in zip(weights, xs, ys)) / total)
+    # Two points establish only a difference. With more evidence, require drift
+    # larger than twice residual scatter; a numerical tolerance avoids noise-floor claims.
+    tolerance = 1e-6 * max(1.0, abs(statistics.median(ys)))
+    direction = "limited" if len(points) == 2 else (
+        "flat" if max(ys) - min(ys) <= tolerance else
+        ("up" if change > 0 else "down") if abs(change) > max(2 * noise, tolerance) else "mixed")
+    return {"direction": direction, "observations": len(points), "fitted_change": change, "residual_scatter": noise}
+
+
+# Every finite observation contributes to the overall and recency-weighted fits.
+# Warmup remains visible; post-warmup behavior is interpreted as a separate phase.
+def _trend(points, warmup_steps=0):
+    if not points:
         return None
-    older, newer = points[-2 * window:-window], points[-window:]
-    before, after = statistics.median(p[1] for p in older), statistics.median(p[1] for p in newer)
-    delta = after - before
-    relative = delta / abs(before) if before else None
-    # A zero reference has no meaningful relative change; exact constancy remains
-    # meaningful. Require every new observation beyond the old median for a trend.
-    above = delta > 0 and all(p[1] > before for p in newer)
-    below = delta < 0 and all(p[1] < before for p in newer)
-    qualifies = relative is not None and abs(relative) >= relative_change
-    direction = "up" if qualifies and above else "down" if qualifies and below else "mixed"
-    return {"previous": _observations(older), "recent": _observations(newer),
-            "relative_change": relative, "relative_change_threshold": relative_change,
-            "threshold_meaning": "Operator-configured descriptive heuristic, not statistical confidence.",
-            "direction": direction}
+    result = {"history": _observations(points), "overall": _fit(points), "recent": _fit(points, recent=True)}
+    current = result["recent"]
+    if warmup_steps > 0:
+        after = [point for point in points if point[0] > warmup_steps]
+        current = _fit(after, recent=True)
+        result["post_warmup"] = current
+        result["warmup_updates"] = warmup_steps
+    result["direction"] = current["direction"]
+    return result
 
 
 # Compare quality only against a baseline with the same explicit conditions hash.
-def _quality_findings(records, min_evaluations, relative_change):
+def _quality_findings(records):
     groups = {}
     for record in records:
         context = record.get("quality") or {}
@@ -494,32 +396,35 @@ def _quality_findings(records, min_evaluations, relative_change):
             name = key.removeprefix("quality/")
             if name not in higher_better | lower_better:
                 continue
-            points = _series(rounds, key, -1)
-            if len(points) < min_evaluations:
-                continue
-            points = points[-min_evaluations:]
-            first, last = points[0][1], points[-1][1]
-            relative = (last - first) / abs(first) if first else None
-            direction = -1 if name in higher_better else 1
-            deteriorating = all(direction * (b[1] - a[1]) > 0 for a, b in zip(points, points[1:]))
-            if relative is not None and direction * relative >= relative_change and deteriorating:
+            trend = _trend(_series(rounds, key))
+            worsening = "down" if name in higher_better else "up"
+            if trend and trend["direction"] == worsening:
                 findings.append(_finding(f"quality_deterioration:{series}:{name}", "warning", "heuristic",
                                          f"{key} repeatedly deteriorated under matching evaluation conditions.",
-                                         {"series": series, "metric": key, **_observations(points),
-                                          "relative_change": relative, "relative_change_threshold": relative_change,
-                                          "min_evaluations": min_evaluations, "model_judgment": name.startswith("judge_")},
+                                         {"series": series, "metric": key, "trend": trend,
+                                          "model_judgment": name.startswith("judge_")},
                                          "Inspect the individual held-out results; compare a shorter run or adjusted optimization in a separate experiment. Training reward increases do not override this independent evidence."))
     return findings
 
 
-# Report sustained observations; never infer optimal settings, reward alignment, or causation.
-def runtime_findings(method, records, *, window, min_evaluations, relative_change, warmup_steps=0, ranges=None):
-    if not isinstance(window, int) or isinstance(window, bool) or window < 2:
-        raise ValueError("assessment window must be an integer of at least two metric observations")
-    if not isinstance(min_evaluations, int) or isinstance(min_evaluations, bool) or min_evaluations < 2:
-        raise ValueError("assessment min_evaluations must be an integer of at least two")
-    if not _finite(relative_change) or relative_change <= 0:
-        raise ValueError("assessment relative_change must be finite and positive")
+# Sparse or noisy evidence limits a conclusion, never whether an assessment appears.
+def _trend_summary(label, trend):
+    if trend is None:
+        return f"{label}: no finite observations were recorded."
+    direction = trend["direction"]
+    if direction in {"unknown", "limited"}:
+        phase = "post-warmup " if "post_warmup" in trend else ""
+        return f"{label}: too little {phase}history to establish a sustained trend yet."
+    descriptions = {"up": "rising", "down": "falling", "flat": "nearly unchanged", "mixed": "noisy, with no clear direction"}
+    overall = trend["overall"]["direction"]
+    text = f"{label}: the recent trend is {descriptions[direction]}."
+    if overall in {"up", "down"} and direction in {"up", "down"} and overall != direction:
+        text += f" The overall history is {descriptions[overall]}, so the recent direction has reversed."
+    return text
+
+
+# Interpret full ordered histories with shared trend rules; recommendations remain advisory.
+def runtime_findings(method, records, *, warmup_steps=0, ranges=None):
     findings, latest = [], {}
     for record in records:
         for key, value in record.get("log", {}).items():
@@ -534,111 +439,104 @@ def runtime_findings(method, records, *, window, min_evaluations, relative_chang
                                      {"metric": key, "value": str(value), "step": record.get("step"), "time": record.get("time")},
                                      "Inspect the affected batch, precision, gradients, and scorer output before attributing this to learning rate."))
     training = [r for r in records if not r.get("eval") and not r.get("quality")]
-    trends = {key: _trend(_series(training, key, warmup_steps), window, relative_change) for key in latest}
+    trends = {key: _trend(_series(training, key), warmup_steps) for key in latest}
     loss = trends.get("loss")
     # On-policy loss tracks a changing distribution/objective and is not a monotone
     # measure of progress. Preference loss also cannot establish answer quality.
-    if method in ("sft", "dpo", "kto", "reward") and loss and loss["direction"] == "up":
-        evidence = {"loss": loss, "warmup_steps": warmup_steps}
+    fixed_objective = method in {"sft", "dpo", "kto", "reward"}
+    if fixed_objective:
+        rising = loss is not None and loss["direction"] == "up"
+        evidence = {"loss": loss, "warmup_updates": warmup_steps}
         for key in ("grad_norm", "learning_rate"):
             if trends.get(key):
                 evidence[key] = trends[key]
-        findings.append(_finding("rising_training_loss", "warning", "heuristic",
-                                 "Training loss increased across two post-warmup observation windows.", evidence,
-                                 "Inspect data and gradient trends; if instability persists, compare a lower learning rate in a separate run. These observations do not identify an optimal rate."))
-    if method in ("sft", "dpo", "kto", "reward") and loss:
-        before = loss["previous"]["median"]
-        values = loss["previous"]["values"] + loss["recent"]["values"]
-        # A narrow range across every observation supports a descriptive plateau;
-        # matching medians amid large oscillations do not establish stalled learning.
-        flat = all(value == 0 for value in values) if before == 0 else all(
-            abs(value - before) / abs(before) < relative_change for value in values)
-        if flat:
-            findings.append(_finding("little_loss_change", "info", "heuristic",
-                                     "Logged training loss changed little across two post-warmup windows.",
-                                     {"loss": loss, "warmup_steps": warmup_steps},
-                                     "Compare held-out progress and the learning-rate schedule before changing duration or rate; a flat training objective alone does not establish convergence."))
-    if method == "distillation" and loss and loss["direction"] != "mixed":
-        findings.append(_finding("distillation_loss_trend", "info", "heuristic",
-                                 "The logged distillation objective changed across post-warmup windows.",
-                                 {"loss": loss, "warmup_steps": warmup_steps},
-                                 "Compare teacher agreement and held-out task scores under matching conditions; the generated training distribution changes, so loss alone cannot establish student quality."))
+        findings.append(_finding("rising_training_loss" if rising else "training_progress", "warning" if rising else "info", "heuristic",
+                                 _trend_summary("Training loss", loss), evidence,
+                                 "Inspect batch composition, gradients, and the learning-rate schedule; persistent instability can justify comparing a lower learning rate."
+                                 if rising else "Interpret training loss alongside held-out results; fitting the training objective does not establish general task quality."))
+    else:
+        findings.append(_finding("generated_objective", "info", "heuristic",
+                                 _trend_summary("Training objective", loss), {"loss": loss},
+                                 "This method trains on generated responses. Interpret reward, KL, clipping, and held-out results together; training loss alone cannot establish model improvement."))
     gradient = trends.get("grad_norm")
     if gradient and gradient["direction"] == "up":
         findings.append(_finding("rising_gradient_norm", "info", "heuristic",
-                                 "Gradient norms increased across two post-warmup windows.", {"grad_norm": gradient},
+                                 "Gradient norms show a rising recent trend.", {"grad_norm": gradient},
                                  "Check loss, clipping, and batch composition together; growing norms alone do not prove divergence."))
-    evaluation_points = _series([r for r in records if r.get("eval")], "eval_loss", warmup_steps)
-    if method in ("sft", "dpo", "kto", "reward") and len(evaluation_points) >= min_evaluations:
-        points = evaluation_points[-min_evaluations:]
-        first, last = points[0][1], points[-1][1]
-        relative = (last - first) / abs(first) if first else None
-        # Align train windows to the evaluated interval; unrelated older training
-        # improvements cannot support a current generalization-gap interpretation.
-        aligned = [p for p in _series(training, "loss", warmup_steps) if points[0][0] <= p[0] <= points[-1][0]]
-        aligned_trend = _trend(aligned, window, relative_change)
-        consistently_worse = all(b[1] > a[1] for a, b in zip(points, points[1:]))
-        if relative is not None and relative >= relative_change and consistently_worse:
-            evidence = {"eval_loss": _observations(points), "relative_change": relative,
-                        "relative_change_threshold": relative_change, "min_evaluations": min_evaluations}
+    evaluation = [r for r in records if r.get("eval") and not r.get("quality")]
+    evaluation_points = _series(evaluation, "eval_loss")
+    evaluation_trend = _trend(evaluation_points, warmup_steps)
+    if not evaluation:
+        findings.append(_finding("evaluation_missing", "warning", "measured", "No ordinary evaluation metrics were recorded.", {},
+                                 "Review --eval-strategy and the held-out dataset configuration."))
+    elif fixed_objective:
+        evidence = {"eval_loss": evaluation_trend}
+        if evaluation_trend and evaluation_trend["direction"] == "up":
+            # Overfitting needs opposing training/eval directions over the same
+            # observed interval; retain earlier history in the training conclusion.
+            aligned = [p for p in _series(training, "loss") if evaluation_points[0][0] <= p[0] <= evaluation_points[-1][0]]
+            aligned_trend = _trend(aligned, warmup_steps)
             if aligned_trend and aligned_trend["direction"] == "down":
                 evidence["training_loss"] = aligned_trend
                 findings.append(_finding("possible_overfitting", "warning", "heuristic",
-                                         "Training loss improved while held-out loss repeatedly worsened over the same interval.", evidence,
+                                         "Recent training loss is falling while held-out loss is rising over the same observed interval.", evidence,
                                          "Check that evaluation data and masking/objective remain comparable; compare shorter training or stronger regularization in another run. This pattern can indicate overfitting."))
             else:
                 findings.append(_finding("worsening_evaluation", "warning", "heuristic",
-                                         "Held-out loss repeatedly worsened across the configured minimum evaluation count.", evidence,
+                                         _trend_summary("Held-out loss", evaluation_trend), evidence,
                                          "Inspect held-out examples and training stability; this observation alone does not distinguish overfitting from other causes."))
+        else:
+            findings.append(_finding("evaluation_progress", "info", "heuristic", _trend_summary("Held-out loss", evaluation_trend), evidence,
+                                     "One evaluation measures performance but cannot establish a trend. Decreasing held-out loss supports progress on this objective, not unmeasured tasks."))
     if method in ("grpo", "rloo", "distillation"):
-        findings.extend(_generation_findings(training, trends, window, warmup_steps, method))
+        findings.extend(_generation_findings(training, trends, method))
     for key, bounds in (ranges or {}).items():
-        points = _series(records, key, warmup_steps)[-window:]
-        if len(points) < window:
+        points = _series(records, key)
+        if not points:
             continue
         low, high = bounds
-        outside = (low is not None and all(p[1] < low for p in points)) or (high is not None and all(p[1] > high for p in points))
+        outside = (low is not None and points[-1][1] < low) or (high is not None and points[-1][1] > high)
         if outside:
             findings.append(_finding(f"configured_range:{key}", "warning", "measured",
-                                     f"{key} stayed outside its configured range for {window} observations.",
+                                     f"The latest {key} is outside its configured range.",
                                      {"metric": key, "configured_bounds": list(bounds), **_observations(points)},
                                      "Review the observations against the task; configured display ranges are operator guidance, not universal quality limits."))
-    findings.extend(_quality_findings(records, min_evaluations, relative_change))
+    findings.extend(_quality_findings(records))
     return findings
 
 
 # Exact boundaries (zero variance/cutoffs) describe signal health without hidden thresholds.
-def _generation_findings(records, trends, window, warmup_steps, method):
+def _generation_findings(records, trends, method):
     findings = []
     keys = {key for record in records for key in record.get("log", {})}
     for key in sorted(keys):
-        points = _series(records, key, warmup_steps)[-window:]
-        if len(points) < window:
+        points = _series(records, key)
+        if not points:
             continue
         zero_std = key == "reward_std" or key.startswith("rewards/") and key.endswith("/std")
-        if method in ("grpo", "rloo") and zero_std and all(p[1] == 0 for p in points):
+        if method in ("grpo", "rloo") and zero_std and points[-1][1] == 0:
             findings.append(_finding(f"constant_reward:{key}", "warning", "measured",
-                                     f"{key} was zero throughout the observed window.",
+                                     f"The latest {key} is zero; this reward currently provides no within-group variation.",
                                      {"metric": key, **_observations(points)},
                                      "Inspect generated answers and this reward's requirements; a constant component cannot distinguish sampled answers, but other components may still provide signal."))
         if method in ("grpo", "rloo") and key == "frac_reward_zero_std" and any(p[1] > 0 for p in points):
             all_groups = all(p[1] == 1 for p in points)
             findings.append(_finding("zero_variance_groups", "warning" if all_groups else "info", "measured",
                                      "Some sampled prompt groups have no within-group reward variation." if not all_groups else
-                                     "Every reported prompt group has zero reward variation throughout the observed window.",
+                                     "Every reported prompt group has zero reward variation throughout the recorded history.",
                                      {"metric": key, **_observations(points)},
                                      "Inspect rewards and completions for constant scoring, uniformly solved/unsolved prompts, and insufficient sampling diversity. Reward variation does not establish reward quality."))
         if key == "completions/clipped_ratio" and any(p[1] > 0 for p in points):
             findings.append(_finding("generation_cutoffs", "warning" if all(p[1] == 1 for p in points) else "info", "measured",
-                                     "Generated completions reached their token limit during the observed window.",
+                                     "Generated completions reached their token limit during this run.",
                                      {"metric": key, **_observations(points)},
                                      "Inspect clipped answers; compare a larger completion budget if useful answers are cut short, accounting for added memory and generation time."))
     # Drift, entropy, and clipping are interpreted together; none independently
     # proves collapse or bad quality. Missing evidence stays missing.
     evidence = {key: trend for key, trend in trends.items()
                 if trend and (key in ("kl", "entropy") or key.startswith("clip_ratio/"))}
-    if any(t["direction"] != "mixed" for t in evidence.values()):
+    if any(t["direction"] in {"up", "down"} for t in evidence.values()):
         findings.append(_finding("policy_dynamics", "info", "heuristic",
-                                 "Observed policy statistics changed across post-warmup windows.", evidence,
+                                 "Policy statistics show directional changes in the recorded history.", evidence,
                                  "Review KL, entropy, policy clipping, and independent task scores together before comparing learning rate, regularization, or sampling settings. Direction alone does not establish improvement or collapse."))
     return findings

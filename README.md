@@ -162,13 +162,14 @@ trlx merge --base BASE --adapter ADAPTER --out BASE --force
 
 ## Settings assessment and independent quality checks
 
-All seven trainers provide a full pre-run scan and runtime recommendations. Findings distinguish
+All seven trainers provide a full pre-run scan, an assessment after every evaluation, and a final
+assessment at training completion. Findings distinguish
 measurements, preparation projections, and heuristics, and include their evidence. They never change
 training settings, stop a run, or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
 runtime notices appear inline and in the TUI log pane. Training metrics remain in `metrics.jsonl`.
-Startup shows only problems, including disabled evaluation or a projected run too short for the
-configured assessment windows. At completion, a final assessment reports supported conclusions,
-missing evidence, and relevant settings. It is retained in `log.txt` and adds no evaluation passes.
+Startup shows only problems, including disabled evaluation. Assessments use the full chronological
+history, interpret recent behavior and warmup internally, and report uncertainty when evidence is
+sparse or noisy. They are retained in `log.txt` and add no evaluation passes.
 
 Training and `check` require the following explicit block, supplied by new `trlx init` configurations.
 Add it to older configs; initialization with `--force` replaces the entire file.
@@ -176,9 +177,6 @@ Add it to older configs; initialization with `--force` replaces the entire file.
 ```toml
 [assessment]
 quality_checks = false
-runtime_window = 20
-runtime_min_evaluations = 3
-runtime_relative_change = 0.05
 quality_preset = "None"
 quality_dataset = "None"
 quality_max_length = 2048
@@ -186,10 +184,9 @@ quality_max_new_tokens = 256
 quality_batch_size = 1
 ```
 
-The runtime window counts logged observations. The relative-change threshold is heuristic sensitivity,
-not a confidence level. Override these with `--assessment-window`, `--assessment-min-evaluations`, and
-`--assessment-relative-change`. Trend comparison needs two full windows: a window of 20 requires
-40 usable observations after warmup. Missing evidence is reported without inventing a trend.
+Evaluation frequency controls when assessment happens. There are no user-configured assessment
+windows, minimum evaluation counts, or sensitivity thresholds. Insufficient evidence limits individual
+conclusions without suppressing the assessment.
 Ordinary evaluation and metric assessment do not require `--quality-checks`.
 
 Independent checks are optional and require a separate evaluation dataset and a built-in preset:

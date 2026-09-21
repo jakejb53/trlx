@@ -120,13 +120,10 @@ class ReplaySpec:
     kl_coef: float
 
 
-# Assessment controls are explicit operational settings; None below denotes an absent optional input.
+# Independent quality checks have explicit settings; metric interpretation is owned by the assessor.
 @dataclasses.dataclass(frozen=True)
 class AssessmentSpec:
     quality_checks: bool
-    runtime_window: int
-    runtime_min_evaluations: int
-    runtime_relative_change: float
     quality_preset: str | None
     quality_dataset: DatasetRef | None
     quality_max_length: int
@@ -700,23 +697,18 @@ def _assessment_string(path, where, table, key):
 
 # Every operational assessment setting is required explicitly, even while independent checks are disabled.
 def _assessment(path, table, method):
-    import math
     from trlx.quality_scorers import PRESETS
 
     where = "[assessment]"
     _check_keys(path, where, table, {field.name for field in dataclasses.fields(AssessmentSpec)})
     values = {"quality_checks": _require(path, where, table, "quality_checks", bool)}
-    minimums = {"runtime_window": 2, "runtime_min_evaluations": 2, "quality_max_length": 2,
+    minimums = {"quality_max_length": 2,
                 "quality_max_new_tokens": 1, "quality_batch_size": 1}
     for key, minimum in minimums.items():
         value = _require(path, where, table, key, int)
         if value < minimum:
             raise TrlxError(f"{path}: {where}.{key} must be at least {minimum}")
         values[key] = value
-    change = _require(path, where, table, "runtime_relative_change", (int, float))
-    if not math.isfinite(change) or change <= 0:
-        raise TrlxError(f"{path}: {where}.runtime_relative_change must be finite and positive")
-    values["runtime_relative_change"] = float(change)
     preset = _assessment_string(path, where, table, "quality_preset")
     if preset is not None and preset not in PRESETS:
         raise TrlxError(f"{path}: {where}.quality_preset must be None or one of {', '.join(PRESETS)}")

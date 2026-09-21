@@ -122,7 +122,7 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 - `[preflight]`: `offpolicy_logp_per_token`, the per-token log-prob threshold for the off-policy warning, and `rows`, how many train rows it scores. `dpo` and `kto` only.
 - `[rewards]`: `grpo` and `rloo`. `funcs`: list of entries, each a bare name from `trl.rewards` or trlx built-ins, `{name, args}` for factories, an HF model path, or `module:function` / `path.py:function`.
 - `[replay]`: `sft` only. `dataset`, `fraction` (replay share of the mixed train set, in (0, 1)), `kl_coef`.
-- `[assessment]`: required for training and `check`; explicit runtime evidence-window and quality-check
+- `[assessment]`: required for training and `check`; explicit independent quality-check
   settings per §2.11. Shared, method-specific, and CLI precedence applies. Missing required keys are errors.
 
 Dataset files: JSONL, JSON array, CSV, Parquet, by extension. Applies everywhere a dataset is named.
@@ -250,17 +250,16 @@ All seven methods scan every training/evaluation row, including selected replay 
 Findings identify measured facts, preparation projections, or heuristics, with evidence and recommendations.
 The trainer remains authoritative on prepared data; preflight checks projections against actual row counts.
 Startup and `check` display only warnings and errors, with relevant settings. Disabled ordinary evaluation
-and projected observation counts below assessment requirements are warnings; unknown counts remain unknown.
-Runtime advice reads all logged metrics, accounts for warmup and required observation windows, and
-coalesces repeated findings. It never changes settings, optimizer/scheduler state, control flags, or
+is a warning. After every evaluation, rank zero assesses the full chronological metric history, including
+any quality results from that evaluation. Recency weighting, noise handling, and warmup interpretation
+are internal analysis policy. Sparse evidence limits conclusions without suppressing the assessment.
+Assessment never changes settings, optimizer/scheduler state, control flags, or
 checkpoint selection. Scores do not establish an optimal learning rate or universally correct reward.
-At training completion, rank zero reports metric-based conclusions, evidence gaps, and recommendations
-once, after final evaluation and any enabled quality checks. The report appears inline and in `log.txt`;
-`metrics.jsonl` remains authoritative. It performs no additional evaluation and never relaxes configured
-evidence requirements. Completion alone does not establish model improvement.
+At training completion, the same analysis produces a final report after any enabled quality checks.
+Reports appear inline and in `log.txt`; `metrics.jsonl` remains authoritative. Assessment performs no
+additional evaluation. Completion alone does not establish model improvement.
 
-`[assessment]` requires `quality_checks`, `runtime_window` (at least 2 logs per comparison window),
-`runtime_min_evaluations` (at least 2), `runtime_relative_change` (finite positive heuristic sensitivity),
+`[assessment]` requires `quality_checks`,
 `quality_preset`, `quality_dataset` (both nullable using `"None"`), `quality_max_length` (at least 2),
 `quality_max_new_tokens`, and `quality_batch_size` (both positive). `init` writes explicit defaults;
 quality checks start disabled. CLI overrides include `--quality-checks` / `--no-quality-checks`.

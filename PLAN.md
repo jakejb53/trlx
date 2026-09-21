@@ -357,7 +357,8 @@ Completed: tuning-only review (2026-09-20)
 
 - All seven trainers scan model metadata, tokenizers, and all effective train/eval/replay rows before
   confirmation. Method-specific findings distinguish measurements, projections, and heuristics.
-- Runtime recommendations use explicit evidence windows and never change training settings or control.
+- Assessments run after every evaluation and at completion, interpreting the recorded history internally
+  without changing training settings or control.
 - Optional built-in quality presets cover language modeling, QA, classification, multiple choice, JSON,
   reward preferences, instruction following, and writing; the last two use a configured judge and shipped rubrics.
   Checks run at baseline, scheduled evaluations, and completion even when ordinary evaluation is disabled.
@@ -442,6 +443,20 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
 PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   tests.test_review tests.test_assessment_lifecycle tests.test_train tests.test_imports -q
 ```
+
+Completed: assessment after every evaluation (2026-09-20)
+
+- Supersedes the configurable-window assessment behavior above. Every evaluation and training
+  completion use one assessment path over the full chronological history, with recency, noise,
+  and warmup interpretation handled internally. Limited evidence qualifies conclusions without silencing reports.
+- Removed `runtime_window`, `runtime_min_evaluations`, `runtime_relative_change`, their CLI options,
+  generated defaults, and coverage warnings. Disabled ordinary evaluation remains a startup warning.
+- Updated `trlx/assessment.py`, `metrics.py`, `review.py`, `config.py`, `options.py`, `init_cmd.py`,
+  `README.md`, and `SPEC.md`. No compatibility handling or existing-run changes.
+- `run.toml` was not modified. The operator will regenerate it with `trlx init --force` from the repo root;
+  this replaces `run.toml` with fresh defaults.
+- Validation is left to the operator. No tests were updated or run for this revision; earlier test
+  results do not validate it. Existing assessment tests still reference the removed controls.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

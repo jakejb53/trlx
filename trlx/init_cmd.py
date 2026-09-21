@@ -35,9 +35,6 @@ RANGES = {
 # These defaults are emitted into operator configuration, never filled in silently at runtime.
 ASSESSMENT_DEFAULTS = {
     "quality_checks": False,
-    "runtime_window": 20,
-    "runtime_min_evaluations": 3,
-    "runtime_relative_change": 0.05,
     "quality_preset": "None",
     "quality_dataset": "None",
     "quality_max_length": 2048,

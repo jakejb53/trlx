@@ -119,8 +119,6 @@ def callback_class():
             self.method = method
             self.ranges = ranges
             self.records = read(self.path) if assessment_settings is not None and self.path.exists() else []
-            self._active_advice = set()
-            self._assessment_failed = False
             self._final_assessment_reported = False
 
         # Persist and flush each trainer record so live readers see progress immediately.
@@ -128,7 +126,11 @@ def callback_class():
             if logs is None:
                 return
             self._append(record(state, logs, time.time()))
-            self._advise(args, state)
+
+        # Training registers the quality callback first, so its scheduled evidence
+        # is already durable when this evaluation-level assessment runs.
+        def on_evaluate(self, args, state, control, **kwargs):
+            self._report_assessment(args, state)
 
         # Quality results share this writer without calling Trainer.log or changing its counters.
         def quality(self, args, state, logs, context):
@@ -136,7 +138,6 @@ def callback_class():
             item["eval"] = True
             item["quality"] = dict(context)
             self._append(item)
-            self._advise(args, state, quality_complete=context.get("status") == "complete")
 
         # Resume comparisons require the same dataset/scorer series, not merely the same metric name.
         def has_baseline(self, series):
@@ -161,30 +162,19 @@ def callback_class():
                 # Later trainer callbacks may mutate logs; advice must match the durable evidence.
                 self.records.append(json.loads(serialized))
 
-        # Repeated active findings are coalesced; advisory failures cannot take ownership of training.
-        def _advise(self, args, state, *, quality_complete=False):
-            if self.assessment_settings is None or self._assessment_failed:
+        # Every eval receives a complete interpretation; one reporting failure
+        # cannot suppress later assessments or change trainer control.
+        def _report_assessment(self, args, state, *, final=False):
+            if self.assessment_settings is None:
                 return
             from trlx import assessment, review
 
-            settings = self.assessment_settings
             try:
-                findings = assessment.runtime_findings(
-                    self.method, self.records, window=settings.runtime_window,
-                    min_evaluations=settings.runtime_min_evaluations,
-                    relative_change=settings.runtime_relative_change,
-                    warmup_steps=args.get_warmup_steps(state.max_steps), ranges=self.ranges,
-                )
-                active = {item["code"] for item in findings}
-                for finding in findings:
-                    # Each completed quality round deserves a fresh comparison;
-                    # ordinary training logs still coalesce unchanged advice.
-                    refresh = quality_complete and finding["code"].startswith("quality_baseline:")
-                    if refresh or finding["code"] not in self._active_advice:
-                        print(review.format_finding(finding), flush=True)
-                self._active_advice = active
+                result = assessment.run_assessment(self.method, self.records, args,
+                                                   completed_steps=state.global_step, planned_steps=state.max_steps,
+                                                   ranges=self.ranges)
+                print(review.render_run_assessment(result, args, final=final), flush=True)
             except Exception as error:
-                self._assessment_failed = True
                 print(f"assessment unavailable: {type(error).__name__}: {error}; training metrics remain in {self.path}",
                       flush=True)
 
@@ -200,15 +190,7 @@ def callback_class():
             # authoritative stream first; reporting cannot alter training control.
             if self.assessment_settings is not None and not self._final_assessment_reported:
                 self._final_assessment_reported = True
-                from trlx import assessment, review
-
-                try:
-                    result = assessment.final_assessment(self.method, self.records, args, self.assessment_settings,
-                                                         completed_steps=state.global_step, planned_steps=state.max_steps,
-                                                         ranges=self.ranges)
-                    print(review.render_final_assessment(result, args, self.assessment_settings), flush=True)
-                except Exception as error:
-                    print(f"final assessment unavailable: {type(error).__name__}: {error}; metrics remain in {self.path}", flush=True)
+                self._report_assessment(args, state, final=True)
 
     return MetricsCallback
 

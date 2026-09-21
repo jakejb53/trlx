@@ -240,9 +240,6 @@ def add_training_options(parser, method_name):
     fields = [
         ("--quality-checks", "quality_checks", bool,
          "Run built-in quality checks at baseline, evaluation points, and completion, even with evaluation disabled; advisory only."),
-        ("--assessment-window", "runtime_window", int, "Logged observations per runtime comparison window; at least 2."),
-        ("--assessment-min-evaluations", "runtime_min_evaluations", int, "Comparable evaluation observations needed for trend advice; at least 2."),
-        ("--assessment-relative-change", "runtime_relative_change", float, "Positive relative-change sensitivity; a heuristic threshold, not statistical confidence."),
         ("--quality-preset", "quality_preset", str | None,
          "Built-in preset: language_modeling, qa, classification, multiple_choice, json, preference, instruction_following, or writing."),
         ("--quality-dataset", "quality_dataset", str | None, "Separate evaluation dataset; required when quality checks are enabled."),

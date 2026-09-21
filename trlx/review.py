@@ -401,8 +401,6 @@ _ASSESSMENT_SETTINGS = {
     "reward_filtered_pairs": "max_length",
     "replay_exposure": "replay.dataset replay.fraction replay.kl_coef",
     "evaluation_coverage": "dataset.split dataset.eval_fraction dataset.dataset_eval eval_strategy eval_steps",
-    "assessment_training_coverage": "assessment.runtime_window logging_strategy logging_steps warmup_steps num_train_epochs max_steps",
-    "assessment_evaluation_coverage": "assessment.runtime_min_evaluations eval_strategy eval_steps eval_delay num_train_epochs max_steps",
     "lora_scale": "peft.r peft.lora_alpha peft.use_rslora peft.rank_pattern peft.alpha_pattern",
     "model_context_budget": "max_length max_prompt_length max_completion_length generation_kwargs",
     "distillation_vocab_size": "model.path teacher.path",
@@ -621,12 +619,9 @@ def render_assessment(report, cfg, *, will_publish=True, width=None):
 
 
 # Recommendations refer to existing controls; values still come from the completed trainer.
-_FINAL_SETTINGS = {
-    "final_training_coverage": "assessment.runtime_window logging_strategy logging_steps warmup_steps",
-    "final_evaluation_coverage": "assessment.runtime_min_evaluations eval_strategy eval_steps",
-    "final_evaluation_missing": "eval_strategy",
+_RUN_ASSESSMENT_SETTINGS = {
+    "evaluation_missing": "eval_strategy",
     "rising_training_loss": "learning_rate lr_scheduler_type warmup_steps max_grad_norm",
-    "little_loss_change": "learning_rate lr_scheduler_type num_train_epochs max_steps",
     "rising_gradient_norm": "learning_rate max_grad_norm",
     "possible_overfitting": "num_train_epochs max_steps weight_decay eval_strategy eval_steps",
     "worsening_evaluation": "learning_rate eval_strategy eval_steps",
@@ -636,14 +631,28 @@ _FINAL_SETTINGS = {
 }
 
 
-# Final evidence stays readable; observations and exact metric values remain in metrics.jsonl.
-def render_final_assessment(report, args, assessment_settings, *, width=None):
+# Internal fitting details are not operator controls. Summaries retain the full
+# observation count and extent; exact chronological measurements stay in metrics.jsonl.
+def _run_evidence(value):
+    if isinstance(value, dict):
+        if {"history", "overall", "recent", "direction"} <= value.keys():
+            history = value["history"]
+            values = history["values"]
+            first, last = history["step_range"]
+            return (f"{len(values)} observations, steps {first}–{last}; first {values[0]:.3f}, "
+                    f"latest {values[-1]:.3f}, range {min(values):.3f}–{max(values):.3f}")
+        return {key: _run_evidence(item) for key, item in value.items()}
+    return value
+
+
+# Evaluation and completion use the same readable conclusions and supporting measurements.
+def render_run_assessment(report, args, *, final=False, width=None):
     width = width if width is not None else shutil.get_terminal_size().columns
     available = {item.key: item for item in options.settings(report["method"])}
-    lines = ["Final training assessment:"]
+    lines = ["Final training assessment:" if final else "Training assessment after evaluation:"]
     count = report["evaluation_records"]
     lines.extend(_assessment_paragraph(
-        f"Training ended at update {report['completed_steps']}/{report['planned_steps']}; "
+        f"Training {'ended at' if final else 'at'} update {report['completed_steps']}/{report['planned_steps']}; "
         f"{count} recorded ordinary {'evaluation' if count == 1 else 'evaluations'}.", width))
     if report["train_loss"] is not None:
         value = report["train_loss"]
@@ -662,14 +671,13 @@ def render_final_assessment(report, args, assessment_settings, *, width=None):
     for finding in sorted(report["findings"], key=lambda item: {"error": 0, "warning": 1, "info": 2}[item["severity"]]):
         lines.append("")
         lines.extend(_assessment_paragraph(f"{finding['summary']} ({finding['basis']})", width))
-        lines.extend(_assessment_evidence(finding.get("evidence") or {}, width))
+        lines.extend(_assessment_evidence(_run_evidence(finding.get("evidence") or {}), width))
         if finding.get("recommendation"):
             lines.extend(_assessment_paragraph("Recommendation: " + finding["recommendation"], width, "    "))
         flags = []
-        for key in _FINAL_SETTINGS.get(finding["code"], "").split():
+        for key in _RUN_ASSESSMENT_SETTINGS.get(finding["code"], "").split():
             setting = available.get(key)
-            owner, name = (assessment_settings, key.split(".", 1)[1]) if key.startswith("assessment.") else (args, key)
-            if setting is None or not hasattr(owner, name):
+            if setting is None or not hasattr(args, key):
                 continue
             if key == "eval_steps" and args.eval_strategy != "steps":
                 continue
@@ -677,7 +685,7 @@ def render_final_assessment(report, args, assessment_settings, *, width=None):
                 continue
             if key == "num_train_epochs" and args.max_steps > 0 or key == "max_steps" and args.max_steps <= 0:
                 continue
-            value = _redact(_plain(getattr(owner, name)), name)
+            value = _redact(_plain(getattr(args, key)), key)
             argument = _argument(setting, value)
             flags.append(argument if argument is not None else f"{setting.flag}: automatic/unset")
         if flags:
