@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from trlx import TrlxError
+from trlx import TrlxError, processes
 
 # Internal inherited descriptor, never a persisted setting or operator override.
 PIPE_ENV = "TRLX_FEEDBACK_FD"
@@ -136,25 +136,49 @@ class Collector:
         self.pending = collections.deque()
         self.lock = threading.RLock()
         self.readers = []
+        self.children = []
+        self.streams = []
         self.error = None
 
     # The log file's enclosing context outlives every child pipe reader.
     def __enter__(self):
         return self
 
-    # Also clean up children if launch fails before a Job takes ownership.
+    # Own partial launches too; normal exit also collects any surviving descendants.
     def __exit__(self, exc_type, exc, traceback):
-        if exc_type is not None:
-            for process, stop, thread, stream in self.readers:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
+        failures = self.stop(terminal=True)
         try:
             self.finish()
         except Exception as error:
-            if exc is None:
+            if exc is not None:
+                exc.add_note(str(error))
+            elif any(process.returncode not in (None, 0) for process in self.children):
+                self.shutdown_notice(f"shutdown error: {error}", terminal=True)
+            else:
                 raise
-            exc.add_note(str(error))
+        if failures:
+            if exc is not None:
+                exc.add_note("; ".join(failures))
+            elif not any(process.returncode not in (None, 0) for process in self.children):
+                raise TrlxError("shutdown incomplete: " + "; ".join(failures))
+
+    # Diagnostics must not replace an existing failure, even if stderr is broken.
+    def shutdown_notice(self, message, *, terminal=None):
+        self.accept("supervisor", {"kind": "note", "message": message}, display=False)
+        if (self.display if terminal is None else terminal) and sys.stderr is not None:
+            try:
+                print(message, file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # Collection or the original failure still determines the exit status.
+
+    # Shutdown notices bypass the paused metric display but keep its authoritative log.
+    # Callers may enable terminal output after curses has unwound on cancellation.
+    def stop(self, children=None, *, terminal=None):
+        # Logging or terminal failure must not interrupt process cleanup.
+        def report(message):
+            self.shutdown_notice(message, terminal=terminal)
+
+        return processes.stop(self.children if children is None else children, report)
 
     # Collection and log writes share a lock, preserving complete source-labelled lines.
     def accept(self, source, event, *, display=True):
@@ -172,21 +196,28 @@ class Collector:
 
     # Start both drainers immediately, before any child can fill either pipe.
     def spawn(self, command, env, source):
-        read_fd, write_fd = os.pipe()
-        try:
-            child_env = dict(env, **{PIPE_ENV: str(write_fd), "PYTHONUNBUFFERED": "1"})
-            process = subprocess.Popen(command, env=child_env, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, pass_fds=(write_fd,))
-        except BaseException:
-            os.close(read_fd)
-            raise
-        finally:
-            os.close(write_fd)
-        stop = threading.Event()
-        for fd, structured in ((read_fd, True), (process.stdout.fileno(), False)):
-            thread = threading.Thread(target=self._read, args=(fd, structured, source, stop), daemon=True)
-            self.readers.append((process, stop, thread, fd if structured else process.stdout))
-            thread.start()
+        # Defer terminal interrupts until all child/pipe ownership is registered.
+        # A private session prevents terminal Ctrl+C from interrupting worker cleanup twice.
+        with processes.defer_interrupt():
+            read_fd, write_fd = os.pipe()
+            try:
+                child_env = dict(env, **{PIPE_ENV: str(write_fd), "PYTHONUNBUFFERED": "1"})
+                process = subprocess.Popen(command, env=child_env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                           pass_fds=(write_fd,), start_new_session=True)
+                processes.register(process, source)
+                self.children.append(process)
+                self.streams.extend((read_fd, process.stdout))
+            except BaseException:
+                os.close(read_fd)
+                raise
+            finally:
+                os.close(write_fd)
+            stop = threading.Event()
+            for fd, structured in ((read_fd, True), (process.stdout.fileno(), False)):
+                thread = threading.Thread(target=self._read, args=(fd, structured, source, stop), daemon=True)
+                self.readers.append((process, stop, thread, fd if structured else process.stdout))
+                thread.start()
         return process
 
     # Decode across read boundaries and retain final unterminated diagnostics. A dead
@@ -194,8 +225,17 @@ class Collector:
     def _read(self, fd, structured, source, stop):
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = ""
+        drain_deadline = None
         try:
             while True:
+                # A surviving descendant must not keep teardown blocked by
+                # continuously writing. Drain buffered diagnostics for a bounded
+                # interval, then report incomplete collection instead of hanging.
+                if stop.is_set():
+                    if drain_deadline is None:
+                        drain_deadline = time.monotonic() + processes.KILL_SECONDS
+                    elif time.monotonic() >= drain_deadline:
+                        raise TimeoutError("output did not close after process shutdown")
                 ready = select.select([fd], [], [], 0.1)[0]
                 if not ready:
                     if stop.is_set():
@@ -260,12 +300,17 @@ class Collector:
         for process, stop, thread, stream in self.readers:
             stop.set()
         for process, stop, thread, stream in self.readers:
-            thread.join()
+            if thread.ident is not None:
+                thread.join()
+        # Streams are registered before reader startup so a thread-start failure
+        # cannot leak the second pipe or make us join a thread that never started.
+        for stream in self.streams:
             if isinstance(stream, int):
                 os.close(stream)
             else:
                 stream.close()
         self.readers.clear()
+        self.streams.clear()
         self.check()
 
 

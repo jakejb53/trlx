@@ -473,6 +473,19 @@ Completed: actionable guidance, visible evaluation loss, and baseline (2026-09-2
   ownership, quality callbacks, `README.md`, and `SPEC.md`. `run.toml` and existing runs were unchanged.
 - Validation remains with the operator. No tests were updated or run for these changes.
 
+Completed: graceful cancellation (2026-09-21)
+
+- Workers and verification run in private process groups, registered at spawn so cleanup covers
+  partial launches and descendants. Cancellation prevents verification from starting.
+- Shared cleanup sends SIGINT, allows 60 seconds, then sends SIGTERM and allows 5 seconds before
+  SIGKILL. A second Ctrl+C forces termination. Final reaping and output draining are bounded.
+- Shutdown progress is logged; cleanup preserves the original failure. Ctrl+C exits with status 130
+  without a cancellation traceback.
+- Added `trlx/processes.py`; updated launch, feedback, training, CLI, `README.md`, and `SPEC.md`.
+  Configuration and existing runs were unchanged.
+- Validation remains with the operator. No tests were updated or run; the GPU driver incident's
+  connection to the previous cancellation behavior remains unproven.
+
 ### Additional TODO: optional acceleration recommendations (planned)
 
 - During `trlx init`, use GPU architecture and installed Python, PyTorch, and CUDA versions to recommend

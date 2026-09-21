@@ -337,6 +337,10 @@ def main(argv=None):
                 result = args.func(args)
             progress.finish("completed" if result == 0 else "failed")
             return result
+    except KeyboardInterrupt:
+        # Worker cleanup and the progress context have already unwound. Preserve
+        # conventional shell cancellation status without a misleading traceback.
+        return 130
     except TrlxError as e:
         # A supervisor may have disabled a broken stderr; never redirect errors to metrics stdout.
         if sys.stderr is not None:

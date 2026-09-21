@@ -266,10 +266,15 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup, *, assessment_repo
                             print(line, file=sys.stderr, flush=True)
                 except Exception as error:
                     on_display_error(error)
-        except BaseException:
+        except BaseException as error:
             # Cancellation and supervisor failures still own process cleanup.
             # Display exceptions have already been handled at their boundary.
-            job.terminate()
+            try:
+                failures = job.terminate(terminal=True)
+                if failures:
+                    error.add_note("; ".join(failures))
+            except Exception as cleanup_error:
+                error.add_note(f"shutdown also failed: {cleanup_error}")
             raise
         if progress is not None:
             progress.finish("completed" if failure is None else f"failed: {failure[0]} exited with code {failure[1]}")

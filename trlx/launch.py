@@ -14,7 +14,7 @@ import time
 
 import torch
 
-from trlx import TrlxError, model as model_mod
+from trlx import TrlxError, model as model_mod, processes
 
 # Bytes-per-parameter multipliers for the fit rule (PLAN.md multi-GPU design):
 # a peft run holds frozen weights plus a small adapter and its optimizer
@@ -152,19 +152,18 @@ def spawn(method, config_path, strategy, physical, collector, *, force=False, no
         try:
             procs.append(collector.spawn(cmd, env, f"rank {rank}"))
         except OSError as e:
-            terminate(procs)
+            collector.stop(terminal=True)
             raise TrlxError(f"cannot start worker rank {rank}: {e.strerror or e}")
     return procs
 
 
-# Non-blocking. Returns (rank, code) of a worker that exited nonzero, or None.
-# A failed rank means the others would hang in a collective waiting for it,
-# so they are killed rather than waited for.
-def check(procs):
+# Detect the first failing rank, then stop its peers with bounded cleanup time.
+# Preserve the original code even when other ranks subsequently exit on SIGINT.
+def check(procs, *, feedback=None):
     for rank, proc in enumerate(procs):
         code = proc.poll()
         if code is not None and code != 0:
-            terminate(procs)
+            terminate(procs, feedback=feedback)
             return rank, code
     return None
 
@@ -203,27 +202,42 @@ class Job:
         self.verify = None
         self.progress = progress
         self.feedback = feedback
+        self._failure = None
+        self._cancelled = False
 
-    # Non-blocking. Starts verify when its turn comes.
+    # Advance supervision; failed workers and the verify transition may require bounded cleanup.
     def poll(self):
+        if self._failure is not None:
+            return self._failure
+        if self._cancelled:
+            return "cancelled", 130
         if self.feedback is not None:
             self.feedback.check()
         if self.progress is not None:
             self.progress.check_error()
-        failure = check(self.workers)
+        failure = check(self.workers, feedback=self.feedback)
         if failure is not None:
-            return f"worker rank {failure[0]}", failure[1]
+            self._failure = (f"worker rank {failure[0]}", failure[1])
+            self.start_verify = None
+            return self._failure
         if self.verify is None and self.start_verify is not None and not running(self.workers):
+            # Worker exit alone does not prove descendant processes released CUDA.
+            errors = terminate(self.workers, feedback=self.feedback)
+            if errors:
+                raise TrlxError("cannot start verification after incomplete worker cleanup: " + "; ".join(errors))
             self.verify = self.start_verify()
         if self.verify is not None:
             code = self.verify.poll()
             if code is not None and code != 0:
-                return "verify", code
+                self._failure = ("verify", code)
+                return self._failure
         return None
 
     # True once nothing remains to run: workers exited (any code), and verify
     # was not wanted or has exited (any code; a failure is reported by poll).
     def done(self):
+        if self._failure is not None or self._cancelled:
+            return True
         if running(self.workers):
             return False
         if self.start_verify is None:
@@ -238,29 +252,47 @@ class Job:
             tick()
             failure = self.poll()
             if failure is not None:
-                if self.feedback is not None:
-                    self.feedback.finish()
+                self._finish_feedback(failure)
                 tick()
                 return failure
             time.sleep(_POLL_SECONDS)
         failure = self.poll()
-        if self.feedback is not None:
-            self.feedback.finish()
+        self._finish_feedback(failure)
         tick()
         return failure
 
-    # Kills whatever is still running, verify included.
-    def terminate(self):
-        terminate(self.workers + ([self.verify] if self.verify is not None else []))
+    # Cleanup diagnostics cannot overwrite the worker/verification failure already observed.
+    def _finish_feedback(self, failure):
+        if self.feedback is None:
+            return
+        try:
+            self.feedback.finish()
+        except Exception as error:
+            if failure is None:
+                raise
+            self.feedback.shutdown_notice(f"shutdown error: {error}")
+
+    # Cancellation revokes verification before cleanup; the collector also knows
+    # children created during a spawn interrupted before its return value was assigned.
+    def terminate(self, *, terminal=None):
+        self._cancelled = True
+        self.start_verify = None
+        if self.feedback is not None:
+            return self.feedback.stop(terminal=terminal)
+        return terminate(self.workers + ([self.verify] if self.verify is not None else []))
 
 
-# Kills workers that are still running.
-def terminate(procs):
-    for proc in procs:
-        if proc.poll() is None:
-            proc.kill()
-    for proc in procs:
-        proc.wait()
+# All shutdown entry points use the same group-aware policy.
+def terminate(procs, *, feedback=None):
+    if feedback is not None:
+        return feedback.stop(procs)
+
+    # A caller without a collector still receives explicit shutdown diagnostics.
+    def report(message):
+        if sys.stderr is not None:
+            print(message, file=sys.stderr, flush=True)
+
+    return processes.stop(procs, report)
 
 
 # An unused TCP port for the rendezvous, released just before the workers
