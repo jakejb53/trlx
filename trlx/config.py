@@ -93,6 +93,7 @@ class DatasetSpec:
     eval_fraction: float | None
     eval_source: DatasetRef | None
     synthetic_dataset_eval: bool = False
+    shuffle_eval_data: bool = False
 
     # Synthetic rows are generated after model placement, but evaluation is enabled now.
     @property
@@ -618,8 +619,11 @@ def _dataset(path, table):
     if "train" in table:
         raise TrlxError(f"{path}: [dataset].train is no longer supported; use eval_fraction (for example 0.1)")
     _check_keys(path, block, table, ("split", "dataset", "eval_fraction", "dataset_train", "dataset_eval",
-                                    "synthetic_dataset_eval"))
+                                    "synthetic_dataset_eval", "shuffle_eval_data"))
     split = _require(path, block, table, "split", bool)
+    shuffle = _require(path, block, table, "shuffle_eval_data", bool) if "shuffle_eval_data" in table else False
+    if shuffle and not split:
+        raise TrlxError(f"{path}: shuffle_eval_data requires the percentage split (split = true)")
     synthetic = (_require(path, block, table, "synthetic_dataset_eval", bool)
                  if "synthetic_dataset_eval" in table else False)
     if synthetic and (split or "dataset_eval" in table):
@@ -635,7 +639,8 @@ def _dataset(path, table):
             raise TrlxError(f"{path}: [dataset].eval_fraction must be between 0 and 1, exclusive, got {fraction}")
         if "dataset" not in table:
             raise TrlxError(f"{path}: [dataset] requires 'dataset'; supply --dataset or save the source in the config")
-        return DatasetSpec(True, dataset_ref(path, "[dataset].dataset", table["dataset"]), float(fraction), None)
+        return DatasetSpec(True, dataset_ref(path, "[dataset].dataset", table["dataset"]), float(fraction), None,
+                           shuffle_eval_data=shuffle)
     for wrong in ("dataset", "eval_fraction"):
         if wrong in table:
             raise TrlxError(f"{path}: [dataset] split = false uses 'dataset_train' and 'dataset_eval'; '{wrong}' is for split = true")

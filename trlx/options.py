@@ -166,6 +166,9 @@ def add_training_options(parser, method_name):
         ("--attn-implementation", "model.attn_implementation", str, "Attention backend, for example sdpa or eager."),
         ("--dataset", "dataset.source", str, "Training source: .jsonl/.json/.csv/.parquet or org/name:split."),
         ("--eval-fraction", "dataset.eval_fraction", float, "Evaluation share, strictly between 0 and 1; resolved at data load."),
+        ("--shuffle-eval-data", "dataset.shuffle_eval_data", bool,
+         "Randomly select the evaluation share instead of the final rows; requires --split. "
+         "Uses data_seed when set, otherwise seed; preserves row order within each set. Default: disabled."),
         ("--split", "dataset.split", bool, "Split one source; --no-split uses separate files and removes eval_fraction."),
         ("--dataset-train", "dataset.dataset_train", str, "Training source with --no-split."),
         ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source with --no-split; omit for training only."),

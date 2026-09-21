@@ -367,11 +367,18 @@ consistency. Prompt comparison is removed; delete `[verify].prompts`, `--verify-
 The generated `eval_fraction = 0.1` reserves the final 10% of rows for evaluation.
 The count is rounded up when loading the actual data; both partitions must remain
 nonempty. Evaluation measures held-out performance without updating model weights.
-Splitting preserves file order; shuffle first when a random split is appropriate.
+Add `--shuffle-eval-data` to select the same number of evaluation rows randomly from
+the whole source, excluding them from training. Both sets retain their original relative
+row order. The selection uses `--data-seed` when set, otherwise `--seed`, and repeats for
+the same source and seed. This option requires percentage-split mode and works for all trainers.
+To persist it, set `shuffle_eval_data = true` in `[dataset]`.
 
 ```sh
 # Change the held-out share for one run.
 trlx sft --model MODEL --dataset DATA --eval-fraction 0.2
+
+# Randomly hold out the same share instead of taking rows from the end.
+trlx sft --model MODEL --dataset DATA --eval-fraction 0.2 --shuffle-eval-data
 
 # Use separate training/evaluation files.
 trlx sft --model MODEL --no-split --dataset train.jsonl --dataset-eval eval.jsonl

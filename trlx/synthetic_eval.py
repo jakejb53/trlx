@@ -139,7 +139,15 @@ def generate(trainer, source, maximum, *, progress=None):
                                             total=count, unit="rows", visible=True) as activity:
         for index in range(count):
             number = index + 1
-            ids = _rank_zero(lambda: _prompt(processor, source[index]["text"], model, maximum, number), distributed)
+
+            # Rank zero logs the complete source before generation starts. Keep
+            # source access inside the coordinated failure boundary for peers.
+            def prepare_prompt():
+                text = source[index]["text"]
+                activity.note(f"Source {number}/{count}:\n{text}")
+                return _prompt(processor, text, model, maximum, number)
+
+            ids = _rank_zero(prepare_prompt, distributed)
             inputs = torch.tensor([ids], device=next(model.parameters()).device)
             try:
                 # Only natural EOS proves completion. Inherited time/string stops
@@ -158,6 +166,10 @@ def generate(trainer, source, maximum, *, progress=None):
             row = _rank_zero(lambda: _summary(tokenizer, output[0, len(ids):], ids, eos, maximum, number), distributed)
             rows.append(row)
             activity.advance()
+            # Only validated summaries are shown, once across ranks. Notes bypass
+            # counter throttling and reach both the terminal and the run log.
+            if not distributed or dist.get_rank() == 0:
+                activity.note(f"Summary {number}/{count}:\n{row['text']}\n\nSummaries generated: {number}/{count}")
     return rows
 
 

@@ -188,8 +188,10 @@ class Endpoint:
     # Runs complete_full() over many message lists with `concurrency` threads.
     # Observe completion order but store input order. Report failure before the
     # pool waits for running requests; queued requests are cancelled immediately.
+    # on_complete(index, reply) runs serially in the collecting thread, once per
+    # successful request; callback failures use the same batch cancellation path.
     def complete_many_full(self, message_lists, concurrency, max_tokens=None, *, progress=None,
-                           label="requests", require_stop=False):
+                           label="requests", require_stop=False, on_complete=None):
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise DatasetError("concurrency must be an integer at least 1")
         message_lists = list(message_lists)
@@ -207,6 +209,8 @@ class Endpoint:
                     for future in concurrent.futures.as_completed(futures):
                         try:
                             replies[futures[future]] = future.result()
+                            if on_complete is not None:
+                                on_complete(futures[future], replies[futures[future]])
                         except DatasetError as error:
                             # Request order is source-row order for eval-build.
                             raise DatasetError(

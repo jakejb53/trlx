@@ -10,6 +10,7 @@ columns found.
 """
 
 import math
+import random
 from fractions import Fraction
 
 import datasets
@@ -34,7 +35,9 @@ _FORMAT_COLUMNS = {
 
 # Loads the train set and the eval set (None when eval is disabled) for a
 # config.DatasetSpec, validated against `dataset_format`.
-def load(spec, dataset_format, *, progress=None):
+def load(spec, dataset_format, *, seed=None, progress=None):
+    if spec.shuffle_eval_data and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TrlxError("shuffle_eval_data requires an explicit integer split seed")
     if spec.split:
         whole = load_ref(spec.source, progress=progress)
         # Round evaluation upward so a positive fraction always reserves data.
@@ -49,8 +52,17 @@ def load(spec, dataset_format, *, progress=None):
                 f"(dataset has {whole.num_rows} rows)"
             )
         with stage(progress, "splitting training and evaluation rows", visible=True) as activity:
-            train = whole.select(range(train_rows))
-            eval_set = whole.select(range(train_rows, whole.num_rows))
+            if spec.shuffle_eval_data:
+                # A local RNG leaves training randomness untouched. Sample membership
+                # only, then retain source order on both sides of the disjoint split.
+                held_out = set(random.Random(seed).sample(range(whole.num_rows), eval_rows))
+                # Concrete indices also keep the dataset library's cache identity deterministic.
+                train = whole.select([index for index in range(whole.num_rows) if index not in held_out])
+                eval_set = whole.select(sorted(held_out))
+                activity.note(f"random evaluation sample; seed {seed}; source order retained within each set")
+            else:
+                train = whole.select(range(train_rows))
+                eval_set = whole.select(range(train_rows, whole.num_rows))
             activity.note(f"{train_rows} training rows; {eval_rows} evaluation rows")
     else:
         train = load_ref(spec.source, progress=progress)
@@ -72,7 +84,7 @@ REPLAY_COLUMN = "replay"
 # The train set with [replay].dataset mixed in (SPEC 2.9). `fraction` is the
 # replay share of the result, so R replay rows join N train rows where
 # R / (N + R) = fraction; R is rounded and at least 1. The first R rows of the
-# replay dataset in file order are used, matching the ordered train/eval split.
+# replay dataset in file order are used, independently of train/eval selection.
 # The two sets must have the same columns: concatenation needs equal
 # features, and the trainer decides the row shape from the first example.
 # `flag` adds REPLAY_COLUMN; without it the result is plain mixing.

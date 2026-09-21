@@ -114,6 +114,7 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 - `[teacher]`: `distillation` only. Same keys as `[model]`.
 - `[dataset]`:
   - `split = true`: `dataset` and `eval_fraction` strictly between 0 and 1. At load time, the final `ceil(row_count * eval_fraction)` rows evaluate; earlier rows train. Both sides must be nonempty. The old `train` key is rejected.
+  - Optional `shuffle_eval_data = true` / `--shuffle-eval-data` selects that same evaluation count randomly without replacement instead of from the end. Only valid with `split = true`. Uses `data_seed` when set, otherwise `seed`; preserves source order within both disjoint sets. Omission or false retains the end split.
   - `split = false`: `dataset_train`, optional `dataset_eval`. Without `dataset_eval` or synthetic evaluation, evaluation is disabled and `eval_*` fields are rejected.
   - Key mismatch with `split` is an error.
   - CLI `--dataset` selects the primary source in either mode. `--no-split` removes fractional-split keys; without a separate or synthetic evaluation source, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.

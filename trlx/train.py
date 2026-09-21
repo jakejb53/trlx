@@ -125,7 +125,8 @@ def _assess(cfg, gpu_count, *, progress=None):
         synthetic_eval.require_saved(pathlib.Path(cfg.args.resume_from_checkpoint).resolve().parent)
     metadata = _assessment_metadata(model_mod.load_config(cfg.model, progress=progress))
     processor = model_mod.assessment_processor(cfg, progress=progress)
-    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress,
+                                        seed=cfg.args.data_seed if cfg.args.data_seed is not None else cfg.args.seed)
     if cfg.dataset.synthetic_dataset_eval:
         with stage(progress, "validating CPT source rows", visible=True) as activity:
             synthetic_eval.validate_source(train_set)
@@ -483,7 +484,8 @@ def _train_worker(args):
 
     model = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
     processor = model_mod.load_processor(cfg.model, progress=progress)
-    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress,
+                                        seed=cfg.args.data_seed if cfg.args.data_seed is not None else cfg.args.seed)
     synthetic_callback = None
     if cfg.dataset.synthetic_dataset_eval:
         synthetic_eval.validate_source(train_set)
@@ -583,7 +585,8 @@ def check(args):
 
     model = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
     processor = model_mod.load_processor(cfg.model, progress=progress)
-    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress)
+    train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress,
+                                        seed=cfg.args.data_seed if cfg.args.data_seed is not None else cfg.args.seed)
     train_set = _mix_replay(cfg, train_set, progress=progress)
     report = preflight.Report()
     # The Trainer creates output_dir on construction. check writes nothing,

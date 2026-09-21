@@ -95,7 +95,9 @@ def _explicit_keys(document):
 def _selected(cfg):
     selected = set(_COMMON | _METHOD[cfg.method.name])
     selected.update(_explicit_keys(cfg.document) & _EXPLICIT_TUNING)
-    selected.update({"model.dtype", "dataset.eval_fraction", "rewards.funcs"})
+    selected.update({"model.dtype", "dataset.eval_fraction", "dataset.shuffle_eval_data", "rewards.funcs"})
+    if cfg.dataset.shuffle_eval_data:
+        selected.add("data_seed")
     if cfg.method.name == "sft":
         selected.add("dataset.synthetic_dataset_eval")
     for feature, details in _FEATURES.items():
@@ -137,7 +139,7 @@ def _applicable(key, cfg, controls):
         return cfg.rewards is not None
     if key == "dataset.dataset_train":
         return False  # --dataset already addresses the primary source in either mode.
-    if key == "dataset.eval_fraction":
+    if key in {"dataset.eval_fraction", "dataset.shuffle_eval_data"}:
         return cfg.dataset.split
     if key == "dataset.dataset_eval":
         return not cfg.dataset.split and cfg.dataset.eval_source is not None

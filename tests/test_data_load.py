@@ -1,5 +1,6 @@
 """Fractional holdout uses actual rows and never changes their order."""
 
+import random
 import unittest
 from unittest.mock import patch
 
@@ -17,11 +18,46 @@ class FractionalSplit(unittest.TestCase):
                 data_load.load_ref(ref)
 
     # In-memory datasets exercise the same slicing path as local and Hub sources.
-    def split(self, count, fraction):
+    def split(self, count, fraction, *, shuffle=False, seed=None):
         whole = Dataset.from_dict({"text": [str(index) for index in range(count)]})
-        spec = config.DatasetSpec(True, config.DatasetRef("memory.jsonl", True, None), fraction, None)
+        spec = config.DatasetSpec(True, config.DatasetRef("memory.jsonl", True, None), fraction, None,
+                                  shuffle_eval_data=shuffle)
         with patch.object(data_load, "load_ref", return_value=whole):
-            return data_load.load(spec, "language modeling or prompt-completion")
+            return data_load.load(spec, "language modeling or prompt-completion", seed=seed)
+
+    # Random membership keeps exact rounding, source order, and disjoint full coverage.
+    def test_random_split_preserves_counts_order_and_coverage(self):
+        before = random.getstate()
+        for count, fraction, expected in ((100, .07, 7), (23, .1, 3), (2, .1, 1)):
+            with self.subTest(count=count):
+                train, evaluation = self.split(count, fraction, shuffle=True, seed=42)
+                left, right = list(map(int, train["text"])), list(map(int, evaluation["text"]))
+                self.assertEqual(len(right), expected)
+                self.assertEqual(left, sorted(left))
+                self.assertEqual(right, sorted(right))
+                self.assertFalse(set(left) & set(right))
+                self.assertEqual(sorted(left + right), list(range(count)))
+        self.assertEqual(random.getstate(), before)
+
+    # The same source and seed reproduce membership independently of process RNG state.
+    def test_random_split_repeats_by_seed_and_samples_beyond_tail(self):
+        first_pair = self.split(100, .2, shuffle=True, seed=0)
+        repeated_pair = self.split(100, .2, shuffle=True, seed=0)
+        self.assertEqual([part._fingerprint for part in first_pair],
+                         [part._fingerprint for part in repeated_pair])
+        first = list(first_pair[1]["text"])
+        repeated = list(repeated_pair[1]["text"])
+        changed = list(self.split(100, .2, shuffle=True, seed=1)[1]["text"])
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, changed)
+        self.assertNotEqual(first, [str(index) for index in range(80, 100)])
+
+    # Random selection must never silently become unseeded or tolerate an empty side.
+    def test_random_split_rejects_missing_seed_and_empty_partition(self):
+        with self.assertRaisesRegex(TrlxError, "integer split seed"):
+            self.split(10, .1, shuffle=True)
+        with self.assertRaisesRegex(TrlxError, "both must be nonempty"):
+            self.split(1, .1, shuffle=True, seed=0)
 
     # The same config must adapt when the input grows between runs.
     def test_fraction_tracks_current_size(self):

@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, and synthetic CPT evaluation complete. Optional acceleration recommendations remain planned. Synthetic evaluation execution validation remains with the operator.
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, synthetic CPT evaluation, and optional random evaluation splitting complete. Optional acceleration recommendations remain planned. Synthetic evaluation execution validation remains with the operator.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -508,6 +508,18 @@ Completed: graceful cancellation (2026-09-21)
 - Independent source review completed. The inherited generation-stopping issue was fixed and
   re-reviewed with no remaining reported defects. No tests, endpoint requests, or training runs
   were executed. Execution validation remains with the operator.
+
+### Random evaluation split (complete, 2026-09-21)
+
+- All trainers support `--shuffle-eval-data` / `[dataset].shuffle_eval_data` for standard percentage
+  splitting. Samples without replacement using the existing evaluation fraction and rounding;
+  selected rows are excluded from training. Both sets retain source order. Default remains the tail split.
+- Selection uses `data_seed` when set, otherwise `seed`, consistently across assessment, workers,
+  and `check`. The option survives run snapshots and requires `split = true`.
+- Updated `trlx/data_load.py`, `config.py`, `options.py`, `train.py`, `review.py`, focused tests,
+  `README.md`, and `SPEC.md`. No operational configuration files changed.
+- Validation: 125 focused tests passed. The broader supervisor suite's 7 failures and 17 errors
+  reproduced with the original loading calls; existing process-control fixture failures remain unresolved.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

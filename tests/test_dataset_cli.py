@@ -236,6 +236,9 @@ class DatasetOutputs(unittest.TestCase):
             "chat": ([text, "--questions-endpoint", "https://example.invalid/v1",
                       "--questions-model", "model", "--n", "1", "--max-tokens", "32",
                       "--concurrency", "1", "--timeout", "1", "--retries", "0"], "questions from model"),
+            "eval-build": ([self.source, "--endpoint", "https://example.invalid/v1",
+                            "--model", "model", "--max-tokens", "32", "--concurrency", "2",
+                            "--timeout", "1", "--retries", "0"], "source row summaries from model"),
             "stats": ([self.source], "counting tokens in text"),
         }
         self.assertEqual(set(cases), set(_commands(cli.build_parser())))
@@ -257,7 +260,8 @@ class DatasetOutputs(unittest.TestCase):
 
                 # Keep both real generation passes and endpoint progress; replace only HTTP I/O.
                 def reply(*args, **kwargs):
-                    return io.BytesIO(json.dumps({"choices": [{"message": {"content": "A reply"}}]}).encode())
+                    return io.BytesIO(json.dumps({"choices": [{"message": {"content": "A reply"},
+                                                               "finish_reason": "stop"}]}).encode())
 
                 with patch("dataset.cli.env.load"), patch("builtins.open", side_effect=open_source), \
                         patch("dataset.endpoint.urllib.request.urlopen", side_effect=reply) as request, \
@@ -268,13 +272,17 @@ class DatasetOutputs(unittest.TestCase):
                 self.assertIn(processing, stderr.getvalue())
                 self.assertIn(f"dataset {name}: completed; elapsed", stderr.getvalue())
                 self.assertNotIn(f"dataset {name}:", stdout.getvalue())
-                self.assertEqual(request.call_count, 2 if name == "chat" else 0)
+                self.assertEqual(request.call_count, 2 if name in {"chat", "eval-build"} else 0)
                 if name != "stats":
                     self.assertTrue(output.is_file())
                     self.assertIn(f"published {output}", stderr.getvalue())
                 if name == "chat":
                     self.assertIn("answers from model", stderr.getvalue())
                     self.assertIn("1/1 requests", stderr.getvalue())
+                if name == "eval-build":
+                    self.assertIn("Summary 1/2:\nA reply\n\nSummaries generated:", stderr.getvalue())
+                    self.assertIn("Summary 2/2:\nA reply\n\nSummaries generated:", stderr.getvalue())
+                    self.assertIn("Summaries generated: 2/2", stderr.getvalue())
 
     # Healing may publish a partially repaired file while correctly returning a failed outcome.
     def test_heal_unresolved_errors_do_not_report_command_success(self):

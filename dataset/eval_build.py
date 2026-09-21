@@ -15,7 +15,7 @@ SUMMARY_PROMPT = (
 
 
 # Validate the entire source before requesting anything; publish only after every
-# ordered reply passes validation. One request always corresponds to one source row.
+# reply passes validation. Completion logs may be out of order; saved rows may not.
 def build(rows, endpoint, max_tokens, concurrency, strip_reasoning_tags=False, *, progress=None):
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
         raise DatasetError("--max-tokens must be a positive integer completion-token limit")
@@ -33,20 +33,30 @@ def build(rows, endpoint, max_tokens, concurrency, strip_reasoning_tags=False, *
             ])
             activity.advance()
 
-    replies = endpoint.complete_many_full(
-        requests, concurrency, max_tokens, progress=progress,
-        label="source row summaries", require_stop=True,
-    )
-    if len(replies) != len(rows):
-        raise DatasetError(f"expected {len(rows)} summaries, received {len(replies)}; output was not written")
-    output = []
-    with stage(progress, "validating summaries", total=len(rows), unit="rows") as activity:
-        for number, reply in enumerate(replies, 1):
-            # Separate reasoning is deliberately excluded; the existing chat guard
-            # owns the explicit inline-stripping policy and rejects unclosed blocks.
+    output = [None] * len(rows)
+    completed = 0
+    with stage(progress, "generating evaluation summaries", visible=True) as activity:
+        # The endpoint calls this serially as requests finish. Validate before
+        # counting or displaying, and emit each full pair under one reporter lock.
+        def completed_summary(index, reply):
+            nonlocal completed
+            number = index + 1
+            # Separate reasoning is excluded; the chat guard owns inline stripping.
             text = strip_inline_reasoning(reply.content, f"source row {number}", strip_reasoning_tags).strip()
             if not text:
                 raise DatasetError(f"source row {number}: summary is empty; output was not written")
-            output.append({"text": text})
-            activity.advance()
+            output[index] = {"text": text}
+            completed += 1
+            activity.note(f"Source {number}/{len(rows)}:\n{rows[index]['text']}\n\n"
+                          f"Summary {number}/{len(rows)}:\n{text}\n\n"
+                          f"Summaries generated: {completed}/{len(rows)}")
+
+        replies = endpoint.complete_many_full(
+            requests, concurrency, max_tokens, progress=progress,
+            label="source row summaries", require_stop=True, on_complete=completed_summary,
+        )
+    if len(replies) != len(rows):
+        raise DatasetError(f"expected {len(rows)} summaries, received {len(replies)}; output was not written")
+    if completed != len(rows):
+        raise DatasetError(f"expected {len(rows)} validated summaries, received {completed}; output was not written")
     return output

@@ -23,6 +23,52 @@ class Resolution(unittest.TestCase):
         with patch.object(config, "_read_toml", return_value=self.source):
             return config.load(args.config, method, overrides=options.overrides(args))
 
+    # The optional split selection survives CLI resolution and worker snapshots for every trainer.
+    def test_random_eval_split_round_trip_for_all_methods(self):
+        for method in cli.METHODS:
+            extra = ["--shuffle-eval-data", "--data-seed", "0", "--seed", "17"]
+            if method == "distillation":
+                extra += ["--teacher", "teacher"]
+            if method in ("grpo", "rloo"):
+                extra += ["--reward", "json_valid"]
+            with self.subTest(method=method):
+                cfg = self.load(method, extra)
+                self.assertTrue(cfg.dataset.shuffle_eval_data)
+                with patch.object(config, "_read_toml", return_value=self.snapshot(cfg)):
+                    worker = config.load("snapshot", method, resolved=True)
+                self.assertEqual(worker.dataset, cfg.dataset)
+                self.assertEqual(worker.args.data_seed, 0)
+                self.assertEqual(worker.args.seed, 17)
+
+    # Explicit disabling overrides saved membership selection; absence keeps the old default.
+    def test_random_eval_split_default_and_override(self):
+        self.assertFalse(self.load().dataset.shuffle_eval_data)
+        self.source["dataset"]["shuffle_eval_data"] = True
+        self.assertTrue(self.load().dataset.shuffle_eval_data)
+        self.assertFalse(self.load(extra=["--no-shuffle-eval-data"]).dataset.shuffle_eval_data)
+
+    # Selection applies only to percentage splitting and must be a real boolean.
+    def test_random_eval_split_rejects_incompatible_modes_and_types(self):
+        for extra in (["--no-split"], ["--no-split", "--dataset-eval", "eval.jsonl"],
+                      ["--synthetic-dataset-eval"]):
+            with self.subTest(extra=extra), self.assertRaisesRegex(TrlxError, "percentage split"):
+                self.load(extra=["--shuffle-eval-data", *extra])
+        self.source["dataset"]["shuffle_eval_data"] = "yes"
+        with self.assertRaisesRegex(TrlxError, "shuffle_eval_data must be bool"):
+            self.load()
+
+    # Exercise the actual assessment loading boundary, including data_seed=0 precedence.
+    def test_assessment_passes_effective_split_seed(self):
+        for extra, expected in ((["--seed", "17"], 17), (["--seed", "17", "--data-seed", "0"], 0)):
+            cfg = self.load(extra=["--shuffle-eval-data", *extra])
+            with patch.object(train.model_mod, "load_config"), \
+                 patch.object(train, "_assessment_metadata", return_value={}), \
+                 patch.object(train.model_mod, "assessment_processor"), \
+                 patch.object(train.data_load, "load", side_effect=RuntimeError("loading boundary")) as load:
+                with self.assertRaisesRegex(RuntimeError, "loading boundary"):
+                    train._assess(cfg, 1)
+            self.assertEqual(load.call_args.kwargs["seed"], expected)
+
     # CLI wins over the selected method, which wins over shared settings.
     def test_precedence_without_source_mutation(self):
         self.source["learning_rate"] = 0.03

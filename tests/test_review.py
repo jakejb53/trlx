@@ -35,6 +35,16 @@ def arguments(text):
 
 
 class Rendering(unittest.TestCase):
+    # The review exposes membership selection and its effective data seed only where applicable.
+    def test_random_eval_selection_and_seed_are_visible(self):
+        cfg = configuration(extra={"data_seed": 0, "dataset": {
+            "split": True, "dataset": "data.jsonl", "eval_fraction": .1, "shuffle_eval_data": True}})
+        fragments = arguments(review.render(cfg, width=120))
+        self.assertIn("--shuffle-eval-data", fragments)
+        self.assertIn("--data-seed 0", fragments)
+        separate = configuration(extra={"dataset": {"split": False, "dataset_train": "data.jsonl"}})
+        self.assertNotIn("shuffle-eval-data", review.render(separate, width=120))
+
     # All trainer registries are exercised; no model source may be consulted.
     def test_method_selection_and_every_fragment_parses(self):
         expected = {"sft": "--assistant-only-loss", "dpo": "--beta", "kto": "--desirable-weight",
