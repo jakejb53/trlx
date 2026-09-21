@@ -549,7 +549,7 @@ def check(args):
         cfg = config_mod.from_document(document, args.method, path=source)
     config_mod.require_assessment(cfg, source)
     assessment_report = _assess(cfg, 1, progress=progress)
-    print(review.render_assessment(assessment_report, will_publish=False), flush=True)
+    print(review.render_assessment(assessment_report, cfg, will_publish=False), flush=True)
     print(f"check: one process on GPU {physical[0]}", file=sys.stderr)
     preflight.check_config(cfg, source, None, progress=progress)
     print("preflight: config checks passed", file=sys.stderr)

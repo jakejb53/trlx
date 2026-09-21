@@ -371,6 +371,25 @@ Completed: tuning-only review (2026-09-20)
   Synthetic CPU, single-GPU, DDP, and LoRA/FSDP checks preserved training state and the next update,
   including FSDP generation-error cleanup. No full-scale model run or live judge endpoint was tested.
 
+Completed: assessment readability (2026-09-20)
+
+- Startup and `check` assessments show only warnings and errors, grouped by severity; the entire
+  section is omitted when neither exists. Evidence uses readable fields, affected-row percentages,
+  token totals, and explicit unknowns. Relevant CLI settings
+  accompany findings with resolved values and explanations, including method and evaluation overrides.
+- Full report evidence is preserved; long terminal lists have counted previews. Runtime notices retain
+  their existing format. Files: `trlx/review.py`, `trlx/train.py`, `tests/test_review.py`,
+  and `tests/test_assessment_lifecycle.py`.
+- Verification: 102 focused tests passed; independent review findings were fixed and re-reviewed
+  with no remaining blockers. All 102 tests passed again after the warnings-and-errors-only follow-up,
+  including empty output and evidence preservation checks. No live GPU training was run.
+  From the repo root with the project Python:
+
+  ```sh
+  PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+    tests.test_review tests.test_assessment_lifecycle tests.test_assessment tests.test_train -q
+  ```
+
 ### Training output improvements (complete, 2026-09-20)
 
 - `trlx/feedback.py` separates typed worker feedback from raw output. The supervisor records both

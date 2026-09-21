@@ -124,22 +124,25 @@ class AssessmentLifecycleTests(unittest.TestCase):
     # Terminal previews may be concise, but neither nested evidence nor the
     # persisted report is truncated as a side effect of rendering.
     def test_assessment_preview_preserves_full_evidence_and_check_mode(self):
+        from tests.test_review import configuration
+
         report = {"profile": {"train": {"rows": 1000}, "eval": {"rows": 100}},
                   "findings": [{"code": "data.train.truncated_rows", "basis": "projected", "severity": "warning",
-                                "summary": "Sequence settings discard tokens", "evidence": {"rows": list(range(1000))},
+                                "summary": "Sequence settings discard tokens", "evidence": {"split": "train", "truncated_rows": list(range(1000))},
                                 "recommendation": "Review the affected rows."}],
                   "quality": {"preset": "qa", "rows": 100}}
         original = copy.deepcopy(report)
-        training_text = review.render_assessment(report)
-        check_text = review.render_assessment(report, will_publish=False)
+        cfg = configuration()
+        training_text = review.render_assessment(report, cfg, width=120)
+        check_text = review.render_assessment(report, cfg, will_publish=False, width=120)
         self.assertEqual(report, original)
-        self.assertIn('"count": 1000', training_text)
-        self.assertIn('"first": [0, 1, 2, 3, 4]', training_text)
+        self.assertIn('1,000 entries; first 5 shown', training_text)
+        self.assertIn('0, 1, 2, 3, 4', training_text)
         self.assertNotIn("998", training_text)
         self.assertIn("assessment.json after confirmation", training_text)
         self.assertNotIn("assessment.json", check_text)
         self.assertIn("Advisory only", check_text)
-        self.assertIn("including when evaluation is disabled", training_text)
+        self.assertNotIn("Independent quality checks:", training_text)
 
     # A complete malformed quality record must fail with source/line context,
     # rather than crashing later inside a live renderer or a resume comparison.

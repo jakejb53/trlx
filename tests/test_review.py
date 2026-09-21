@@ -243,6 +243,146 @@ class Rendering(unittest.TestCase):
         self.assertEqual(options.overrides(parsed)["rewards.funcs"], ["json_valid"])
 
 
+class AssessmentRendering(unittest.TestCase):
+    # Synthetic full-scan evidence exercises presentation without accessing source datasets.
+    def report(self, *, split="train", issue="truncated_rows", count=284):
+        return {"profile": {"train": {"rows": 289, "effective_rows": 200, "raw_tokens": 400000,
+                                       "retained_tokens": 280000, "discarded_tokens": 120000},
+                            "eval": {"rows": 33}},
+                "findings": [{"code": f"data.{split}.{issue}", "severity": "warning", "basis": "projected",
+                              "summary": "Sequence settings discard tokens", "evidence": {"split": split, issue: list(range(count))},
+                              "recommendation": "Inspect the affected rows before changing sequence settings."}]}
+
+    # Count source rows, preserve token totals, and expose effective CLI overrides with explanations.
+    def test_truncation_counts_settings_and_immutability(self):
+        cfg = configuration(extra={"max_length": 1024, "truncation_mode": "keep_start", "packing": False})
+        report = self.report()
+        original = copy.deepcopy(report)
+        text = review.render_assessment(report, cfg, width=100)
+        for fragment in ("284 of 289 rows (98.3%)", "Total source tokens: 400,000",
+                         "Tokens retained after preparation: 280,000", "Tokens discarded by all preparation: 120,000",
+                         "284 entries; first 5 shown", "0, 1, 2, 3, 4", "--max-length 1024", "--truncation-mode keep_start",
+                         "--no-packing", "Keeps the beginning", "--packing-strategy"):
+            self.assertIn(fragment, text)
+        self.assertNotIn('"truncated_rows":', text)
+        self.assertEqual(report, original)
+
+    # Missing token projections cannot masquerade as zero; wrapped prose remains complete.
+    def test_eval_unknown_totals_and_narrow_terminal(self):
+        cfg = configuration(extra={"max_length": 1024})
+        text = review.render_assessment(self.report(split="eval", count=33), cfg, width=60)
+        joined = " ".join(text.split())
+        self.assertIn("33 of 33 rows (100.0%)", joined)
+        self.assertIn("Tokens discarded by all preparation: unknown", joined)
+        self.assertIn("within this split", joined)
+        self.assertTrue(all(len(line) <= 60 for line in text.splitlines()))
+
+    # Eval packing is independent of training packing; inactive controls must not mislead operators.
+    def test_eval_packing_overrides_in_both_directions(self):
+        for training, evaluation in ((True, False), (False, True)):
+            with self.subTest(training=training, evaluation=evaluation):
+                cfg = configuration(extra={"packing": training, "eval_packing": evaluation})
+                text = review.render_assessment(self.report(split="eval", count=33), cfg)
+                if evaluation:
+                    self.assertIn("--eval-packing", text)
+                    self.assertIn("--packing-strategy", text)
+                    self.assertNotIn("--truncation-mode", text)
+                else:
+                    self.assertIn("--no-eval-packing", text)
+                    self.assertIn("--truncation-mode", text)
+                    self.assertNotIn("--packing-strategy", text)
+
+    # Repairing duplicate data is not a reason to suggest unrelated tuning changes.
+    def test_data_only_action_and_nested_evidence(self):
+        report = self.report(issue="duplicates", count=2)
+        finding = report["findings"][0]
+        finding.update(basis="measured", summary="Identical examples repeat", recommendation="Confirm repetition is intentional.")
+        finding["evidence"] = {"duplicates": [{"rows": [2, 7], "detail": {"source": "original"}}]}
+        text = review.render_assessment(report, configuration())
+        self.assertIn("Action applies to the data", text)
+        self.assertIn("Rows: 2 entries (2, 7)", text)
+        self.assertIn("Source: original", text)
+        self.assertNotIn("Relevant settings", text)
+
+    # Only problems render across all methods; their relevant settings remain visible.
+    def test_all_methods_static_findings_and_setting_associations(self):
+        from trlx import assessment
+
+        for method in ("sft", "dpo", "kto", "grpo", "rloo", "reward", "distillation"):
+            with self.subTest(method=method):
+                cfg = configuration(method, extra={"max_steps": 40, "warmup_steps": 40})
+                report = self.report()
+                report["profile"]["eval"].update(effective_rows=33, loss_tokens=33759)
+                report["findings"] = assessment.static_findings(cfg, report["profile"], 2)
+                text = review.render_assessment(report, cfg, width=100)
+                for flag in ("--max-steps 40", "--warmup-steps 40"):
+                    self.assertIn(flag, text)
+                self.assertNotIn("Batch per optimizer update", text)
+                self.assertNotIn("Training duration:", text)
+                self.assertNotIn("Evaluation coverage", text)
+                self.assertNotIn("Training estimates and information", text)
+                if method != "sft":
+                    self.assertNotIn("--packing", text)
+
+    # Display order follows severity while a max-step budget hides the overridden epoch setting.
+    def test_priority_and_max_step_precedence(self):
+        from trlx import assessment
+
+        cfg = configuration(extra={"max_steps": 40, "num_train_epochs": 99, "warmup_steps": 40})
+        report = self.report()
+        report["findings"] = assessment.static_findings(cfg, report["profile"], 2) + report["findings"]
+        report["findings"].append({"code": "data.train.errors", "severity": "error", "basis": "projected",
+                                   "summary": "Rows could not be profiled", "evidence": {},
+                                   "recommendation": "Correct incompatible rows."})
+        text = review.render_assessment(report, cfg)
+        self.assertLess(text.index("Errors:"), text.index("Warnings:"))
+        self.assertIn("--max-steps 40", text)
+        self.assertNotIn("--num-train-epochs", text)
+
+    # Empty and information-only reports print nothing, even with quality checks configured.
+    def test_no_problems_omits_section_and_preserves_evidence(self):
+        from trlx import assessment
+
+        cfg = configuration(extra={"peft": {"r": 16, "lora_alpha": 8, "use_rslora": True,
+                                              "rank_pattern": {"Decoder.Q_proj$": 4}}})
+        report = self.report()
+        report["findings"] = assessment.static_findings(cfg, report["profile"], 1)
+        report["quality"] = {"preset": "qa", "rows": 100}
+        for findings in (report["findings"], []):
+            report["findings"] = findings
+            original = copy.deepcopy(report)
+            for will_publish in (True, False):
+                self.assertEqual(review.render_assessment(report, cfg, will_publish=will_publish), "")
+                self.assertEqual(report, original)
+
+    # Vocabulary token strings are evidence, whereas actual credential settings remain redacted.
+    def test_distillation_mismatch_keeps_literal_tokens(self):
+        report = self.report()
+        report["findings"] = [{"code": "distillation_token_ids", "severity": "warning", "basis": "measured",
+                               "summary": "Token IDs differ", "recommendation": "Use compatible vocabularies.",
+                               "evidence": {"mismatches": [{"token": "Example_TOKEN", "student_id": 2, "teacher_id": 3}]}}]
+        cfg = configuration("distillation")
+        text = review.render_assessment(report, cfg)
+        self.assertIn("Token: Example_TOKEN", text)
+        self.assertIn("--model example-model", text)
+        self.assertIn("--teacher example-teacher", text)
+
+    # Scoring-only quality presets must not suggest a generation control they never use.
+    def test_quality_context_settings_follow_preset(self):
+        for preset in ("language_modeling", "preference", "qa"):
+            with self.subTest(preset=preset):
+                cfg = types.SimpleNamespace(**vars(configuration()))
+                cfg.assessment = types.SimpleNamespace(quality_preset=preset, quality_max_length=1024,
+                                                       quality_max_new_tokens=64)
+                report = self.report()
+                report["findings"] = [{"code": "quality_context_budget", "severity": "warning", "basis": "projected",
+                                       "summary": "Quality context exceeds capacity", "evidence": {},
+                                       "recommendation": "Review input and generation limits."}]
+                text = review.render_assessment(report, cfg)
+                self.assertIn("--quality-max-length 1024", text)
+                self.assertEqual("--quality-max-new-tokens 64" in text, preset == "qa")
+
+
 class Input(unittest.TestCase):
     # The render path is tested above; these tests isolate consent and stream handling.
     def setUp(self):

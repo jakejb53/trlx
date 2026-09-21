@@ -388,18 +388,237 @@ def format_finding(finding):
     return text
 
 
-# Pre-run advice supplements the tuning list; full row evidence is published after confirmation.
-def render_assessment(report, *, will_publish=True):
+# Associations select presentation only; CLI definitions and resolved config own names and values.
+_ASSESSMENT_SETTINGS = {
+    "effective_batch": "per_device_train_batch_size gradient_accumulation_steps",
+    "training_budget": "num_train_epochs max_steps warmup_steps dataloader_drop_last",
+    "warmup_entire_run": "warmup_steps num_train_epochs max_steps",
+    "generation_schedule_incompatible": "per_device_train_batch_size generation_batch_size steps_per_generation num_generations",
+    "prompt_groups": "per_device_train_batch_size gradient_accumulation_steps generation_batch_size steps_per_generation num_generations num_iterations",
+    "empty_training_batches": "per_device_train_batch_size gradient_accumulation_steps generation_batch_size steps_per_generation num_generations dataloader_drop_last",
+    "kto_kl_batch": "loss_type per_device_train_batch_size train_sampling_strategy gradient_accumulation_steps",
+    "kto_parallel_kl_groups": "per_device_train_batch_size dataset_num_proc",
+    "kto_singleton_kl": "per_device_train_batch_size",
+    "kto_weighted_balance": "desirable_weight undesirable_weight",
+    "dpo_aot_batch": "loss_type per_device_train_batch_size gradient_accumulation_steps",
+    "dpo_inactive_smoothing": "loss_type label_smoothing",
+    "reward_filtered_pairs": "max_length",
+    "replay_exposure": "replay.dataset replay.fraction replay.kl_coef",
+    "evaluation_coverage": "dataset.split dataset.eval_fraction dataset.dataset_eval eval_strategy eval_steps",
+    "lora_scale": "peft.r peft.lora_alpha peft.use_rslora peft.rank_pattern peft.alpha_pattern",
+    "model_context_budget": "max_length max_prompt_length max_completion_length generation_kwargs",
+    "distillation_vocab_size": "model.path teacher.path",
+    "distillation_token_ids": "model.path teacher.path",
+    "quality_input_limits": "assessment.quality_dataset assessment.quality_max_length",
+    "quality_context_budget": "assessment.quality_max_length assessment.quality_max_new_tokens",
+    "quality_overlap": "assessment.quality_dataset",
+}
+
+
+# Null evidence is unknown, not zero; enum implementation names are not operator terminology.
+def _assessment_value(value):
+    value = _plain(value)
+    if value is None:
+        return "unknown"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{value:,}"
+    return str(value).removeprefix("IntervalStrategy.")
+
+
+# Wrap prose without splitting CLI flags, paths, or identifiers; no value is truncated.
+def _assessment_paragraph(text, width, indent="  "):
+    return textwrap.wrap(text, width=max(width, len(indent) + 20), initial_indent=indent,
+                         subsequent_indent=indent, break_long_words=False, break_on_hyphens=False)
+
+
+# Retain nested field names and explicitly count previews; full evidence stays in the report.
+def _assessment_evidence(evidence, width, indent="    ", *, literal_keys=False):
+    lines = []
+    for key, value in evidence.items():
+        label = {"limitation": "Limits of this estimate", "eval_loss_tokens": "Evaluation tokens contributing to loss",
+                 "train_rows": "Prepared training rows", "eval_rows": "Prepared evaluation rows",
+                 "eval_strategy": "Evaluation schedule"}.get(key, key.replace("_", " ").capitalize())
+        if literal_keys:
+            label = key
+        if isinstance(value, dict) and value:
+            lines.extend(_assessment_paragraph(label + ":", width, indent))
+            # Module patterns are executable matching expressions, not prose labels.
+            lines.extend(_assessment_evidence(value, width, indent + "  ",
+                         literal_keys=literal_keys or key in {"rank_pattern", "alpha_pattern"}))
+        elif isinstance(value, (list, tuple)):
+            suffix = f"{len(value):,} entries; first 5 shown" if len(value) > 5 else f"{len(value):,} entries"
+            if any(isinstance(item, (dict, list, tuple)) for item in value[:5]):
+                lines.extend(_assessment_paragraph(f"{label}: {suffix}", width, indent))
+                for index, item in enumerate(value[:5]):
+                    lines.extend(_assessment_evidence({f"entry {index}": item}, width, indent + "  "))
+            else:
+                preview = ", ".join(_assessment_value(item) for item in value[:5])
+                lines.extend(_assessment_paragraph(f"{label}: {suffix}" + (f" ({preview})" if preview else ""), width, indent))
+        else:
+            text = "none" if isinstance(value, dict) and not value else _assessment_value(value)
+            if key == "eval_strategy":
+                text = {"epoch": "at the end of each epoch", "steps": "at the configured step interval",
+                        "no": "disabled"}.get(text.lower(), text)
+            elif key == "max_steps" and isinstance(value, (int, float)) and value <= 0:
+                text += " (inactive; epoch count determines the budget)"
+            elif key == "budget_source":
+                text = {"num_train_epochs": "epoch count (--num-train-epochs)",
+                        "max_steps": "update limit (--max-steps)"}.get(value, text)
+            lines.extend(_assessment_paragraph(f"{label}: {text}", width, indent))
+    return lines
+
+
+# Source-row percentages use source rows, never packed-block or retained-row denominators.
+def _assessment_finding(finding, profile):
+    code = finding["code"]
+    evidence = dict(finding.get("evidence") or {})
+    summary = finding["summary"]
+    if code in {"data.train.truncated_rows", "data.eval.truncated_rows"}:
+        split = code.split(".")[1]
+        indices = evidence.get("truncated_rows")
+        source = profile.get(split) or {}
+        rows = source.get("rows")
+        if indices is not None and rows:
+            name = "Training" if split == "train" else "Evaluation"
+            summary = f"{name}: {len(indices):,} of {rows:,} rows ({len(indices) / rows:.1%}) will lose tokens."
+            evidence.pop("split", None)
+            evidence.pop("truncated_rows")
+            evidence = {"affected_row_indices (zero-based, within this split)": indices, **evidence}
+        # These totals cover ALL preparation losses, including dropped rows; do not
+        # attribute them solely to truncation or fabricate counts after scan errors.
+        evidence.update({"total_source_tokens": source.get("raw_tokens"),
+                         "tokens_retained_after_preparation": source.get("retained_tokens"),
+                         "tokens_discarded_by_all_preparation": source.get("discarded_tokens")})
+    elif code == "effective_batch":
+        summary = f"Batch per optimizer update: {_assessment_value(evidence['effective_batch'])} entries."
+        evidence.pop("effective_batch")
+    elif code == "training_budget":
+        summary = f"Training duration: approximately {_assessment_value(evidence['updates'])} optimizer updates."
+        evidence.pop("updates")
+    elif code == "evaluation_coverage":
+        summary = "Evaluation coverage"
+    elif code == "lora_scale":
+        divisor = "sqrt(rank)" if evidence.get("use_rslora") else "rank"
+        summary = f"LoRA scaling: {_assessment_value(evidence['default_scale'])} (alpha / {divisor})."
+        evidence.pop("default_scale")
+    return summary, evidence
+
+
+# Data repair has no tuning cure. Sequence findings show only the selected method's controls.
+def _assessment_setting_keys(finding, cfg):
+    code = finding["code"]
+    if code.startswith("data.overlap."):
+        return "dataset.source dataset.split dataset.eval_fraction dataset.dataset_eval".split()
+    if code.startswith("data."):
+        split, issue = code.split(".")[1:]
+        if issue not in {"truncated_rows", "dropped_rows", "zero_loss_rows", "boundary_mismatch_rows", "errors"}:
+            return []
+        keys = ["max_length"]
+        if cfg.method.name == "sft":
+            # Evaluation may override packing independently. Only inherit the
+            # training switch when eval_packing is unset, as the profiler does.
+            packing = cfg.args.packing
+            if split == "eval" and cfg.args.eval_packing is not None:
+                packing = cfg.args.eval_packing
+                keys.append("eval_packing")
+            else:
+                keys.append("packing")
+                if split == "eval":
+                    keys.append("eval_packing")
+            keys.append("packing_strategy" if packing else "truncation_mode")
+            keys.append("dataset_kwargs")
+        elif cfg.method.name == "dpo":
+            keys.append("truncation_mode")
+        if issue in {"zero_loss_rows", "boundary_mismatch_rows", "errors"}:
+            keys += ["completion_only_loss", "assistant_only_loss", "chat_template_path"]
+        return keys
+    return _ASSESSMENT_SETTINGS.get(code, "").split()
+
+
+# Explain each displayed current value using shared metadata, with context for inherited controls.
+def _assessment_setting_lines(finding, cfg, profile, settings, controls, width):
+    lines = []
+    for key in _assessment_setting_keys(finding, cfg):
+        setting = settings.get(key)
+        # Split-specific selection above already resolved packing applicability;
+        # the tuning-list filter only knows the TRAIN packing configuration.
+        split_specific = finding["code"].startswith("data.") and key in {"packing", "eval_packing", "packing_strategy", "truncation_mode"}
+        if setting is None or not split_specific and not _applicable(key, cfg, controls):
+            continue
+        if key == "assessment.quality_max_new_tokens" and cfg.assessment.quality_preset in {"language_modeling", "preference"}:
+            continue  # These presets score existing tokens and never generate responses.
+        value = _plain(_value(key, cfg, controls))
+        # Empty optional dictionaries and absent template overrides have no effect here.
+        if key in {"dataset_kwargs", "generation_kwargs", "chat_template_path"} and not value:
+            continue
+        safe = _redact(value, key.rsplit(".", 1)[-1])
+        argument = _argument(setting, safe) if safe == value else None
+        if argument is None:
+            argument = f"{setting.flag}: {'automatic/unset' if safe is None else safe}"
+        description = _description(setting, value, cfg).rsplit(" Type:", 1)[0]
+        if key == "max_length":
+            description = "Sequence token limit; increasing it can retain more content and requires more memory."
+        elif key == "truncation_mode":
+            description = {"keep_start": "Keeps the beginning; excess tokens at the end are discarded.",
+                           "keep_end": "Keeps the end; excess tokens at the beginning are discarded."}.get(value, description)
+        elif key == "packing":
+            description = ("Combines sequences into blocks; --packing-strategy determines how long sequences are handled."
+                           if value else "Prepares sequences individually. If enabling --packing, also review --packing-strategy; some strategies truncate long sequences.")
+        elif key == "eval_packing" and value is None:
+            description = f"Inherits --packing ({'enabled' if cfg.args.packing else 'disabled'}) for evaluation."
+        elif key == "gradient_accumulation_steps":
+            description = "Batches accumulated per optimizer update; this does not enlarge each device's individual batch."
+        elif key.startswith("peft."):
+            description = {
+                "peft.r": "Default adapter rank; changes adapter capacity and the scaling denominator.",
+                "peft.lora_alpha": "Adapter scaling numerator; changing it changes the adapter contribution.",
+                "peft.use_rslora": "Uses alpha / sqrt(rank) when enabled; otherwise alpha / rank.",
+                "peft.rank_pattern": "Per-layer rank overrides; an empty table uses the default rank everywhere.",
+                "peft.alpha_pattern": "Per-layer alpha overrides; an empty table uses the default alpha everywhere.",
+            }[key]
+        lines.extend(_assessment_paragraph(argument, width, "      "))
+        lines.extend(_assessment_paragraph(description, width, "        "))
+    if lines:
+        return ["    Relevant settings (current values):", *lines]
+    return ["    Action applies to the data; no tuning setting repairs this finding."] if finding["code"].startswith("data.") else []
+
+
+# Pre-run presentation is separate from runtime notices; neither may mutate persisted evidence.
+def render_assessment(report, cfg, *, will_publish=True, width=None):
+    # Routine estimates stay in the complete report; only problems warrant review.
+    problems = [item for item in report["findings"] if item["severity"] in {"error", "warning"}]
+    if not problems:
+        return ""
     profile = report["profile"]
     train, evaluation = profile["train"], profile.get("eval")
-    lines = ["", "Settings assessment:",
-             f"  Full scan: {train['rows']} training rows; {evaluation['rows'] if evaluation else 0} evaluation rows."]
-    lines.extend(format_finding(finding) for finding in report["findings"])
-    quality = report.get("quality")
-    if quality is not None:
-        lines.append(f"  Independent quality checks: {quality['preset']}, {quality['rows']} rows; "
-                     "baseline, scheduled evaluations, and completion (including when evaluation is disabled).")
-    lines.append("  Advisory only." + (" Complete evidence will be saved in assessment.json after confirmation." if will_publish else ""))
+    width = width if width is not None else shutil.get_terminal_size().columns
+    settings = {setting.key: setting for setting in options.settings(cfg.method.name)}
+    controls = config.run_settings(cfg.document)
+    lines = ["", "Settings assessment:"]
+    lines.extend(_assessment_paragraph(
+        f"Scanned all {train['rows']:,} training rows and {evaluation['rows'] if evaluation else 0:,} evaluation rows.", width))
+    lines.extend(_assessment_paragraph(
+        "Measured = observed in the inputs; projected = estimated preparation or training behavior; heuristic = advisory interpretation.", width))
+    for severity, heading in (("error", "Errors"), ("warning", "Warnings")):
+        findings = [item for item in problems if item["severity"] == severity]
+        if not findings:
+            continue
+        lines.extend(["", heading + ":"])
+        for finding in findings:
+            summary, evidence = _assessment_finding(finding, profile)
+            lines.extend(_assessment_paragraph(f"{summary} ({finding['basis']})", width))
+            # Evidence can contain vocabulary items named "token"; these are not
+            # credentials. Redaction belongs to the resolved setting values below.
+            lines.extend(_assessment_evidence(evidence, width))
+            lines.extend(_assessment_setting_lines(finding, cfg, profile, settings, controls, width))
+            if finding.get("recommendation"):
+                lines.extend(_assessment_paragraph("Recommendation: " + finding["recommendation"], width, "    "))
+            lines.append("")
+    lines.extend(_assessment_paragraph("Advisory only." + (" Complete evidence will be saved in assessment.json after confirmation." if will_publish else ""), width))
     return "\n".join(lines) + "\n"
 
 
@@ -413,7 +632,7 @@ def confirm(cfg, *, progress=None, assessment=None):
                 raise TrlxError("settings review requires readable stdin and writable stdout; training was not started")
             sys.stdout.write(render(cfg))
             if assessment is not None:
-                sys.stdout.write(render_assessment(assessment))
+                sys.stdout.write(render_assessment(assessment, cfg))
             while True:
                 sys.stdout.write("\nPress Enter to continue or q to quit: ")
                 sys.stdout.flush()
