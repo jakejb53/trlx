@@ -130,7 +130,8 @@ class Progress:
                 detail = current._description()
                 since = (f"last measured progress {now - current.last_progress:.1f}s ago"
                          if current.last_progress is not None else "no measured progress yet")
-                self._write(f"waiting: {detail}; stage elapsed {now - current.started:.1f}s; {since}", kind="waiting")
+                extra = f"; {current.waiting_detail()}" if current.waiting_detail is not None else ""
+                self._write(f"waiting: {detail}; stage elapsed {now - current.started:.1f}s; {since}{extra}", kind="waiting")
             else:
                 self._write(f"waiting for command; elapsed {now - self.started:.1f}s; no active stage reported", kind="waiting")
 
@@ -155,6 +156,8 @@ class Stage:
         self.last_progress = None
         self.parent = None
         self.sequence = 0
+        # Operation-owned diagnostics are read only for heartbeats, never counted as progress.
+        self.waiting_detail = None
 
     # Publish the boundary before executing the operation, including blocking calls.
     def __enter__(self):

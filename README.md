@@ -423,11 +423,16 @@ trlx sft --model MODEL --dataset DATA --eval-fraction 0.2
 trlx sft --model MODEL --dataset DATA --eval-fraction 0.2 --shuffle-eval-data
 
 # Use separate training/evaluation files.
-trlx sft --model MODEL --no-split --dataset train.jsonl --dataset-eval eval.jsonl
+trlx sft --model MODEL --dataset-train train.jsonl --dataset-eval eval.jsonl
 
 # Train on all rows, without evaluation.
 trlx sft --model MODEL --no-split --dataset data.jsonl
 ```
+
+Either `--dataset-train` or `--dataset-eval` selects separate-file mode, overriding
+the configured split default and removing inherited split-only settings. Explicit
+`--split` conflicts with these options. Training-only mode also removes the configured
+evaluation schedule when no separate or synthetic evaluation source is available.
 
 To persist separate files, use `split = false` with `dataset_train` and optional
 `dataset_eval` in `[dataset]`; remove `dataset` and `eval_fraction`.
@@ -669,6 +674,10 @@ response encoding, JSON, or message fields. Successful requests remain in memory
 are not repeated. Retry notices name the failed request, cause, attempt, and backoff.
 Exhausting the retry budget still fails the batch; results are not saved for a later run.
 Explicit incomplete-generation results remain errors rather than automatic retries.
+Waiting notices identify every active request by number, elapsed request/attempt time,
+retry attempt, and whether it is awaiting the endpoint or backing off. They report queued
+requests and completed responses retained in memory. Server-side progress is unavailable;
+the socket timeout is not a total request deadline.
 
 For replay generation through an endpoint:
 

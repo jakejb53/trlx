@@ -117,7 +117,7 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
   - Optional `shuffle_eval_data = true` / `--shuffle-eval-data` selects that same evaluation count randomly without replacement instead of from the end. Only valid with `split = true`. Uses `data_seed` when set, otherwise `seed`; preserves source order within both disjoint sets. Omission or false retains the end split.
   - `split = false`: `dataset_train`, optional `dataset_eval`. Without `dataset_eval` or synthetic evaluation, evaluation is disabled and `eval_*` fields are rejected.
   - Key mismatch with `split` is an error.
-  - CLI `--dataset` selects the primary source in either mode. `--no-split` removes fractional-split keys; without a separate or synthetic evaluation source, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
+  - CLI `--dataset` selects the primary source in either mode. Explicit `--dataset-train` or `--dataset-eval` implies `--no-split`, overriding the configured split default; explicit `--split` conflicts. `--no-split` removes fractional-split keys and inherited shuffle selection; without a separate or synthetic evaluation source, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
   - SFT CPT `text` rows only: `--synthetic-dataset-eval` / `synthetic_dataset_eval = true` replaces configured splitting and evaluation sources, trains on all primary rows, and retains the evaluation schedule. Explicit CLI `--split`, `--eval-fraction`, or `--dataset-eval` conflicts. The resolved snapshot uses `split = false`, `dataset_train`, and `synthetic_dataset_eval`.
     Generate one factual prose summary per primary row from the loaded model after distributed placement, before the step-zero evaluation or optimizer updates; replay rows are excluded. The positive `max_length` is also the generated-token limit. Full prompts must fit the model context; no silent truncation. Model response templates separate reasoning; unparsed tagged responses, empty summaries, and token-limit exhaustion without EOS are fatal.
     Rank zero saves `synthetic-eval.jsonl` in the run directory (§1.1 publication policy). All evaluations and resume reuse those summaries. Missing saved data prevents resume before rewind; no regeneration, hashes, or cross-run cache. Startup skips synthetic evaluation-data inspection; `check` validates without generating. Absence of this option disables the feature.
@@ -295,6 +295,10 @@ response encoding, JSON, or message fields using the configured per-request retr
 and exponential backoff. Successful requests remain in memory without being repeated;
 result order is preserved. Exhaustion fails the batch without cross-run recovery.
 Other HTTP errors and explicit incomplete-generation results are final errors.
+Waiting notices report active request numbers, request and attempt elapsed times,
+attempt counts, awaiting-response/backoff state, queued count, and completed responses
+retained in memory. They distinguish socket timeout from a total request deadline
+and state that server-side progress is unavailable.
 
 ### 2.11 Assessment
 

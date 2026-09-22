@@ -170,8 +170,8 @@ def add_training_options(parser, method_name):
          "Randomly select the evaluation share instead of the final rows; requires --split. "
          "Uses data_seed when set, otherwise seed; preserves row order within each set. Default: disabled."),
         ("--split", "dataset.split", bool, "Split one source; --no-split uses separate files and removes eval_fraction."),
-        ("--dataset-train", "dataset.dataset_train", str, "Training source with --no-split."),
-        ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source with --no-split; omit for training only."),
+        ("--dataset-train", "dataset.dataset_train", str, "Training source; implies --no-split and conflicts with explicit --split."),
+        ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source; implies --no-split and conflicts with explicit --split; omit for training only."),
     ]
     if method_name == "sft":
         wrapper.append(("--synthetic-dataset-eval", "dataset.synthetic_dataset_eval", bool,

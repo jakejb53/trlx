@@ -12,6 +12,7 @@ import concurrent.futures
 import http.client
 import json
 import math
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +31,46 @@ _RETRY_STATUSES = {429, 500, 502, 503, 504}
 # Deliberate constant, not a flag: an accepted exception to the no-runtime-
 # defaults principle, recorded in PLAN.md. Attempt k waits base * 2**(k-1).
 _BACKOFF_BASE_SECONDS = 1.0
+
+
+# Batch-local request clocks never imply token generation or provider-side progress.
+class _BatchRequests:
+    # The reporter's clock permits deterministic timing tests and matches stage elapsed time.
+    def __init__(self, total, attempts, timeout, clock):
+        self.states = [{"state": "queued", "started": None, "attempt_started": None, "attempt": 0}
+                       for _ in range(total)]
+        self.attempts, self.timeout, self.clock = attempts, timeout, clock
+        self.lock = threading.Lock()
+
+    # Update under a separate lock; release it before any call into the reporter.
+    def update(self, index, state, attempt=None):
+        with self.lock:
+            item = self.states[index]
+            now = self.clock()
+            item["state"] = state
+            if attempt is not None:
+                item["attempt"] = attempt
+            if state == "awaiting endpoint":
+                if item["started"] is None:
+                    item["started"] = now
+                item["attempt_started"] = now
+
+    # Report every active request, including a final straggler, without exposing request content.
+    def describe(self):
+        with self.lock:
+            now = self.clock()
+            completed = sum(item["state"] == "completed" for item in self.states)
+            queued = sum(item["state"] == "queued" for item in self.states)
+            parts = [f"{completed} completed responses retained in memory", f"{queued} queued"]
+            for index, item in enumerate(self.states):
+                if item["state"] not in ("awaiting endpoint", "retry backoff"):
+                    continue
+                parts.append(f"request {index + 1}: {item['state']}, elapsed {now - item['started']:.1f}s, "
+                             f"attempt {item['attempt']}/{self.attempts}" +
+                             (f", attempt elapsed {now - item['attempt_started']:.1f}s"
+                              if item["state"] == "awaiting endpoint" else ""))
+            parts.append(f"socket timeout {self.timeout:g}s (not a total request deadline); server progress unavailable")
+            return "; ".join(parts)
 
 
 class Endpoint:
@@ -97,7 +138,8 @@ class Endpoint:
     # One chat completion as a Reply. Raises DatasetError with the URL and last
     # failure when retries are exhausted. Strict callers
     # require explicit completion metadata; legacy callers retain their behavior.
-    def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False):
+    def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False,
+                      _status=None):
         body = {"model": self.model, "messages": messages}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
@@ -109,9 +151,13 @@ class Endpoint:
         for attempt in range(self.retries + 1):
             if attempt:
                 delay = _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
+                if _status is not None:
+                    _status("retry backoff", attempt + 1)
                 if progress is not None:
                     progress.note(f"{request}: {last}; retry attempt {attempt + 1}/{self.retries + 1} in {delay:g}s")
                 time.sleep(delay)
+            if _status is not None:
+                _status("awaiting endpoint", attempt + 1)
             try:
                 req = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -208,12 +254,30 @@ class Endpoint:
         message_lists = list(message_lists)
         with stage(progress, f"{label} from {self.model} at {self.display_url}",
                    total=len(message_lists), unit="requests") as activity:
+            tracker = _BatchRequests(len(message_lists), self.retries + 1, self.timeout,
+                                     activity.reporter.clock if activity.reporter is not None else time.monotonic)
+            activity.waiting_detail = tracker.describe
+
+            # Each worker owns its request's state; only the collector advances measured batch counts.
+            def complete(index, messages):
+                # Subclasses/mocks that do not report attempts still have an accurate request lifetime.
+                tracker.update(index, "awaiting endpoint", 1)
+                # Never hold the tracking lock across endpoint work or progress emission.
+                def status(state, attempt):
+                    tracker.update(index, state, attempt)
+
+                try:
+                    reply = self.complete_full(messages, max_tokens, progress=activity,
+                        request=f"request {index + 1}", _status=status,
+                        **({"require_stop": True} if require_stop else {}))
+                except BaseException:
+                    tracker.update(index, "failed")
+                    raise
+                tracker.update(index, "completed")
+                return reply
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-                # Omit the new keyword for existing callers and endpoint subclasses.
-                completion_options = {"require_stop": True} if require_stop else {}
-                futures = {pool.submit(self.complete_full, messages, max_tokens,
-                                       progress=activity, request=f"request {i + 1}",
-                                       **completion_options): i
+                futures = {pool.submit(complete, i, messages): i
                            for i, messages in enumerate(message_lists)}
                 replies = [None] * len(futures)
                 try:
@@ -230,7 +294,8 @@ class Endpoint:
                         activity.advance()
                 except BaseException as error:
                     for pending in futures:
-                        pending.cancel()
+                        if pending.cancel():
+                            tracker.update(futures[pending], "cancelled")
                     # Error diagnostics already sanitize endpoint responses. Sanitize
                     # again at this boundary before publishing a batch-level notice.
                     detail = self._diagnostic(error) if isinstance(error, DatasetError) else type(error).__name__

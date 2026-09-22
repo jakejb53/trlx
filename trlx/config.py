@@ -393,6 +393,14 @@ def _apply_overrides(doc, overrides, path):
     source = overrides.pop("dataset.source", None)
     if source is not None and any(key in overrides for key in ("dataset.dataset", "dataset.dataset_train")):
         raise TrlxError(f"{path}: --dataset cannot be combined with another explicit training source")
+    separate_sources = ["--" + key.replace("_", "-") for key in ("dataset_train", "dataset_eval")
+                        if "dataset." + key in overrides]
+    if separate_sources:
+        if overrides.get("dataset.split") is True:
+            raise TrlxError(f"{path}: --split conflicts with {', '.join(separate_sources)}; "
+                            "remove --split to use separate training/evaluation sources")
+        # Explicit file roles select the same mode and cleanup as --no-split.
+        overrides["dataset.split"] = False
     if "run" not in doc and any(key.startswith("run.") for key in overrides):
         doc["run"] = run_settings(doc, path)
     for dotted, value in overrides.items():
@@ -436,6 +444,10 @@ def _apply_overrides(doc, overrides, path):
         else:
             previous = dataset.pop("dataset", None)
             dataset.pop("eval_fraction", None)
+            # A configured membership shuffle belongs to the replaced split mode;
+            # keep explicit CLI input so validation still rejects a contradiction.
+            if "dataset.shuffle_eval_data" not in overrides:
+                dataset.pop("shuffle_eval_data", None)
             if previous is not None:
                 dataset.setdefault("dataset_train", previous)
     if source is not None:

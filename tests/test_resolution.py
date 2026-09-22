@@ -130,6 +130,49 @@ class Resolution(unittest.TestCase):
         self.assertNotIn("eval_fraction", cfg.document["dataset"])
         self.assertEqual(cfg.document["dataset"]["dataset_train"], "data.jsonl")
 
+    # Explicit source roles replace configured split settings and survive worker loading.
+    def test_separate_source_flags_select_mode(self):
+        for flags, expected_train, expected_eval in (
+            (["--dataset-train", "train.jsonl", "--dataset-eval", "eval.jsonl"], "train.jsonl", "eval.jsonl"),
+            (["--dataset-train", "train.jsonl"], "train.jsonl", None),
+            (["--dataset-eval", "eval.jsonl"], "configured.jsonl", "eval.jsonl"),
+        ):
+            with self.subTest(flags=flags):
+                self.source["dataset"]["dataset"] = "configured.jsonl"
+                self.source["dataset"]["shuffle_eval_data"] = True
+                args = cli.parse_args(["sft", "--model", "chosen-model", "--use-cpu", *flags])
+                with patch.object(config, "_read_toml", return_value=self.source):
+                    cfg = config.load(args.config, "sft", overrides=options.overrides(args))
+                self.assertFalse(cfg.dataset.split)
+                self.assertFalse(cfg.dataset.shuffle_eval_data)
+                self.assertNotIn("dataset", cfg.document["dataset"])
+                self.assertNotIn("eval_fraction", cfg.document["dataset"])
+                self.assertEqual(cfg.dataset.source.source, expected_train)
+                self.assertEqual(cfg.dataset.eval_source.source if cfg.dataset.eval_source else None, expected_eval)
+                if expected_eval is None:
+                    self.assertEqual(cfg.args.eval_strategy, "no")
+                    self.assertFalse(any(key.startswith("eval_") for key in cfg.document))
+                with patch.object(config, "_read_toml", return_value=self.snapshot(cfg)):
+                    worker = config.load("snapshot", "sft", resolved=True)
+                self.assertEqual(worker.dataset, cfg.dataset)
+
+    # Contradictory CLI modes identify the supplied flags and explain the remedy.
+    def test_separate_source_flags_reject_explicit_split(self):
+        for flag in ("--dataset-train", "--dataset-eval"):
+            with self.subTest(flag=flag):
+                args = cli.parse_args(["sft", "--split", flag, "data.jsonl"])
+                with patch.object(config, "_read_toml", return_value=self.source):
+                    with self.assertRaisesRegex(TrlxError, f"--split conflicts with {flag}; remove --split"):
+                        config.load(args.config, "sft", overrides=options.overrides(args))
+
+    # Mode inference must not silently discard explicit evaluation settings.
+    def test_implied_no_split_rejects_incompatible_explicit_settings(self):
+        for extra, message in ((["--shuffle-eval-data"], "percentage split"),
+                               (["--eval-fraction", "0.2"], "conflicts"),
+                               (["--synthetic-dataset-eval"], "synthetic-dataset-eval conflicts")):
+            with self.subTest(extra=extra), self.assertRaisesRegex(TrlxError, message):
+                self.load(extra=["--dataset-eval", "eval.jsonl", *extra])
+
     # --no-split without an eval file deliberately removes the generated schedule.
     def test_cli_training_only(self):
         cfg = self.load(extra=["--no-split"])
