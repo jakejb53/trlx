@@ -450,7 +450,8 @@ def build_parser():
     requests.add_argument("--timeout", type=float, default=ENDPOINT_TIMEOUT, metavar="SECONDS",
                    help=f"finite positive timeout per API request, in seconds; default: {ENDPOINT_TIMEOUT}")
     requests.add_argument("--retries", type=int, default=ENDPOINT_RETRIES, metavar="COUNT",
-                   help=f"integer retries after initial request, >= 0; exponential backoff; default: {ENDPOINT_RETRIES}")
+                   help=f"integer retries after initial request, >= 0; transient failures and malformed responses; "
+                        f"exponential backoff; successful requests are retained; default: {ENDPOINT_RETRIES}")
     requests.add_argument("--api-key", metavar="ENVVAR",
                    help="name of variable holding the key, shared by both endpoints; default: no Authorization header")
     requests.add_argument("--strip-reasoning-tags", action="store_true",
@@ -499,7 +500,8 @@ def build_parser():
     p.add_argument("--timeout", type=float, default=ENDPOINT_TIMEOUT, metavar="SECONDS",
                    help=f"finite positive timeout per request, in seconds; default: {ENDPOINT_TIMEOUT}")
     p.add_argument("--retries", type=int, default=ENDPOINT_RETRIES, metavar="COUNT",
-                   help=f"integer retries after initial request, >= 0; exponential backoff; default: {ENDPOINT_RETRIES}")
+                   help=f"integer retries after initial request, >= 0; transient failures and malformed responses; "
+                        f"exponential backoff; successful requests are retained; default: {ENDPOINT_RETRIES}")
     p.add_argument("--api-key", metavar="ENVVAR",
                    help="environment variable holding the API key; default: no Authorization header")
     p.add_argument("--strip-reasoning-tags", action="store_true",

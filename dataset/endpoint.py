@@ -2,8 +2,9 @@
 
 Shared by dataset chat and, per the import rule, by trlx (llm_judge,
 replay-build). Concurrency is a thread pool; order of results matches order
-of requests. Retries cover connection errors, timeouts, 429, and 5xx with
-exponential backoff. Any other HTTP status is a final error.
+of requests. Retries cover connection errors, timeouts, retryable HTTP statuses,
+and malformed response encoding/JSON/fields with exponential backoff.
+Other HTTP statuses and explicit incomplete-generation results are final errors.
 """
 
 import collections
@@ -94,7 +95,7 @@ class Endpoint:
             return self.complete_full(messages, max_tokens, progress=activity).content
 
     # One chat completion as a Reply. Raises DatasetError with the URL and last
-    # status when retries are exhausted or the reply is malformed. Strict callers
+    # failure when retries are exhausted. Strict callers
     # require explicit completion metadata; legacy callers retain their behavior.
     def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False):
         body = {"model": self.model, "messages": messages}
@@ -114,8 +115,20 @@ class Endpoint:
             try:
                 req = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    raw = json.loads(resp.read().decode("utf-8"))
-                    reply = self._extract(raw)
+                    # Retry only response decoding/schema failures here. Request errors and
+                    # explicit generation limits below must not become transient failures.
+                    try:
+                        raw = json.loads(resp.read().decode("utf-8"))
+                        reply = self._extract(raw)
+                    except json.JSONDecodeError:
+                        last = "reply is not JSON; check the endpoint's chat-completions response"
+                        continue
+                    except UnicodeDecodeError:
+                        last = "reply has invalid UTF-8 encoding; check the endpoint response"
+                        continue
+                    except DatasetError as error:
+                        last = self._diagnostic(error)
+                        continue
                     if require_stop:
                         reason = raw["choices"][0].get("finish_reason")
                         if reason != "stop":
@@ -147,8 +160,6 @@ class Endpoint:
             # transient and retried like a refused connection.
             except (http.client.HTTPException, OSError) as e:
                 last = f"connection dropped: {type(e).__name__}: {self._diagnostic(e)}"
-            except json.JSONDecodeError:
-                raise DatasetError(f"{self.display_url}: reply is not JSON; check the endpoint's chat-completions response")
             except UnicodeError:
                 raise DatasetError(f"{self.display_url}: request or reply has invalid text encoding; check the endpoint and credentials")
             except ValueError:

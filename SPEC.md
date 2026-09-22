@@ -290,6 +290,12 @@ Built into trlx, resolved by bare name alongside `trl.rewards`, each a factory t
 
 Only `grpo` and `rloo` policy generation requires the TRL vLLM server (per-step weight sync). Every other generation over a network (`llm_judge`, independent quality judging, `dataset chat`, `replay-build --endpoint`) accepts any OpenAI-compatible endpoint.
 
+The shared client retries transport failures, HTTP 429/500/502/503/504, and malformed
+response encoding, JSON, or message fields using the configured per-request retry count
+and exponential backoff. Successful requests remain in memory without being repeated;
+result order is preserved. Exhaustion fails the batch without cross-run recovery.
+Other HTTP errors and explicit incomplete-generation results are final errors.
+
 ### 2.11 Assessment
 
 All seven methods scan every training/evaluation row, including selected replay rows, before review,

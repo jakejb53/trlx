@@ -272,7 +272,7 @@ def add_training_options(parser, method_name):
         ("model", str | None, "Served judge model name; judging presets only."),
         ("api_key", str | None, "Judge credential environment-variable name, or None for no authentication; never a literal key."),
         ("timeout", float, "Positive timeout seconds per judge request."),
-        ("retries", int, "Nonnegative retry count for transient judge request failures."),
+        ("retries", int, "Nonnegative retry count for transient judge request failures and malformed responses."),
         ("max_tokens", int, "Positive judge response token budget."),
     ):
         _option(assessment, "--quality-judge-" + key.replace("_", "-"), "assessment.judge." + key, hint, description)

@@ -664,6 +664,11 @@ Existing outputs require `--force`; `--no-staging` controls publication only.
 `dataset chat` and `dataset eval-build` share optional request settings:
 `--concurrency` defaults to 4 (positive integer), `--timeout` to 120 seconds (finite and
 positive), and `--retries` to 2 (nonnegative integer). Both accept `--api-key ENVVAR`.
+Retries apply per request to transport failures, retryable HTTP statuses, and malformed
+response encoding, JSON, or message fields. Successful requests remain in memory and
+are not repeated. Retry notices name the failed request, cause, attempt, and backoff.
+Exhausting the retry budget still fails the batch; results are not saved for a later run.
+Explicit incomplete-generation results remain errors rather than automatic retries.
 
 For replay generation through an endpoint:
 

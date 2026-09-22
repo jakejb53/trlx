@@ -1,4 +1,4 @@
-"""Expected endpoint failures are actionable without changing retry behavior."""
+"""Endpoint failures, bounded per-request retries, and batch result ownership."""
 
 import io
 import http.client
@@ -58,13 +58,69 @@ class EndpointErrors(unittest.TestCase):
         reply = endpoint._extract({"choices": [{"message": {"content": "ok", "reasoning": None}}]})
         self.assertEqual((reply.content, reply.reasoning), ("ok", ""))
 
-    # Bad UTF-8/JSON are final response errors rather than transport retries.
-    def test_invalid_response_encoding_and_json_are_not_retried(self):
-        for data, error in ((b"\xff", "encoding"), (b"not JSON", "not JSON")):
-            with self.subTest(data=data), patch("dataset.endpoint.urllib.request.urlopen", return_value=io.BytesIO(data)) as call:
-                with self.assertRaisesRegex(DatasetError, error):
-                    self.endpoint(retries=2).complete([])
-                self.assertEqual(call.call_count, 1)
+    # Malformed replies consume the same bounded retry budget as transport failures.
+    def test_malformed_responses_retry_then_succeed(self):
+        valid = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+        invalid = [b"\xff", b"not JSON", b"{}", b'{"choices": []}',
+                   b'{"choices": [{"message": {"content": null}}]}',
+                   b'{"choices": [{"message": {"content": "ok", "reasoning": []}}]}']
+        for data in invalid:
+            with self.subTest(data=data), patch("dataset.endpoint.urllib.request.urlopen", side_effect=[
+                io.BytesIO(data), io.BytesIO(valid)
+            ]) as call, patch("dataset.endpoint.time.sleep") as sleep:
+                self.assertEqual(self.endpoint(retries=2).complete([]), "ok")
+                self.assertEqual(call.call_count, 2)
+                sleep.assert_called_once_with(1.0)
+
+    # Exhaustion names the malformed field, reports every retry, and never loops indefinitely.
+    def test_malformed_response_exhaustion(self):
+        for retries in (0, 2):
+            lines = []
+            with self.subTest(retries=retries), patch("dataset.endpoint.urllib.request.urlopen",
+                    side_effect=[io.BytesIO(b"{}") for _ in range(retries + 1)]) as call, \
+                 patch("dataset.endpoint.time.sleep") as sleep:
+                with self.assertRaisesRegex(DatasetError, f"gave up after {retries + 1} attempts.*message.content"):
+                    self.endpoint(retries=retries).complete_full([], request="request 19",
+                        progress=Mock(note=lines.append))
+                self.assertEqual(call.call_count, retries + 1)
+                self.assertEqual(sleep.call_count, retries)
+                if retries:
+                    self.assertIn("request 19:", "\n".join(lines))
+                    self.assertIn("retry attempt 3/3 in 2s", "\n".join(lines))
+
+    # A valid but truncated completion requires changed generation settings, not another attempt.
+    def test_explicit_incomplete_generation_is_not_retried(self):
+        data = json.dumps({"choices": [{"message": {"content": "partial"}, "finish_reason": "length"}]}).encode()
+        with patch("dataset.endpoint.urllib.request.urlopen", return_value=io.BytesIO(data)) as call, \
+             patch("dataset.endpoint.time.sleep") as sleep:
+            with self.assertRaisesRegex(DatasetError, "increase --max-tokens"):
+                self.endpoint(retries=2).complete_full([], require_stop=True)
+        self.assertEqual(call.call_count, 1)
+        sleep.assert_not_called()
+
+    # A malformed request result is retried locally; completed neighbors and order are retained.
+    def test_batch_retries_only_failed_request(self):
+        counts = {"first": 0, "second": 0, "third": 0}
+        lock = threading.Lock()
+        completed = []
+
+        # Count actual HTTP attempts by input, independent of thread completion order.
+        def respond(request, timeout):
+            name = json.loads(request.data)["messages"][0]["content"]
+            with lock:
+                counts[name] += 1
+                attempt = counts[name]
+            if name == "second" and attempt == 1:
+                return io.BytesIO(b"{}")
+            return io.BytesIO(json.dumps({"choices": [{"message": {"content": name}}]}).encode())
+
+        with patch("dataset.endpoint.urllib.request.urlopen", side_effect=respond), patch("dataset.endpoint.time.sleep"):
+            replies = self.endpoint(retries=1).complete_many_full(
+                [[{"role": "user", "content": name}] for name in counts], 3,
+                on_complete=lambda index, reply: completed.append(index))
+        self.assertEqual([reply.content for reply in replies], list(counts))
+        self.assertEqual(counts, {"first": 1, "second": 2, "third": 1})
+        self.assertEqual(sorted(completed), [0, 1, 2])
 
     # Retry count and backoff remain unchanged for a transient connection failure.
     def test_transient_failure_retries_then_succeeds(self):

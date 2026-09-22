@@ -239,7 +239,8 @@ def build_parser(method=None):
     p.add_argument("--out", required=True, help="output dataset path")
     p.add_argument("--max-tokens", type=int, required=True, help="positive completion token limit per prompt")
     p.add_argument("--timeout", type=float, metavar="SECONDS", help="positive seconds per request; required with --endpoint")
-    p.add_argument("--retries", type=int, help="nonnegative retry count after first attempt; required with --endpoint")
+    p.add_argument("--retries", type=int, help="nonnegative retry count after first attempt for transient failures "
+                   "and malformed responses; required with --endpoint")
     p.add_argument("--concurrency", type=int, help="positive parallel request count; required with --endpoint")
     p.add_argument("--api-key", metavar="ENVVAR", help="endpoint only; environment variable holding the key")
     p.add_argument("--force", action="store_true", help="replace existing output, including the prompts input")
