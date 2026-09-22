@@ -70,7 +70,7 @@ class BuildTest(unittest.TestCase):
         ])
         answers = StubEndpoint([Reply("Rain.", ""), Reply("The sea.", ""), Reply("Rivers.", "")])
         with patch("dataset.chat.chunk_text", return_value=["first source", "second source", "third source"]):
-            rows, skipped = build(TEXT, 1000, 3, questions, answers,
+            rows, evaluation, skipped = build(TEXT, 1000, 3, questions, answers,
                                   QUESTIONS_PROMPT, ANSWERS_PROMPT, 1)
         self.assertEqual([row["messages"][0]["content"] for row in rows],
                          ["What falls?", "Where does water go?", "What flows?"])
@@ -95,7 +95,7 @@ class BuildTest(unittest.TestCase):
                         "--questions-model", "test", "--n", "1", "--max-tokens", "1000", *flags,
                     ])
                     answer = "<think>inline</think>Rain falls." if strip else "Rain falls."
-                    rows, _ = build(TEXT, 1000, 1, StubEndpoint([Reply("What falls?", "question reasoning")]),
+                    rows, _, _ = build(TEXT, 1000, 1, StubEndpoint([Reply("What falls?", "question reasoning")]),
                                     StubEndpoint([Reply(answer, "answer reasoning")]), QUESTIONS_PROMPT,
                                     ANSWERS_PROMPT, 1, args.strip_reasoning_tags, exclude_reasoning=args.exclude_reasoning)
                     self.assertEqual(rows[0]["messages"][1]["content"], "Rain falls.")
@@ -117,7 +117,7 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(answers.requests, [[{"role": "user", "content": "Answer What is {chunk}? from Source {n}"}]])
 
     def test_reasoning_column_from_the_field(self):
-        rows, skipped = run([Reply("What falls?", "planning the question")],
+        rows, _, skipped = run([Reply("What falls?", "planning the question")],
                             [Reply("Rain falls.", "recalling the text")])
         self.assertEqual(skipped, [])
         self.assertEqual(rows[0]["reasoning"], "recalling the text")
@@ -126,7 +126,7 @@ class BuildTest(unittest.TestCase):
         self.assertNotIn("planning the question", str(rows[0]))
 
     def test_reasoning_column_empty_without_a_field(self):
-        rows, _ = run([Reply("What falls?", "")], [Reply("Rain falls.", "")])
+        rows, _, _ = run([Reply("What falls?", "")], [Reply("Rain falls.", "")])
         self.assertEqual(rows[0]["reasoning"], "")
 
     def test_inline_block_in_questions_is_fatal(self):
@@ -138,7 +138,7 @@ class BuildTest(unittest.TestCase):
             run([Reply("What falls?", "")], [Reply("<think>\nhmm\n</think>\nRain falls.", "")])
 
     def test_stripping_recovers_both_passes(self):
-        rows, skipped = run([Reply("<think>\nhmm\n</think>\nWhat falls?", "")],
+        rows, _, skipped = run([Reply("<think>\nhmm\n</think>\nWhat falls?", "")],
                             [Reply("<think>\nhmm\n</think>\nRain falls.", "")], strip=True)
         self.assertEqual(skipped, [])
         self.assertEqual(rows[0]["messages"][0]["content"], "What falls?")
@@ -160,7 +160,7 @@ class BuildProgress(unittest.TestCase):
             return io.BytesIO(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
 
         with patch("dataset.endpoint.urllib.request.urlopen", side_effect=reply):
-            rows, skipped = build(TEXT, 1000, 1, questions, answers, QUESTIONS_PROMPT,
+            rows, _, skipped = build(TEXT, 1000, 1, questions, answers, QUESTIONS_PROMPT,
                                   ANSWERS_PROMPT, 1, progress=Progress("dataset chat", emit=lines.append))
         self.assertEqual(skipped, [])
         self.assertEqual(rows[0]["messages"][1]["content"], "Rain falls.")

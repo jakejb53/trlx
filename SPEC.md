@@ -367,6 +367,13 @@ It is independent of `--strip-reasoning-tags` and does not disable endpoint reas
 after list-marker and surrounding-whitespace cleanup. Keep the first occurrence in source
 order and report each removal. Case, internal whitespace, and punctuation remain significant.
 
+`chat --eval-n N --eval-out PATH` reserves the last N retained questions from each chunk,
+after deduplication, for evaluation; other questions go to `--out`. N defaults to zero
+(disabled); positive N requires `--eval-out` and must be smaller than `--n`.
+Short chunks reserve up to N; empty answers are skipped without reassignment. Each row
+belongs to one output. Both distinct destinations are validated before requests and
+prepared before publication under the same force/staging policy as `split`.
+
 `dataset eval-build INPUT --out OUTPUT --endpoint URL --model NAME --max-tokens N`
 requires nonempty string `text` in every row and a positive completion-token limit.
 It does not sample, re-chunk, or withhold source rows. `--summary-prompt` defaults to

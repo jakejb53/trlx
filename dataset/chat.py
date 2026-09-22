@@ -65,10 +65,12 @@ def parse_questions(reply, n):
     return questions[:n]
 
 
-# Runs both passes. Returns (rows, skipped) where skipped lists messages for
+# Runs both passes. Returns (training, evaluation, skipped); skipped lists messages for
 # chunks that yielded no questions, duplicate questions, and empty answers.
 def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_prompt,
-          answers_prompt, concurrency, strip_reasoning_tags=False, *, exclude_reasoning=False, progress=None):
+          answers_prompt, concurrency, strip_reasoning_tags=False, *, exclude_reasoning=False, eval_n=0, progress=None):
+    if not isinstance(eval_n, int) or isinstance(eval_n, bool) or not 0 <= eval_n < n:
+        raise DatasetError("--eval-n must be an integer >= 0 and smaller than --n")
     with stage(progress, "chunking source text") as activity:
         chunks = chunk_text(text, max_tokens, progress=activity)
         activity.note(f"{len(chunks)} source chunks; requesting up to {n} questions per chunk")
@@ -79,6 +81,7 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
     requests = [[{"role": "user", "content": fill(questions_prompt, n=n, chunk=c)}] for c in chunks]
     replies = questions_endpoint.complete_many_full(requests, concurrency, progress=progress, label="questions")
     pairs = []  # (chunk index, question)
+    evaluation_questions = set()
     seen = {}  # Cleaned question -> first source chunk, in source order rather than completion order.
     for i, reply in enumerate(replies):
         # Pass 1 discards reasoning: its output is question strings, not data.
@@ -86,6 +89,7 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
         questions = parse_questions(content, n)
         if not questions:
             skipped.append(f"chunk {i}: no questions parsed from reply")
+        retained = []
         for question in questions:
             # Deduplicate before paid answer requests; keep the first question's source context.
             if question in seen:
@@ -93,6 +97,10 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
                 continue
             seen[question] = i
             pairs.append((i, question))
+            retained.append(question)
+        # Assign before answering: a skipped answer never moves another question between sets.
+        if eval_n:
+            evaluation_questions.update(retained[-eval_n:])
 
     requests = [
         [{"role": "user", "content": fill(answers_prompt, chunk=chunks[i], question=q)}]
@@ -100,6 +108,7 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
     ]
     replies = answers_endpoint.complete_many_full(requests, concurrency, progress=progress, label="answers")
     rows = []
+    evaluation = []
     for (i, q), reply in zip(pairs, replies):
         where = f"chunk {i}, question: {q}"
         answer = strip_inline_reasoning(reply.content, where, strip_reasoning_tags).strip()
@@ -112,5 +121,5 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
         # Column exclusion is independent of stripping tagged reasoning from content.
         if not exclude_reasoning:
             row["reasoning"] = reply.reasoning
-        rows.append(row)
-    return rows, skipped
+        (evaluation if q in evaluation_questions else rows).append(row)
+    return rows, evaluation, skipped

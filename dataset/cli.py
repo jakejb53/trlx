@@ -14,7 +14,7 @@ import sys
 
 from dataset import chat, convert, cpt, env, eval_build, fields, heal, pairs, rows, stats
 from dataset.endpoint import Endpoint
-from dataset.io import DatasetError, read_rows, validate_rows_output, write_many_rows, write_rows
+from dataset.io import DatasetError, read_rows, validate_rows_output, validate_rows_outputs, write_many_rows, write_rows
 from dataset.progress import Progress, stage
 from dataset.prompts import load as load_prompt
 
@@ -150,6 +150,12 @@ def _cmd_heal(args):
 # Resolves the answers pass to its own endpoint or a copy of the questions
 # pass. Exactly one of the two answers flags is an error, never a partial copy.
 def _cmd_chat(args):
+    if not 0 <= args.eval_n < args.n:
+        raise DatasetError("--eval-n must be >= 0 and smaller than --n")
+    if bool(args.eval_n) != bool(args.eval_out):
+        raise DatasetError("positive --eval-n and --eval-out must be supplied together")
+    # Check both paths, including aliases, before spending any endpoint requests.
+    validate_rows_outputs([args.out, args.eval_out] if args.eval_out else [args.out], args.force)
     if (args.answers_endpoint is None) != (args.answers_model is None):
         raise DatasetError("answers pass needs both --answers-endpoint and --answers-model, or neither")
     api_key = None
@@ -172,16 +178,23 @@ def _cmd_chat(args):
         raise DatasetError(f"{args.input}: cannot read: {e.strerror or e}; check the path and permissions")
     except UnicodeError:
         raise DatasetError(f"{args.input}: input is not valid UTF-8; convert the text to UTF-8")
-    data, skipped = chat.build(
+    data, evaluation, skipped = chat.build(
         text, args.max_tokens, args.n, q_ep, a_ep,
         load_prompt(args.questions_prompt, required=("n", "chunk"), allowed=("n", "chunk")),
         load_prompt(args.answers_prompt, required=("chunk", "question"), allowed=("chunk", "question")),
-        args.concurrency, args.strip_reasoning_tags, exclude_reasoning=args.exclude_reasoning, progress=args.progress,
+        args.concurrency, args.strip_reasoning_tags, exclude_reasoning=args.exclude_reasoning,
+        eval_n=args.eval_n, progress=args.progress,
     )
     for s in skipped:
         print(f"skipped {s}", file=sys.stderr)
-    write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging, progress=args.progress)
-    print(f"{len(data)} rows, {len(skipped)} skipped")
+    if args.eval_out:
+        write_many_rows([(args.out, data), (args.eval_out, evaluation)], [args.input],
+                        force=args.force, no_staging=args.no_staging, progress=args.progress)
+        print(f"{len(data)} training rows to {args.out}, {len(evaluation)} evaluation rows to {args.eval_out}, "
+              f"{len(skipped)} skipped")
+    else:
+        write_rows(args.out, data, [args.input], force=args.force, no_staging=args.no_staging, progress=args.progress)
+        print(f"{len(data)} rows, {len(skipped)} skipped")
     return 0
 
 
@@ -412,6 +425,13 @@ def build_parser():
                         "run trlx init to create defaults or supply a file; no built-in fallback")
     questions.add_argument("--n", type=int, required=True, metavar="QUESTIONS",
                            help="integer requested questions per source chunk; fewer may be returned")
+    questions.add_argument("--eval-n", type=int, default=0, metavar="QUESTIONS",
+                   help="reserve the last N retained questions per chunk for evaluation, after deduplication; "
+                        "integer >= 0 and < --n; default: 0 (disabled); positive values require --eval-out; "
+                        "short chunks reserve up to N; skipped answers reduce counts without reassignment")
+    questions.add_argument("--eval-out", metavar="FILE",
+                   help="evaluation output (.jsonl, .json, .csv, .parquet); requires positive --eval-n; "
+                        "must differ from --out; existing output requires --force; both outputs stage by default")
     questions.add_argument("--max-tokens", type=int, required=True, metavar="TOKENS",
                            help=f"positive integer SOURCE chunk limit ({cpt.ESTIMATE_LABEL}); not a completion limit")
     answers = p.add_argument_group("answer generation")

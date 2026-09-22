@@ -429,14 +429,18 @@ def _validate_outputs(outputs, force, validator=validate_rows_output):
     return targets
 
 
-# Split prepares every serialization before publishing any result. Publication itself is
-# sequential, so a second-output failure must identify results already changed.
-def write_many_rows(outputs, inputs=(), *, force=False, no_staging=False, progress=None):
-    outputs = list(outputs)
+# Validate coupled row destinations before generation or serialization spends work.
+def validate_rows_outputs(paths, force=False):
     try:
-        _validate_outputs(outputs, force)
+        return _validate_outputs([(path, None) for path in paths], force)
     except OSError as error:
         raise DatasetError(f"cannot inspect outputs: {error}; no destination completed") from error
+
+
+# Prepare every serialization before sequential publication, reporting partial completion.
+def write_many_rows(outputs, inputs=(), *, force=False, no_staging=False, progress=None):
+    outputs = list(outputs)
+    validate_rows_outputs([path for path, _ in outputs], force)
     writers = [(path, _rows_writer(path, rows, progress=progress)) for path, rows in outputs]
     _write_many(writers, force=force, no_staging=no_staging, progress=progress)
 

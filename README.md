@@ -625,6 +625,15 @@ parser; inline reasoning is rejected unless `--strip-reasoning-tags` removes a c
 leading block. An unclosed block is always an error. The two flags are independent;
 use both to strip inline tags and omit the separate reasoning column.
 
+To reserve one of ten questions per chunk for evaluation, add
+`--n 10 --eval-n 1 --out training.jsonl --eval-out eval.jsonl` to `dataset chat`.
+`--eval-n` defaults to zero; a positive value must be smaller than `--n` and requires
+`--eval-out`. After deduplication, the last requested number of retained questions
+per chunk goes to evaluation and the rest to training. Short chunks contribute up
+to that number; skipped answers reduce counts without reassigning questions.
+Both destinations are validated before requests and staged before either is published
+unless `--no-staging` is set. Existing outputs require `--force`.
+
 For a synthetic CPT evaluation dataset:
 
 ```sh
