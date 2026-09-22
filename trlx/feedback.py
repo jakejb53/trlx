@@ -146,7 +146,7 @@ class Collector:
 
     # Own partial launches too; normal exit also collects any surviving descendants.
     def __exit__(self, exc_type, exc, traceback):
-        failures = self.stop(terminal=True)
+        failures = self.stop(terminal=True, cancelled=isinstance(exc, KeyboardInterrupt))
         try:
             self.finish()
         except Exception as error:
@@ -173,16 +173,23 @@ class Collector:
 
     # Shutdown notices bypass the paused metric display but keep its authoritative log.
     # Callers may enable terminal output after curses has unwound on cancellation.
-    def stop(self, children=None, *, terminal=None):
+    def stop(self, children=None, *, terminal=None, cancelled=False):
         # Logging or terminal failure must not interrupt process cleanup.
         def report(message):
             self.shutdown_notice(message, terminal=terminal)
 
-        return processes.stop(self.children if children is None else children, report)
+        return processes.stop(self.children if children is None else children, report, cancelled=cancelled)
 
     # Collection and log writes share a lock, preserving complete source-labelled lines.
     def accept(self, source, event, *, display=True):
         with self.lock:
+            # This acknowledgement is control state, not display output. Record it
+            # before logging so an unrelated log failure cannot lose readiness.
+            if event["kind"] == "cancellation_ready":
+                for process in self.children:
+                    if process._trlx_source == source:
+                        process._trlx_cancel_ready = True
+                display = False
             try:
                 identity = (f"{event['level']} {event['logger']}: "
                             if "logger" in event and "level" in event else "")

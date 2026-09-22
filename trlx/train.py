@@ -35,6 +35,7 @@ from dataset.progress import Progress, stage
 from trlx import (
     TrlxError,
     assessment,
+    cancellation,
     config as config_mod,
     data_load,
     data_profile,
@@ -278,7 +279,7 @@ def _run_job(args, cfg, run_dir, physical, strategy, startup, *, assessment_repo
             # Cancellation and supervisor failures still own process cleanup.
             # Display exceptions have already been handled at their boundary.
             try:
-                failures = job.terminate(terminal=True)
+                failures = job.terminate(terminal=True, cancelled=isinstance(error, KeyboardInterrupt))
                 if failures:
                     error.add_note("; ".join(failures))
             except Exception as cleanup_error:
@@ -506,7 +507,8 @@ def _train_worker(args):
     # callback because the forward-pass check is a collective under FSDP.
     # Other ranks' reports are discarded.
     report = preflight.Report()
-    callbacks = [preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
+    callbacks = [cancellation.callback_class()(),
+                 preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
                                             no_staging=getattr(args, "no_staging", False), progress=progress)]
     if synthetic_callback is not None:
         callbacks.append(synthetic_callback)
@@ -520,6 +522,8 @@ def _train_worker(args):
         # Completion quality must publish before this callback closes the sole metrics writer.
         callbacks.append(writer)
     trainer = build_trainer(cfg, model, processor, train_set, eval_set, callbacks, progress=progress)
+    # Constructor-internal rank ordering must finish before any worker can leave.
+    cancellation.checkpoint("trainer preparation end")
     if synthetic_callback is not None:
         synthetic_callback.bind(trainer)
     if quality_callback is not None:
@@ -534,6 +538,8 @@ def _train_worker(args):
         finally:
             report.flush()
         report.write(run_dir, no_staging=getattr(args, "no_staging", False), progress=progress)
+    # Rank-zero inspection is complete; every worker reaches this before train().
+    cancellation.checkpoint("preflight inspection end")
     try:
         with stage(progress, "trainer running", unit="steps", visible=True) as activity:
             activity_callback = metrics.activity_callback_class()(activity)

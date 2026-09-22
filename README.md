@@ -58,10 +58,11 @@ Training records feedback in `log.txt`, visible in the TUI's log pane. While wor
 waiting notices stay in the log so they do not interrupt metrics tables; other training-command
 phases use a 30-second terminal waiting interval. Preflight example text stays in `preflight.json`.
 
-Ctrl+C requests worker cleanup and waits up to 60 seconds before escalating to SIGTERM, then
-SIGKILL after another 5 seconds if needed. Press Ctrl+C again to force termination. Shutdown includes
-worker descendants, reports its progress, and prevents verification from starting after cancellation.
-Cancellation exits with status 130.
+The first Ctrl+C requests clean shutdown at a shared worker boundary. Workers finish their current
+coordinated work before releasing GPU resources; this may take 60 seconds or longer, with no automatic
+timeout escalation. Press Ctrl+C again to force termination of workers and their descendants.
+Shutdown reports progress, prevents verification from starting, and exits with status 130.
+Worker failures and leftover helper processes retain bounded cleanup.
 
 ## Installing updates
 

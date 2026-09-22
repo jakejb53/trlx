@@ -36,7 +36,7 @@ import torch
 
 from dataset.io import DatasetError, write_text
 from dataset.progress import stage
-from trlx import TrlxError, run_dirs, show
+from trlx import TrlxError, cancellation, run_dirs, show
 
 # Seconds allowed for the vLLM server health probe. A connection that takes
 # longer is treated as unreachable; the same accepted display-constant
@@ -392,6 +392,8 @@ def check_offpolicy(cfg, model, processor, train_set, report, *, progress=None):
     try:
         with stage(progress, "checking off-policy responses", total=count, unit="rows") as activity, torch.no_grad():
             for row in train_set.select(range(count)):
+                # Both responses of the preceding row finished on every rank.
+                cancellation.checkpoint("off-policy row boundary")
                 # Use the same concatenated tokenization and prefix slicing as training and the full scan.
                 pairs = data_profile.response_pairs(processor, row, cfg.method.name)
                 names = ("completion",) if len(pairs) == 1 else ("chosen", "rejected")
@@ -406,6 +408,7 @@ def check_offpolicy(cfg, model, processor, train_set, report, *, progress=None):
                 activity.advance()
     finally:
         model.train(was_training)
+    cancellation.checkpoint("off-policy scoring end")
     facts = {"rows": count, "threshold": threshold}
     for name in ("chosen", "rejected", "completion"):
         values = scores.get(name)
@@ -472,5 +475,7 @@ def callback_class():
             if self.rank == 0:
                 self.report.flush()
                 self.report.write(self.run_dir, no_staging=self.no_staging, progress=self.progress)
+            # The rank-zero publication completes before any subsequent callback.
+            cancellation.checkpoint("preflight callback end")
 
     return PreflightCallback

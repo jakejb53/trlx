@@ -7,7 +7,7 @@ import re
 
 from dataset.io import DatasetError, read_rows, write_rows
 from dataset.progress import stage
-from trlx import TrlxError, quality
+from trlx import TrlxError, cancellation, quality
 
 
 FILENAME = "synthetic-eval.jsonl"
@@ -138,6 +138,8 @@ def generate(trainer, source, maximum, *, progress=None):
     with quality.observational(model), stage(progress, "generating synthetic evaluation summaries",
                                             total=count, unit="rows", visible=True) as activity:
         for index in range(count):
+            # Finish synchronized generation of one summary before any rank leaves.
+            cancellation.checkpoint("synthetic evaluation row boundary")
             number = index + 1
 
             # Rank zero logs the complete source before generation starts. Keep
@@ -170,6 +172,8 @@ def generate(trainer, source, maximum, *, progress=None):
             # counter throttling and reach both the terminal and the run log.
             if not distributed or dist.get_rank() == 0:
                 activity.note(f"Summary {number}/{count}:\n{row['text']}\n\nSummaries generated: {number}/{count}")
+    # No incomplete or cancelled set of summaries reaches publication.
+    cancellation.checkpoint("synthetic evaluation generation end")
     return rows
 
 
@@ -230,5 +234,7 @@ def callback_class():
                 )
             self.ready = True
             self.source = None
+            # _prepare_dataset contains internal rank-ordering barriers.
+            cancellation.checkpoint("synthetic evaluation preparation end")
 
     return SyntheticEvalCallback

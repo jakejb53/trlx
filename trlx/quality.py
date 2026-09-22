@@ -14,7 +14,7 @@ import sys
 from dataset.endpoint import Endpoint
 from dataset.io import DatasetError, write_text
 from dataset.progress import stage
-from trlx import TrlxError, data_load, quality_scorers, show
+from trlx import TrlxError, cancellation, data_load, quality_scorers, show
 
 
 FILENAME = show.QUALITY_FILENAME
@@ -458,6 +458,8 @@ def evaluate(model, processor, dataset, settings, *, rank=0, progress=None):
     results = []
     with observational(model), stage(progress, "independent quality evaluation", total=dataset.num_rows, unit="rows") as activity:
         for start in range(0, dataset.num_rows, settings.quality_batch_size):
+            # Generation and rank-zero judging for the previous batch have finished.
+            cancellation.checkpoint("independent quality batch boundary")
             rows = [dataset[index] for index in range(start, min(start + settings.quality_batch_size, dataset.num_rows))]
             if preset in {"language_modeling", "preference"}:
                 function = _language_modeling if preset == "language_modeling" else _preference
@@ -491,6 +493,7 @@ def evaluate(model, processor, dataset, settings, *, rank=0, progress=None):
             if error is not None:
                 raise EvaluationError(f"quality rows {start + 1}-{start + len(rows)}: {error}", results)
             activity.advance(len(rows))
+    cancellation.checkpoint("independent quality scoring end")
     return results
 
 
@@ -609,6 +612,7 @@ def callback_class():
 
             if self.trainer is None:
                 raise RuntimeError("quality callback was not bound to its trainer")
+            cancellation.checkpoint("independent quality start")
             base = self.trainer.accelerator.unwrap_model(model)
             distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
             context = {"phase": phase, "step": state.global_step, "preset": self.settings.quality_preset,

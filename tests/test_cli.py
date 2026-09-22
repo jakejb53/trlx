@@ -2,15 +2,42 @@
 
 import contextlib
 import io
+import os
+import signal
 import types
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, Mock, patch
 
 from dataset.progress import Progress
-from trlx import TrlxError, cli, config, hardware, model, options, train
+from trlx import TrlxError, cancellation, cli, config, hardware, model, options, train
 
 
 class Interface(unittest.TestCase):
+    # Readiness is announced only after SIGINT can survive parsing/library imports.
+    def test_worker_readiness_and_cancelled_exit(self):
+        events = []
+        connection = Mock(side_effect=events.append)
+
+        # Simulate SIGINT arriving while dynamic command options load dependencies.
+        def parse(argv):
+            self.assertTrue(any(event["kind"] == "cancellation_ready" for event in events))
+            os.kill(os.getpid(), signal.SIGINT)
+            return types.SimpleNamespace(command="sft", _rank=0, func=run)
+
+        # The worker consumes the retained request at its first safe boundary.
+        def run(args):
+            cancellation.checkpoint("prepared worker")
+            self.fail("worker continued after cancellation")
+
+        previous = signal.getsignal(signal.SIGINT)
+        with patch.object(cli, "parse_args", side_effect=parse), patch.object(cli, "load_env"), \
+                patch("trlx.feedback.connect", return_value=connection), \
+                patch("trlx.feedback.configure_logging"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["sft", "--_rank", "0"]), 130)
+        self.assertIs(signal.getsignal(signal.SIGINT), previous)
+        connection.close.assert_called_once_with()
+
     # Retired prompt flags fail explicitly instead of silently skipping requested behavior.
     def test_verification_prompt_options_explain_removal(self):
         commands = [(["verify", "checkpoint", "--base", "base"], "--prompts")]

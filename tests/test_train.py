@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import pathlib
+import signal
 import subprocess
 import sys
 import threading
@@ -12,7 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from dataset.progress import Progress
-from trlx import TrlxError, cli, init_cmd, launch, render_tui, run_dirs, train
+from trlx import TrlxError, cli, init_cmd, launch, processes, render_tui, run_dirs, train
 
 
 # A process that finishes after several polls, so the real Job exercises its
@@ -22,7 +23,9 @@ class Process:
     def __init__(self, code=0):
         self.code = code
         self.polls_left = 6
-        self.kills = 0
+        self.pid = None
+        self.returncode = None
+        self.signals = []
         self.waits = 0
 
     # Once complete, every later observation returns the same exit code.
@@ -30,18 +33,15 @@ class Process:
         if self.polls_left:
             self.polls_left -= 1
             return None
-        return self.code
-
-    # Record cancellation separately from ordinary completion.
-    def kill(self):
-        self.kills += 1
-        self.polls_left = 0
-        self.code = -9
+        self.returncode = self.code
+        return self.returncode
 
     # Reaping is observable without blocking a test.
-    def wait(self):
+    def wait(self, timeout=None):
         self.waits += 1
-        return self.code
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("synthetic worker", timeout)
+        return self.returncode
 
 
 # A closed output destination can fail again during interpreter shutdown.
@@ -96,8 +96,10 @@ class Supervisor(unittest.TestCase):
         self.snapshot_path = pathlib.Path("memory-run/config.toml")
         self.snapshot = self._patch("trlx.train._write_snapshot", return_value=self.snapshot_path)
         self._patch("trlx.train._final_checkpoint", return_value=pathlib.Path("memory-run/checkpoint-1"))
-        self.spawn = self._patch("trlx.launch.spawn", return_value=[self.worker])
-        self.spawn_verify = self._patch("trlx.launch.spawn_verify", return_value=self.verify)
+        self.spawn = self._patch("trlx.launch.spawn", side_effect=self._spawn)
+        self.spawn_verify = self._patch("trlx.launch.spawn_verify", side_effect=self._spawn_verify)
+        self._patch("trlx.processes.os.kill", side_effect=self._signal)
+        self._patch("trlx.processes.os.killpg", side_effect=self._signal)
         self._patch("trlx.launch.time.sleep")
         self._patch("trlx.train.open", create=True, side_effect=self._open)
         self._patch("pathlib.Path.exists", return_value=True)
@@ -119,6 +121,32 @@ class Supervisor(unittest.TestCase):
     def _patch(self, target, **kwargs):
         return self.enterContext(patch(target, **kwargs))
 
+    # Mirror Collector.spawn ownership registration without launching real children.
+    def _spawn(self, method, config, strategy, physical, collector, **kwargs):
+        self.worker.pid = 900001
+        processes.register(self.worker, "rank 0")
+        self.worker._trlx_cancel_ready = True
+        collector.children.append(self.worker)
+        return [self.worker]
+
+    # Verification enters the same collector lifetime after workers are reaped.
+    def _spawn_verify(self, checkpoint, base, physical, collector, **kwargs):
+        self.verify.pid = 900002
+        processes.register(self.verify, "verify")
+        collector.children.append(self.verify)
+        return self.verify
+
+    # Transport is covered by real subprocess tests; no synthetic PID reaches the OS.
+    def _signal(self, pid, sig):
+        process = next(p for p in (self.worker, self.verify) if p.pid == pid)
+        if process.returncode is not None:
+            raise ProcessLookupError
+        if sig:
+            process.signals.append(sig)
+            process.polls_left = 0
+            process.code = 130 if sig == signal.SIGINT else -sig
+            process.returncode = process.code
+
     # Only the log writer and reader reach open; both live entirely in memory.
     def _open(self, path, mode):
         if mode == "ab":
@@ -137,7 +165,7 @@ class Supervisor(unittest.TestCase):
         self.weights.assert_not_called()
         self.assertEqual(self.spawn.call_args.args[1], str(self.snapshot_path))
         self.spawn_verify.assert_called_once()
-        self.assertEqual((self.worker.kills, self.verify.kills), (0, 0))
+        self.assertEqual((self.worker.signals, self.verify.signals), ([], []))
         self.assertEqual(self.verify.poll(), expected)
 
     # Exercise real consent while other supervisor tests isolate already-started jobs.
@@ -283,8 +311,8 @@ class Supervisor(unittest.TestCase):
         train._supervise_lines(pathlib.Path("memory-run"), {"loss": (0, 5), "eval_loss": (0, 5)},
                                pathlib.Path("memory-run/log.txt"), job, failed)
         text = self.stdout.getvalue()
-        self.assertEqual(text.count("Training —"), 1)
-        self.assertEqual(text.count("Evaluation —"), 1)
+        # The current renderer labels columns; one heading per phase survives waits.
+        self.assertEqual(text.count("eval_step"), 2)
         self.assertIn("2.280", text)
         self.assertNotIn("waiting:", self.stderr.buffer.getvalue().decode())
         self.assertIn(b"waiting: trainer running", self.log.getvalue())
@@ -350,7 +378,7 @@ class Supervisor(unittest.TestCase):
                 with self.assertRaisesRegex(TrlxError, "log.txt.*cannot record feedback.*disk full"):
                     train.run(self.args)
         self.assertTrue(failed_write.is_set())
-        self.assertEqual(self.worker.kills, 1)
+        self.assertEqual(self.worker.signals, [signal.SIGINT])
         self.assertGreater(self.worker.waits, 0)
         self.spawn_verify.assert_not_called()
         self.assertNotIn(b"display stopped", self.log.getvalue())
@@ -401,7 +429,7 @@ class Supervisor(unittest.TestCase):
         with self.assertRaises(TrlxError) as caught:
             train.run(self.args)
         self.assertIs(caught.exception, error)
-        self.assertEqual(self.worker.kills, 1)
+        self.assertEqual(self.worker.signals, [signal.SIGINT])
         self.spawn_verify.assert_not_called()
         self.assertNotIn(b"display stopped", self.log.getvalue())
 
@@ -442,7 +470,7 @@ class Supervisor(unittest.TestCase):
             self._patch("trlx.render_lines.Stream.record", side_effect=KeyboardInterrupt)
         with self.assertRaises(KeyboardInterrupt):
             train.run(self.args)
-        self.assertEqual(self.worker.kills, 1)
+        self.assertEqual(self.worker.signals, [signal.SIGINT])
         self.assertEqual(self.worker.waits, 1)
         self.spawn_verify.assert_not_called()
 
@@ -472,7 +500,7 @@ class Supervisor(unittest.TestCase):
         self.enterContext(patch.object(self.log, "flush", side_effect=flush))
         with self.assertRaisesRegex(TrlxError, "cannot record display failure"):
             train.run(self.args)
-        self.assertEqual(self.worker.kills, 1)
+        self.assertEqual(self.worker.signals, [signal.SIGINT])
         self.spawn_verify.assert_not_called()
 
     # A failure while printing the final verdict must not replace its exit code.
@@ -561,7 +589,7 @@ class Supervisor(unittest.TestCase):
         # New child diagnostics arrive through the collector, never by replaying log bytes.
         def spawn(*args, **kwargs):
             args[4].accept("rank 0", {"kind": "raw", "message": "worker log"})
-            return [self.worker]
+            return self._spawn(*args, **kwargs)
 
         self.spawn.side_effect = spawn
         self._assert_completed()

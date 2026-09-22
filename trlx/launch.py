@@ -128,6 +128,8 @@ def _total_memory(physical):
 # Starts one worker per selected device over the supervisor's resolved snapshot.
 # The collector drains feedback and raw output into log.txt. With one
 # device no distributed variables are set, so accelerate runs single-process.
+# Complete the cohort before propagating Ctrl+C: a subset cannot rendezvous.
+@processes.defer_interrupt()
 def spawn(method, config_path, strategy, physical, collector, *, force=False, no_staging=False):
     world = len(physical)
     port = _free_port() if world > 1 else None
@@ -274,25 +276,25 @@ class Job:
 
     # Cancellation revokes verification before cleanup; the collector also knows
     # children created during a spawn interrupted before its return value was assigned.
-    def terminate(self, *, terminal=None):
+    def terminate(self, *, terminal=None, cancelled=False):
         self._cancelled = True
         self.start_verify = None
         if self.feedback is not None:
-            return self.feedback.stop(terminal=terminal)
-        return terminate(self.workers + ([self.verify] if self.verify is not None else []))
+            return self.feedback.stop(terminal=terminal, cancelled=cancelled)
+        return terminate(self.workers + ([self.verify] if self.verify is not None else []), cancelled=cancelled)
 
 
 # All shutdown entry points use the same group-aware policy.
-def terminate(procs, *, feedback=None):
+def terminate(procs, *, feedback=None, cancelled=False):
     if feedback is not None:
-        return feedback.stop(procs)
+        return feedback.stop(procs, cancelled=cancelled)
 
     # A caller without a collector still receives explicit shutdown diagnostics.
     def report(message):
         if sys.stderr is not None:
             print(message, file=sys.stderr, flush=True)
 
-    return processes.stop(procs, report)
+    return processes.stop(procs, report, cancelled=cancelled)
 
 
 # An unused TCP port for the rendezvous, released just before the workers

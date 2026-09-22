@@ -195,12 +195,15 @@ includes elapsed time, with artifact locations displayed alongside the results.
 - All visible GPUs by default. `--gpus` takes device indices.
 - trlx starts its own worker processes. No `accelerate launch`, no accelerate config file.
 - A supervisor process starts one worker per selected GPU. The supervisor owns the run directory, `config.toml`, `log.txt`, and the display, and never loads a model. Rank 0 owns the metric callback, `metrics.jsonl`, and preflight. All ranks report attributed diagnostics and progress. Workers destroy initialized process groups on exit; cleanup failures must not replace an existing training failure. A worker exiting nonzero stops the others and the supervisor exits with that code. Verify runs as a further process after every worker has exited, with all selected GPUs visible, and its exit code is the job's.
-- Workers and verification run in private process groups owned from creation. Cancellation, partial
-  startup, and failure share one shutdown path: SIGINT with 60 seconds for cleanup, then SIGTERM with
-  5 seconds, then SIGKILL for survivors. A second Ctrl+C forces escalation without abandoning cleanup.
-  Descendants are signalled too; final reaping and output draining are bounded. Shutdown progress and
-  failures are reported without replacing the original failure. Cancelled runs never start verification
-  and return 130 without a cancellation traceback.
+- Workers and verification run in private process groups owned from creation. The first Ctrl+C
+  requests cooperative worker cancellation: SIGINT records a request, ranks agree at matching safe
+  boundaries, finish outstanding GPU work, and destroy their process groups normally. The supervisor
+  waits for handler readiness before signalling leaders; helpers finish their work without that signal.
+  Clean shutdown may take 60 seconds or longer, with no automatic timeout escalation. A second Ctrl+C
+  forces termination of owned process groups. Failure, verifier, and leftover-helper cleanup remain
+  bounded: SIGINT with 60 seconds, SIGTERM with 5 seconds, then SIGKILL. Final reaping and output
+  draining are bounded. Shutdown reports progress and preserves the original failure. Cancelled runs
+  skip completion-only work and verification, returning 130 without a cancellation traceback.
 - Strategy: trlx chooses data-parallel when the model at its dtype fits one selected GPU with headroom, sharded otherwise. A sharded run whose per-rank estimate, the training state divided by the rank count plus any unsharded original copy (2.9), still exceeds the smallest selected GPU is refused, forced or not. `--strategy` overrides. Choice printed at startup and recorded in the snapshot.
 
 ### 2.6 Preflight

@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, synthetic CPT evaluation, and optional random evaluation splitting complete. Optional acceleration recommendations remain planned. Synthetic evaluation execution validation remains with the operator.
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, and optional random evaluation splitting complete. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -473,18 +473,35 @@ Completed: actionable guidance, visible evaluation loss, and baseline (2026-09-2
   ownership, quality callbacks, `README.md`, and `SPEC.md`. `run.toml` and existing runs were unchanged.
 - Validation remains with the operator. No tests were updated or run for these changes.
 
-Completed: graceful cancellation (2026-09-21)
+Completed: cooperative cancellation (2026-09-21)
 
-- Workers and verification run in private process groups, registered at spawn so cleanup covers
-  partial launches and descendants. Cancellation prevents verification from starting.
-- Shared cleanup sends SIGINT, allows 60 seconds, then sends SIGTERM and allows 5 seconds before
-  SIGKILL. A second Ctrl+C forces termination. Final reaping and output draining are bounded.
-- Shutdown progress is logged; cleanup preserves the original failure. Ctrl+C exits with status 130
-  without a cancellation traceback.
-- Added `trlx/processes.py`; updated launch, feedback, training, CLI, `README.md`, and `SPEC.md`.
-  Configuration and existing runs were unchanged.
-- Validation remains with the operator. No tests were updated or run; the GPU driver incident's
-  connection to the previous cancellation behavior remains unproven.
+- First Ctrl+C records worker cancellation; ranks agree at matching preparation, training, evaluation,
+  and generation/scoring boundaries, finish outstanding GPU work, and destroy process groups normally.
+  The supervisor announces that clean shutdown may take 60 seconds or longer, without automatic
+  escalation. Second Ctrl+C forces owned process groups. Cancellation skips completion-only work and
+  verification and exits 130. Failure, verifier, and leftover-helper cleanup remain bounded.
+- Launch registers the whole rank cohort before propagating interruption. Workers acknowledge handler
+  readiness before receiving SIGINT; helper processes finish normally. A failed peer during cancellation
+  switches to bounded failure cleanup. NCCL watchdog settings are unchanged; no experimental abort API
+  or automatic GPU recovery probe is used.
+- Added `trlx/cancellation.py`; updated CLI, training, processes, launch, feedback, preflight, quality,
+  synthetic evaluation, `README.md`, and `SPEC.md`. Added cancellation/process tests and updated affected
+  supervisor/CLI tests. Operational configuration and existing runs were unchanged.
+- Validation: 160 focused tests passed; six tiny single-GPU/DDP/FSDP training/evaluation cancellation
+  checks passed. Both GPUs returned to 0% utilization without recovery. Independent review found no
+  remaining blockers. Full-scale model cancellation remains untested.
+- Broader validation exposed the unrelated stale
+  `tests.test_quality_callback.MetricsWriterTest.test_runtime_advisory_failure_isolated` expectation
+  for the removed runtime assessment behavior; it remains unresolved.
+
+From the repo root, using the project environment's Python executable:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_cancellation tests.test_processes tests.test_feedback tests.test_train \
+  tests.test_cli tests.test_imports tests.test_preflight tests.test_quality \
+  tests.test_quality_callback.SchedulingTest -q
+```
 
 ### Synthetic CPT evaluation (complete, 2026-09-21)
 
@@ -519,7 +536,8 @@ Completed: graceful cancellation (2026-09-21)
 - Updated `trlx/data_load.py`, `config.py`, `options.py`, `train.py`, `review.py`, focused tests,
   `README.md`, and `SPEC.md`. No operational configuration files changed.
 - Validation: 125 focused tests passed. The broader supervisor suite's 7 failures and 17 errors
-  reproduced with the original loading calls; existing process-control fixture failures remain unresolved.
+  reproduced with the original loading calls; those process-control fixtures were subsequently corrected
+  and the supervisor suite passed during cooperative cancellation work above.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

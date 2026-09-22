@@ -309,14 +309,21 @@ def main(argv=None):
             worker_rank = token.partition("=")[2]
     if worker_rank is not None and worker_rank.isdecimal():
         label += f" rank {worker_rank}"
-    from trlx import feedback
+    from trlx import cancellation, feedback
 
     connection = feedback.connect()
     events = connection if connection is not None else (
         feedback.Startup() if command in METHODS and worker_rank is None else None)
     try:
         on_error = _defer_training_display_error if command in METHODS and worker_rank is None else None
-        with Progress(label, on_error=on_error, events=events) as progress:
+        # A worker retains SIGINT through imports, trainer preparation, and teardown.
+        # Only coordinated worker boundaries turn the request into an exception.
+        with cancellation.worker_signals(command in METHODS and worker_rank is not None), Progress(
+            label, on_error=on_error, events=events,
+        ) as progress:
+            if command in METHODS and worker_rank is not None and connection is not None:
+                # Popen returning does not prove Python has installed our handler.
+                connection({"kind": "cancellation_ready", "message": "worker cancellation handler ready"})
             with stage(progress, "loading command options"):
                 args = parse_args(argv)
             rank = getattr(args, "_rank", None)
