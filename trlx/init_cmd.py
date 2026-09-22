@@ -80,9 +80,10 @@ def render(system: Hardware) -> str:
     w.key("per_device_train_batch_size", 1)
     w.key("gradient_accumulation_steps", 8)
     w.key("per_device_eval_batch_size", 1)
-    w.comment("Evaluate and save after each epoch, retain two checkpoints, log every optimizer update.")
+    w.comment("Evaluate after each epoch, retain two checkpoints, log every optimizer update.")
     w.key("eval_strategy", "epoch")
-    w.key("save_strategy", "epoch")
+    w.comment("Checkpoint saving follows evaluation; without evaluation, save only at completion. "
+              "Set save_strategy and save_steps to override.")
     w.key("save_total_limit", 2)
     w.key("logging_steps", 1)
     w.key("report_to", "none")

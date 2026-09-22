@@ -139,8 +139,8 @@ class TopLevelKeys(ConfigCase):
         # checkpoint interval must follow that resolved value.
         cfg = self.load('eval_strategy = "steps"\nlogging_steps = 7\n')
         self.assertEqual(cfg.args.save_steps, 7)
-        # Eval off: the dataclass default stands.
-        self.assertEqual(self.load().args.save_steps, 500)
+        # Eval off: zero disables intermediate saves but retains the final checkpoint.
+        self.assertEqual(self.load().args.save_steps, 0)
 
     def test_dataclass_validation_is_reported(self):
         # An invalid enum value is rejected by TrainingArguments.__post_init__

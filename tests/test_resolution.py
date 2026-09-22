@@ -23,6 +23,49 @@ class Resolution(unittest.TestCase):
         with patch.object(config, "_read_toml", return_value=self.source):
             return config.load(args.config, method, overrides=options.overrides(args))
 
+    # Init must leave scheduling free to follow CLI evaluation changes and preserve explicit saves.
+    def test_checkpoint_defaults_and_overrides(self):
+        cases = [
+            ([], "epoch", None),
+            (["--eval-strategy", "steps", "--eval-steps", "5"], "steps", 5),
+            (["--eval-strategy", "steps", "--eval-steps", "7", "--load-best-model-at-end"], "steps", 7),
+            (["--eval-strategy", "no"], "steps", 0),
+            (["--no-split"], "steps", 0),
+            (["--no-split", "--save-steps", "3"], "steps", 3),
+            (["--no-split", "--save-strategy", "epoch"], "epoch", None),
+            (["--no-split", "--save-strategy", "steps"], "steps", 500),
+            (["--eval-strategy", "steps", "--eval-steps", "5", "--save-steps", "10"], "steps", 10),
+            (["--eval-strategy", "steps", "--eval-steps", "5", "--save-strategy", "epoch"], "epoch", None),
+        ]
+        for extra, strategy, interval in cases:
+            with self.subTest(extra=extra):
+                cfg = self.load(extra=extra)
+                self.assertEqual(cfg.args.save_strategy, strategy)
+                if interval is not None:
+                    self.assertEqual(cfg.args.save_steps, interval)
+                with patch.object(config, "_read_toml", return_value=self.snapshot(cfg)):
+                    worker = config.load("snapshot", "sft", resolved=True)
+                self.assertEqual(worker.args.save_strategy, cfg.args.save_strategy)
+                self.assertEqual(worker.args.save_steps, cfg.args.save_steps)
+
+    # Exercise installed Transformers scheduling past its old 500-step default without training.
+    def test_final_only_saving_uses_trainer_completion(self):
+        from transformers import TrainerControl, TrainerState
+        from transformers.trainer_callback import DefaultFlowCallback
+
+        cfg = self.load(extra=["--no-split"])
+        state = TrainerState(max_steps=1001)
+        state.compute_steps(cfg.args, state.max_steps)
+        flow = DefaultFlowCallback()
+        for step in (1, 500, 1000, 1001):
+            with self.subTest(step=step):
+                state.global_step = step
+                control = flow.on_step_end(cfg.args, state, TrainerControl())
+                self.assertEqual(control.should_save, step == state.max_steps)
+                self.assertFalse(control.should_evaluate)
+                control = flow.on_epoch_end(cfg.args, state, TrainerControl())
+                self.assertFalse(control.should_save)
+
     # The optional split selection survives CLI resolution and worker snapshots for every trainer.
     def test_random_eval_split_round_trip_for_all_methods(self):
         for method in cli.METHODS:

@@ -559,18 +559,25 @@ def _build_args(path, method, top, eval_enabled, fsdp, replay):
         kwargs.update(VLLM_FORCED)
     if kl_forced:
         kwargs.update(REPLAY_KL_FORCED)
-    save_steps_given = "save_steps" in kwargs
+    # Resolve save defaults before the dataclass validates coupled save/eval settings.
+    # Explicit strategies retain their library defaults when evaluation is disabled.
+    save_strategy_given = "save_strategy" in kwargs
+    eval_strategy = kwargs.get("eval_strategy", fields["eval_strategy"].default)
+    kwargs.setdefault("save_strategy", eval_strategy if eval_strategy != "no" else "steps")
+    if "save_steps" not in kwargs and kwargs["save_strategy"] == "steps":
+        if eval_strategy == "steps":
+            kwargs["save_steps"] = (kwargs.get("eval_steps") or kwargs.get(
+                "logging_steps", fields["logging_steps"].default))
+        elif not save_strategy_given and eval_strategy == "no":
+            # Transformers skips periodic saves at zero but still saves the final step.
+            # Keep the steps strategy: "no" would also suppress the final checkpoint.
+            kwargs["save_steps"] = 0
 
     try:
         args = cls(**kwargs)
     except (ValueError, TypeError) as e:
         # TRL and transformers validate field combinations in __post_init__.
         raise TrlxError(f"{path}: {cls.__name__} rejected the config: {e}")
-    # The checkpoint interval follows the eval interval. Applied after
-    # __post_init__ because that is where transformers resolves eval_steps
-    # (absent eval_steps with eval_strategy = "steps" becomes logging_steps).
-    if not save_steps_given and args.eval_strategy == "steps":
-        args.save_steps = args.eval_steps
     # The trainer's own startup evaluation runs after distributed preparation and
     # before its first update. Resume keeps the original step-zero measurements.
     args.eval_on_start = bool(eval_enabled and args.eval_strategy != "no" and not args.resume_from_checkpoint)

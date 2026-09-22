@@ -6,7 +6,7 @@ Design rule: do what makes sense, not what the HF/ML ecosystem does.
 
 Design rule: general-purpose. No model family, architecture, module name, path, device, or machine fact is assumed in source or tests. Model facts come from explicit inputs or model metadata; `init` obtains environment facts from hardware inspection. Section 5 records one test model, not assumptions the tools rely on.
 
-Project-specific runtime-default exceptions: absent trainer settings use TRL dataclass defaults; `run_name` uses the output directory's name; a step-based checkpoint interval follows the evaluation interval (§2.2). Flat configs without `[run]` retain the original CLI defaults: all visible GPUs, automatic strategy, line display, and verification enabled. A present `[run]` requires all its keys. Other operational defaults are written explicitly by `init`.
+Project-specific runtime-default exceptions: absent trainer settings use TRL dataclass defaults; `run_name` uses the output directory's name; checkpoints follow evaluation or save only at completion when evaluation is disabled (§2.2). Flat configs without `[run]` retain the original CLI defaults: all visible GPUs, automatic strategy, line display, and verification enabled. A present `[run]` requires all its keys. Other operational defaults are written explicitly by `init`.
 
 ## 1. Repository
 
@@ -108,7 +108,8 @@ Both CLIs provide top-level command descriptions and command-level help with inp
 TOML. One file holds persistent defaults for all methods. Precedence is explicit CLI values, then the selected `[methods.<name>]` section, then shared top-level settings. Nested method tables are merged by key. Unselected method settings are not passed to TRL. A flat per-run config remains supported.
 
 - Top-level keys map onto the method's TRL config dataclass. Unknown key: error. Absent key: dataclass default. Nullable trainer and LoRA fields accept the string `"None"`; nullable CLI booleans also accept an explicit `None` value.
-- `output_dir` is the parent for fresh runs; init writes `runs/<method>` in each method section. Each run gets its own subdirectory (§2.3). `run_name` is a display label, defaulting to that generated directory name. For step evaluation, an omitted checkpoint interval follows the eval interval.
+- `output_dir` is the parent for fresh runs; init writes `runs/<method>` in each method section. Each run gets its own subdirectory (§2.3). `run_name` is a display label, defaulting to that generated directory name.
+- `init` omits `save_strategy` and `save_steps`. By default, checkpoints follow evaluation's strategy and interval; with evaluation disabled, only the final checkpoint is saved (`save_strategy = "steps"`, `save_steps = 0`). Explicit save settings override these defaults. An explicit step strategy without evaluation or a save interval retains TRL's interval default.
 - `[run]`: `gpus` (`all` or comma-separated visible indices), `strategy` (`auto`, `ddp`, `fsdp`), `tui` and `verify` (booleans). CLI forms are `--gpus`, `--strategy`, `--tui`/`--no-tui`, `--verify`/`--no-verify`.
 - `[model]`: `path`, `dtype`, `trust_remote_code`, `attn_implementation`. Class is read from the model's own config, never hardcoded. `reward` resolves the sequence-classification variant of that architecture.
 - `[teacher]`: `distillation` only. Same keys as `[model]`.

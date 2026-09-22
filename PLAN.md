@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, and assessment recommendation overhaul complete. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, assessment recommendation overhaul, and checkpoint defaults complete. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -570,6 +570,21 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   tests.test_assessment_presentation tests.test_review tests.test_metrics tests.test_train \
   tests.test_quality tests.test_quality_scorers tests.test_preflight tests.test_resolution tests.test_imports -q
 ```
+
+### Checkpoint defaults (complete, 2026-09-22)
+
+- `init` omits `save_strategy` and `save_steps`. Saving follows evaluation by default;
+  disabled evaluation uses `save_strategy = "steps"`, `save_steps = 0` for final-only saving.
+  Explicit save settings override the defaults. The installed trainer owns final saving.
+- Updated `trlx/init_cmd.py`, `trlx/config.py`, `tests/test_init.py`, `tests/test_config.py`,
+  `tests/test_resolution.py`, and `SPEC.md`.
+- Validation: 37 tests passed: `tests.test_resolution` and five rendering-only `InitDefaults`
+  tests (`test_cpu_defaults`, `test_precision_uses_all_devices`,
+  `test_all_methods_and_explicit_objectives`, `test_first_run_preset`,
+  `test_hardware_comments_and_terminal_width`). Checks cover CLI overrides, snapshots, and
+  installed trainer save decisions through step 1001. No live training was run.
+- Existing `run.toml` was not modified; its explicit `save_strategy = "epoch"` still overrides
+  these defaults. Removing that setting requires separate configuration approval.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 
