@@ -21,7 +21,8 @@ import typing
 import torch
 from peft import LoraConfig, PeftConfig
 
-from dataset.io import FORMATS
+from dataset.io import FORMATS, DatasetError
+from dataset.prompts import load as load_prompt
 from trlx import TrlxError, ranges, trainers
 
 # TRL fields whose only effect is when the trainer loads the model from a path
@@ -117,6 +118,7 @@ class PreflightSpec:
 class RewardEntry:
     spec: str
     args: dict | None
+    rubric_text: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,6 +138,7 @@ class AssessmentSpec:
     quality_max_new_tokens: int
     quality_batch_size: int
     judge: dict | None
+    prompts: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,6 +161,8 @@ class RunConfig:
     document: dict
     # Library-only config inspection can omit the block; training/check enforce it before startup work.
     assessment: AssessmentSpec | None = None
+    # Loaded once before review; publication uses these contents, never a second source read.
+    prompts: dict = dataclasses.field(default_factory=dict)
 
 
 # Loads and validates a run config for `method_name`. `fsdp` is the value for
@@ -214,6 +219,23 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
             raise TrlxError(f"{path}: --synthetic-dataset-eval requires CPT text rows with full-sequence loss")
         if (args.dataset_kwargs or {}).get("skip_prepare_dataset"):
             raise TrlxError(f"{path}: --synthetic-dataset-eval requires preparation of raw CPT text rows")
+    assessment = _assessment(path, blocks["assessment"], method_name) if "assessment" in blocks else None
+    reward_entries = _rewards(path, blocks["rewards"]) if "rewards" in blocks else None
+    prompt_texts = _prompts(path, blocks.get("prompts", {}), dataset, assessment)
+    if assessment is not None:
+        assessment = dataclasses.replace(assessment, prompts={
+            key: text for key, text in prompt_texts.items() if key.startswith("quality_")
+        })
+    if reward_entries:
+        for index, entry in enumerate(reward_entries):
+            if entry.spec == "llm_judge":
+                values = dict(entry.args or {})
+                if "rubric" in values:
+                    raise TrlxError(f"{path}: llm_judge rubric was removed; save it in a .prompt file and set rubric_file")
+                name = _require(path, f"[rewards].funcs[{index}].args", values, "rubric_file", str)
+                text = _read_prompt(path, name, allowed=None)
+                prompt_texts[f"reward_{index}"] = text
+                reward_entries[index] = dataclasses.replace(entry, rubric_text=text)
     return RunConfig(
         method=method,
         args=args,
@@ -223,11 +245,52 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
         peft=_peft(path, method, blocks["peft"]) if "peft" in blocks else None,
         ranges=ranges.parse(path, blocks["ranges"]),
         preflight=_preflight(path, blocks["preflight"]) if "preflight" in blocks else None,
-        rewards=_rewards(path, blocks["rewards"]) if "rewards" in blocks else None,
+        rewards=reward_entries,
         replay=replay,
         document=doc,
-        assessment=_assessment(path, blocks["assessment"], method_name) if "assessment" in blocks else None,
+        assessment=assessment,
+        prompts=prompt_texts,
     )
+
+
+# Paths belong to the config that supplied them, including saved worker/resume configs.
+def _read_prompt(config_path, name, required=(), allowed=()):
+    if not name.strip():
+        raise TrlxError(f"{config_path}: prompt path must not be empty")
+    target = pathlib.Path(name)
+    if not target.is_absolute():
+        target = pathlib.Path(config_path).absolute().parent / target
+    try:
+        return load_prompt(target, required=required, allowed=allowed)
+    except DatasetError as error:
+        raise TrlxError(f"{config_path}: {error}") from error
+
+
+# Inactive features require no files; active features have no implicit path or text defaults.
+def _prompts(path, table, dataset, assessment):
+    fields = {
+        "synthetic_eval_summary": ("text",),
+        "quality_qa": (), "quality_classification": ("labels",),
+        "quality_multiple_choice": ("choices",), "quality_json": ("required_fields",),
+        "quality_instruction_following_judge": (), "quality_writing_judge": (),
+    }
+    _check_keys(path, "[prompts]", table, fields)
+    for key in table:
+        _require(path, "[prompts]", table, key, str)
+    active = []
+    if dataset.synthetic_dataset_eval:
+        active.append("synthetic_eval_summary")
+    if assessment is not None and assessment.quality_checks:
+        preset = assessment.quality_preset
+        if preset in ("qa", "classification", "multiple_choice", "json"):
+            active.append(f"quality_{preset}")
+        elif preset in ("instruction_following", "writing"):
+            active.append(f"quality_{preset}_judge")
+    result = {}
+    for key in active:
+        name = _require(path, "[prompts]", table, key, str)
+        result[key] = _read_prompt(path, name, fields[key], allowed=() if fields[key] else None)
+    return result
 
 
 # Launch controls were CLI defaults before [run] became persistently editable.

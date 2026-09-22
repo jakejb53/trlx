@@ -24,3 +24,6 @@ dataset = "dataset.cli:main"
 
 [tool.setuptools]
 packages = ["trlx", "dataset"]
+
+[tool.setuptools.package-data]
+trlx = ["prompt_defaults/*.prompt", "prompt_defaults/*.prompt.example"]

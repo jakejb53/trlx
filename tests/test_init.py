@@ -106,6 +106,40 @@ class InitDefaults(unittest.TestCase):
             self.assertEqual(path.read_text(), "operator settings")
         inspect.assert_not_called()
 
+    # Prompt collisions must also fail before inspection or any config publication.
+    def test_existing_prompt_rejected_before_inspection(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
+            path = pathlib.Path(folder) / "custom.toml"
+            prompt = path.parent / "prompts" / "chat-questions.prompt"
+            prompt.parent.mkdir()
+            prompt.write_text("operator instructions", encoding="utf-8")
+            with patch("trlx.init_cmd.hardware.inspect") as inspect:
+                with self.assertRaisesRegex(TrlxError, "--force"):
+                    init_cmd.write(path)
+            inspect.assert_not_called()
+            self.assertFalse(path.exists())
+            self.assertEqual(prompt.read_text(), "operator instructions")
+
+    # Only generated names are replaced; an active operator rubric remains theirs.
+    def test_force_resets_prompts_and_preserves_operator_rubric(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
+            path = pathlib.Path(folder) / "custom.toml"
+            prompt = path.parent / "prompts" / "chat-questions.prompt"
+            prompt.parent.mkdir()
+            prompt.write_text("edited instructions", encoding="utf-8")
+            rubric = prompt.parent / "llm-judge.prompt"
+            rubric.write_text("operator objective", encoding="utf-8")
+            with patch("trlx.init_cmd.hardware.inspect", return_value=Hardware(8, ())):
+                init_cmd.write(path, force=True)
+            self.assertIn("Write {n} questions", prompt.read_text())
+            self.assertEqual(rubric.read_text(), "operator objective")
+            document = tomllib.loads(path.read_text())
+            for key, value in document["prompts"].items():
+                self.assertTrue((path.parent / value).is_file(), key)
+            example = (prompt.parent / "llm-judge.prompt.example").read_text()
+            self.assertIn("EXAMPLE 1", example)
+            self.assertIn("EXAMPLE 2", example)
+
     # A destination created during hardware inspection must not be silently replaced.
     def test_write_refuses_creation_race(self):
         with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent) as folder:
@@ -124,12 +158,14 @@ class InitDefaults(unittest.TestCase):
     # The CLI receives the same measured system used to produce the persisted defaults.
     def test_write_returns_snapshot_and_defaults_to_run_toml(self):
         system = Hardware(8, ())
-        with patch("trlx.init_cmd.validate_output"):
+        with patch("trlx.init_cmd.validate_output"), patch("trlx.init_cmd.validate_text_outputs"):
             with patch("trlx.init_cmd.hardware.inspect", return_value=system):
-                with patch("trlx.init_cmd.write_text") as write:
+                with patch("trlx.init_cmd.write_many_text") as write:
                     self.assertIs(init_cmd.write(), system)
-        self.assertEqual(write.call_args.args[0], "run.toml")
-        self.assertEqual(tomllib.loads(write.call_args.args[1]), self.document(system))
+        outputs = dict(write.call_args.args[0])
+        self.assertEqual(tomllib.loads(outputs[pathlib.Path("run.toml")]), self.document(system))
+        self.assertEqual(set(outputs), {pathlib.Path("run.toml"),
+                         *(pathlib.Path("prompts") / name for name in init_cmd.PROMPT_FILES)})
         self.assertEqual(write.call_args.kwargs, {"force": False, "no_staging": False, "progress": None})
 
     # Forced generation replaces settings explicitly, also permitting a new path.
@@ -144,7 +180,10 @@ class InitDefaults(unittest.TestCase):
                 with patch("trlx.init_cmd.hardware.inspect", return_value=system):
                     self.assertIs(init_cmd.write(str(path), force=True), system)
                 self.assertEqual(tomllib.loads(path.read_text()), self.document(system))
-                self.assertEqual(list(path.parent.iterdir()), [path])
+                prompt_dir = path.parent / "prompts"
+                self.assertEqual(set(path.parent.iterdir()), {path, prompt_dir})
+                self.assertEqual({item.name for item in prompt_dir.iterdir()}, set(init_cmd.PROMPT_FILES))
+                self.assertFalse((prompt_dir / "llm-judge.prompt").exists())
                 if existing:
                     self.assertEqual(path.stat().st_mode & 0o777, mode)
 
@@ -168,7 +207,8 @@ class InitDefaults(unittest.TestCase):
                     with self.assertRaisesRegex(TrlxError, "replace failed"):
                         init_cmd.write(str(path), force=True)
             self.assertEqual(path.read_text(), "operator settings")
-            self.assertEqual(list(path.parent.iterdir()), [path])
+            self.assertEqual(list(path.parent.glob("*.toml")), [path])
+            self.assertFalse(any((path.parent / "prompts").glob("*.prompt")))
 
     # Force replaces the named symlink, including dangling links, without touching its target.
     def test_force_replaces_symlink_in_both_write_modes(self):

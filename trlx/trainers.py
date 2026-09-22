@@ -32,7 +32,7 @@ class Method:
 
 
 # Blocks every method accepts.
-UNIVERSAL_BLOCKS = frozenset({"model", "dataset", "peft", "ranges", "verify", "assessment"})
+UNIVERSAL_BLOCKS = frozenset({"model", "dataset", "peft", "ranges", "verify", "assessment", "prompts"})
 
 
 def _method(name, config_cls, trainer_cls, dataset_format, blocks=(), model_kind="causal"):

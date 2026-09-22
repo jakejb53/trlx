@@ -11,12 +11,15 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from dataset.chat import ANSWERS_PROMPT, QUESTIONS_PROMPT, build, load_prompt, strip_inline_reasoning
+from dataset.chat import build, strip_inline_reasoning
 from dataset.endpoint import Endpoint, Reply
 from dataset.io import DatasetError
 from dataset.progress import Progress
+from dataset.prompts import load as load_prompt
 
 TEXT = "Rain falls from clouds. Rivers carry water to the sea."
+QUESTIONS_PROMPT = "Generate {n} questions from {chunk}"
+ANSWERS_PROMPT = "Use {chunk} to answer {question}"
 
 
 # Returns the queued replies for each pass. complete_many_full is the only
@@ -58,6 +61,15 @@ class StripInlineReasoningTest(unittest.TestCase):
 
 
 class BuildTest(unittest.TestCase):
+    # Inserted source and question text must never be interpreted as placeholders.
+    def test_supplied_templates_control_requests_without_recursive_substitution(self):
+        questions = StubEndpoint([Reply("What is {chunk}?", "")])
+        answers = StubEndpoint([Reply("An answer", "")])
+        build("Source {n}", 1000, 2, questions, answers,
+              "Ask {n}: {chunk}", "Answer {question} from {chunk}", 1)
+        self.assertEqual(questions.requests, [[{"role": "user", "content": "Ask 2: Source {n}"}]])
+        self.assertEqual(answers.requests, [[{"role": "user", "content": "Answer What is {chunk}? from Source {n}"}]])
+
     def test_reasoning_column_from_the_field(self):
         rows, skipped = run([Reply("What falls?", "planning the question")],
                             [Reply("Rain falls.", "recalling the text")])
@@ -122,10 +134,10 @@ class PromptErrors(unittest.TestCase):
     # Invalid prompt encodings identify the file before any generation request.
     def test_invalid_utf8_prompt(self):
         with tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parent) as d:
-            path = pathlib.Path(d) / "prompt.txt"
+            path = pathlib.Path(d) / "prompt.prompt"
             path.write_bytes(b"\xff")
             with self.assertRaisesRegex(DatasetError, "prompt is not valid UTF-8") as result:
-                load_prompt(path, QUESTIONS_PROMPT)
+                load_prompt(path, required=("n", "chunk"), allowed=("n", "chunk"))
             self.assertIn(str(path), str(result.exception))
 
 

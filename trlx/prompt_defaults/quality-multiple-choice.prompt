@@ -1,0 +1,3 @@
+Choices (label: choice text):
+{choices}
+Return only the label of one choice, without an explanation.

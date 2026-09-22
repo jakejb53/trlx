@@ -119,7 +119,7 @@ def _encoded_identity(settings, processor, dataset):
         elif settings.quality_preset == "preference":
             ids = [_preference_ids(processor, row, field) for field in ("chosen", "rejected")]
         else:
-            ids = [_prompt_ids(processor, row, settings.quality_preset)]
+            ids = [_prompt_ids(processor, row, settings)]
         digest.update(json.dumps(ids, separators=(",", ":")).encode() + b"\n")
     return digest.hexdigest()
 
@@ -136,6 +136,8 @@ def series_id(settings, dataset_fingerprint, processor, model, *, dataset=None):
     judge = settings.judge
     identity = {
         "version": SCORER_VERSION, "preset": settings.quality_preset, "data": dataset_fingerprint,
+        # Judge instructions affect scores even when policy input encodings are unchanged.
+        "prompts": settings.prompts,
         "max_length": settings.quality_max_length, "max_new_tokens": settings.quality_max_new_tokens,
         "batch_size": settings.quality_batch_size,
         "tokenizer": codec, "encoded_inputs": encoded, "chat_template": _template(processor),
@@ -234,8 +236,9 @@ def _preference_ids(processor, row, field):
 
 
 # Preset constraints include choices/labels, never reference answers; limits measure the resulting prompt.
-def _prompt_ids(processor, row, preset):
-    return _encode(processor, quality_scorers.generation_prompt(preset, row), prompt=True)
+def _prompt_ids(processor, row, settings):
+    return _encode(processor, quality_scorers.generation_prompt(
+        settings.quality_preset, row, settings.prompts), prompt=True)
 
 
 # Scan the actual benchmark encodings before confirmation, using the same encoders as inference.
@@ -255,7 +258,7 @@ def inspect_inputs(settings, processor, dataset, model_metadata, *, progress=Non
                     counts = [len(_preference_ids(processor, row, field)) for field in ("chosen", "rejected")]
                     budget = max(counts)
                 else:
-                    counts = [len(_prompt_ids(processor, row, preset))]
+                    counts = [len(_prompt_ids(processor, row, settings))]
                     budget = counts[0] + settings.quality_max_new_tokens
                 lengths.append({"row": number, "tokens": counts})
                 budgets.append(budget)
@@ -296,7 +299,7 @@ def _coordinated_ids(processor, row, settings, field=None):
         elif settings.quality_preset == "preference":
             ids = _preference_ids(processor, row, field)
         else:
-            ids = _prompt_ids(processor, row, settings.quality_preset)
+            ids = _prompt_ids(processor, row, settings)
         if settings.quality_preset != "language_modeling" and (not ids or len(ids) > settings.quality_max_length):
             raise TrlxError(f"quality {field or 'prompt'} is empty or exceeds quality_max_length; no input was silently truncated")
         digest = hashlib.sha256(json.dumps(ids).encode()).hexdigest()
@@ -475,7 +478,7 @@ def evaluate(model, processor, dataset, settings, *, rank=0, progress=None):
                         reply = None
                         if scored is None:
                             if endpoint is not None:
-                                reply = endpoint.complete(quality_scorers.judge_messages(preset, row, output),
+                                reply = endpoint.complete(quality_scorers.judge_messages(preset, row, output, settings.prompts),
                                                           max_tokens=settings.judge["max_tokens"], progress=activity)
                                 scored = quality_scorers.parse_judge_reply(reply)
                                 scored["details"]["judge_reply"] = reply

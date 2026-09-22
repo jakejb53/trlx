@@ -23,6 +23,7 @@ import re
 import string
 
 from dataset.endpoint import DatasetError, Endpoint
+from dataset.prompts import load as load_prompt
 from trlx import TrlxError
 
 _log = logging.getLogger("trlx.rewards")
@@ -232,11 +233,13 @@ def length_window(where, args):
 # number in the reply is the score. A reply with no number scores 0 and is
 # logged with its text, so a misbehaving judge is visible in log.txt rather
 # than fatal mid-run.
-def llm_judge(where, args, *, progress=None):
+def llm_judge(where, args, *, progress=None, rubric_text=None):
+    if "rubric" in args:
+        raise TrlxError(f"{where}: rubric was removed; save it in a .prompt file and set rubric_file")
     _args(
         where,
         args,
-        {"url": True, "model": True, "rubric": True, "timeout": True, "retries": True, "concurrency": True,
+        {"url": True, "model": True, "rubric_file": True, "timeout": True, "retries": True, "concurrency": True,
          "api_key": False, "max_tokens": False},
     )
     # api_key names an environment variable, never holds the key: the run
@@ -246,8 +249,14 @@ def llm_judge(where, args, *, progress=None):
     api_key = None
     if "api_key" in args and not isinstance(args["api_key"], str):
         raise TrlxError(f"{where}: api_key must name an environment variable")
-    if not isinstance(args["rubric"], str):
-        raise TrlxError(f"{where}: rubric must be text")
+    if not isinstance(args["rubric_file"], str) or not args["rubric_file"].strip():
+        raise TrlxError(f"{where}: rubric_file must name an operator-authored .prompt file")
+    # Config preparation supplies the reviewed contents; direct factory callers must load a file too.
+    if rubric_text is None:
+        try:
+            rubric_text = load_prompt(args["rubric_file"], allowed=None)
+        except DatasetError as error:
+            raise TrlxError(f"{where}: {error}; use llm-judge.prompt.example as authoring guidance") from error
     if args.get("api_key"):
         api_key = os.environ.get(args["api_key"])
         if not api_key:
@@ -256,7 +265,7 @@ def llm_judge(where, args, *, progress=None):
         endpoint = Endpoint(args["url"], args["model"], api_key, args["timeout"], args["retries"])
     except DatasetError as e:
         raise TrlxError(f"{where}: {e}")
-    rubric, concurrency, max_tokens = args["rubric"], args["concurrency"], args.get("max_tokens")
+    rubric, concurrency, max_tokens = rubric_text, args["concurrency"], args.get("max_tokens")
     if not isinstance(concurrency, int) or concurrency < 1:
         raise TrlxError(f"{where}: concurrency must be a positive integer")
 
@@ -314,7 +323,7 @@ def resolve(entries, *, progress=None):
         name, args = entry.spec, entry.args
         # Only the endpoint-backed factory needs the worker's progress reporter.
         if name == "llm_judge":
-            funcs.append(llm_judge(where, args or {}, progress=progress))
+            funcs.append(llm_judge(where, args or {}, progress=progress, rubric_text=entry.rubric_text))
         elif name in BUILTINS:
             funcs.append(BUILTINS[name](where, args or {}))
         elif hasattr(trl.rewards, name):

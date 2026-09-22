@@ -24,6 +24,7 @@ useful feedback; complete diagnostics remain in log.txt for the TUI and inspecti
 """
 
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import shutil
 import sys
 
 from dataset.progress import Progress, stage
+from dataset.io import DatasetError, write_many_text
 from trlx import (
     TrlxError,
     assessment,
@@ -494,7 +496,8 @@ def _train_worker(args):
             eval_set = synthetic_eval.load_saved(run_dir, progress=progress)
         else:
             synthetic_callback = synthetic_eval.callback_class()(
-                train_set, run_dir, no_staging=getattr(args, "no_staging", False), progress=progress,
+                train_set, run_dir, template=cfg.prompts["synthetic_eval_summary"],
+                no_staging=getattr(args, "no_staging", False), progress=progress,
             )
     train_set = _mix_replay(cfg, train_set, progress=progress)
     if rank == 0:
@@ -710,13 +713,27 @@ def _create_run_dir(cfg):
 # Atomic publication preserves a readable resume source if writing fails.
 def _write_snapshot(cfg, run_dir, physical, strategy, *, no_staging=False):
     dest = run_dir / show.CONFIG_FILENAME
-    document = dict(cfg.document)
+    document = copy.deepcopy(cfg.document)
     document["run_name"] = cfg.args.run_name
     document["launch"] = {"method": cfg.method.name, "strategy": strategy, "gpus": list(physical)}
     try:
+        # Fresh workers read only run-owned copies of the exact text reviewed by the supervisor.
+        # Resume keeps those files in place; edits to the operator's originals have no effect.
+        if not cfg.args.resume_from_checkpoint and cfg.prompts:
+            outputs = []
+            document["prompts"] = {}
+            for key, text in cfg.prompts.items():
+                relative = f"prompts/{key.replace('_', '-')}.prompt"
+                outputs.append((run_dir / relative, text))
+                if key.startswith("reward_"):
+                    index = int(key.removeprefix("reward_"))
+                    document["rewards"]["funcs"][index]["args"]["rubric_file"] = relative
+                else:
+                    document["prompts"][key] = relative
+            write_many_text(outputs, no_staging=no_staging)
         run_dirs.write_atomic(dest, toml_write.dumps(document), no_staging=no_staging)
-    except OSError as e:
-        raise TrlxError(f"{dest}: cannot write snapshot: {e.strerror or e}")
+    except (OSError, DatasetError) as e:
+        raise TrlxError(f"{dest}: cannot write snapshot: {e}") from e
     return dest
 
 

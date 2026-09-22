@@ -17,6 +17,7 @@ from transformers import ProcessorMixin
 
 from dataset.io import DatasetError
 from trlx import TrlxError, quality, quality_scorers
+from tests.test_quality_scorers import prompt_templates
 
 
 # No dataset backend or model artifact is needed to exercise the full row iterator.
@@ -31,7 +32,7 @@ class Rows(list):
 def settings(preset="qa", **changes):
     values = dict(quality_preset=preset, quality_dataset="independent-fixture",
                   quality_max_length=1024, quality_max_new_tokens=128,
-                  quality_batch_size=2, judge=None)
+                  quality_batch_size=2, judge=None, prompts=prompt_templates())
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -264,7 +265,7 @@ class InputInspectionTest(unittest.TestCase):
         rows = Rows([{"prompt": "Q", "answer": "A"}] * 20 + [{"prompt": "Q" * 100, "answer": "A"}])
         configured = settings(quality_max_length=150, quality_max_new_tokens=16)
         result = quality.inspect_inputs(configured, Tokenizer(), rows, {"max_position_embeddings": 200})
-        lengths = [len(quality_scorers.generation_prompt("qa", row)) for row in rows]
+        lengths = [len(quality_scorers.generation_prompt("qa", row, configured.prompts)) for row in rows]
         self.assertEqual(result["input_lengths"], [{"row": index, "tokens": [length]}
                                                   for index, length in enumerate(lengths, 1)])
         self.assertEqual(result["over_limit_rows"], [21])
@@ -579,6 +580,14 @@ class SeriesTest(unittest.TestCase):
             self.assertNotEqual(baseline, quality.series_id(configured, "data-one", tokenizer, model))
         model.generation_config.temperature = 0.5
         self.assertNotEqual(baseline, quality.series_id(configured, "data-one", tokenizer, model))
+
+    # Judge text changes invalidate a baseline even though policy encodings are identical.
+    def test_judge_prompt_contents_change_series_identity(self):
+        configured, tokenizer, model = settings("writing"), Tokenizer(), Model()
+        rows = Rows([{"prompt": "Write about trees"}])
+        baseline = quality.series_id(configured, "data", tokenizer, model, dataset=rows)
+        configured.prompts["quality_writing_judge"] = "Use a different rubric."
+        self.assertNotEqual(baseline, quality.series_id(configured, "data", tokenizer, model, dataset=rows))
 
     # A processor-owned template defines comparable inputs even when its tokenizer has no template.
     def test_processor_template_changes_series_identity(self):

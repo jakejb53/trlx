@@ -16,6 +16,7 @@ from dataset import chat, convert, cpt, env, eval_build, fields, heal, pairs, ro
 from dataset.endpoint import Endpoint
 from dataset.io import DatasetError, read_rows, validate_rows_output, write_many_rows, write_rows
 from dataset.progress import Progress, stage
+from dataset.prompts import load as load_prompt
 
 # Shared dataset endpoint defaults are an explicit exception recorded in PLAN.md.
 # Endpoint itself still receives resolved values; trlx callers are unaffected.
@@ -173,8 +174,8 @@ def _cmd_chat(args):
         raise DatasetError(f"{args.input}: input is not valid UTF-8; convert the text to UTF-8")
     data, skipped = chat.build(
         text, args.max_tokens, args.n, q_ep, a_ep,
-        chat.load_prompt(args.questions_prompt, chat.QUESTIONS_PROMPT),
-        chat.load_prompt(args.answers_prompt, chat.ANSWERS_PROMPT),
+        load_prompt(args.questions_prompt, required=("n", "chunk"), allowed=("n", "chunk")),
+        load_prompt(args.answers_prompt, required=("chunk", "question"), allowed=("chunk", "question")),
         args.concurrency, args.strip_reasoning_tags, progress=args.progress,
     )
     for s in skipped:
@@ -194,9 +195,10 @@ def _cmd_eval_build(args):
         if not api_key:
             raise DatasetError(f"--api-key: environment variable {args.api_key} is not set")
     endpoint = Endpoint(args.endpoint, args.model, api_key, args.timeout, args.retries)
+    summary_prompt = load_prompt(args.summary_prompt, allowed=None)
     data = eval_build.build(
         read_rows(args.input, progress=args.progress), endpoint, args.max_tokens,
-        args.concurrency, args.strip_reasoning_tags, progress=args.progress,
+        args.concurrency, args.strip_reasoning_tags, summary_prompt=summary_prompt, progress=args.progress,
     )
     write_rows(args.out, data, [args.input], force=args.force,
                no_staging=args.no_staging, progress=args.progress)
@@ -400,8 +402,11 @@ def build_parser():
                    help="API base URL (e.g. http://localhost:8000/v1); /chat/completions is appended")
     questions.add_argument("--questions-model", required=True, metavar="NAME",
                            help="question model name served by the API")
-    questions.add_argument("--questions-prompt", metavar="FILE",
-                   help="UTF-8 instruction template with {n} and {chunk}; default: built-in question instruction")
+    questions.add_argument("--questions-prompt", metavar="FILE", default="prompts/chat-questions.prompt",
+                   help="UTF-8 .prompt template requiring {n} (question count) and {chunk} (source text); "
+                        "[[...]] includes its text when all enclosed placeholders have values; default: "
+                        "./prompts/chat-questions.prompt relative to the working directory; missing files fail; "
+                        "run trlx init to create defaults or supply a file; no built-in fallback")
     questions.add_argument("--n", type=int, required=True, metavar="QUESTIONS",
                            help="integer requested questions per source chunk; fewer may be returned")
     questions.add_argument("--max-tokens", type=int, required=True, metavar="TOKENS",
@@ -411,8 +416,11 @@ def build_parser():
                    help="answer API base URL; requires --answers-model; default: questions endpoint")
     answers.add_argument("--answers-model", metavar="NAME",
                    help="answer model name; requires --answers-endpoint; default: questions model")
-    answers.add_argument("--answers-prompt", metavar="FILE",
-                   help="UTF-8 template with {chunk} and {question}; default: built-in answer instruction")
+    answers.add_argument("--answers-prompt", metavar="FILE", default="prompts/chat-answers.prompt",
+                   help="UTF-8 .prompt template requiring {chunk} (source text) and {question} (generated question); "
+                        "[[...]] includes its text when all enclosed placeholders have values; "
+                        "default: ./prompts/chat-answers.prompt relative to the working directory; missing files "
+                        "fail; run trlx init to create defaults or supply a file; no built-in fallback")
     requests = p.add_argument_group("requests and credentials (both passes)")
     requests.add_argument("--concurrency", type=int, default=ENDPOINT_CONCURRENCY, metavar="REQUESTS",
                    help=f"maximum simultaneous API requests per pass; integer >= 1; default: {ENDPOINT_CONCURRENCY}")
@@ -429,8 +437,8 @@ def build_parser():
             "Summarize every input text chunk through an OpenAI-compatible endpoint.\n"
             "Each input row must contain nonempty string text. Output contains one\n"
             '{"text": "generated summary"} row per input, in the same order.\n'
-            "Built-in instructions request concise factual prose preserving key facts,\n"
-            "names, numbers, and relationships, without invented facts or Q&A formatting.\n\n"
+            "Instructions come from --summary-prompt, sent as the system message;\n"
+            "each source text is sent separately as the user message.\n\n"
             "No sampling or re-chunking. Inputs and destination are validated before\n"
             "requests. Empty, malformed, or incomplete responses fail with the source\n"
             "row number; generation failures do not publish an incomplete dataset.\n"
@@ -454,6 +462,10 @@ def build_parser():
                    help="API base URL, including /v1 when required; /chat/completions is appended")
     p.add_argument("--model", required=True, metavar="NAME",
                    help="model name served by the endpoint")
+    p.add_argument("--summary-prompt", metavar="FILE", default="prompts/eval-build-summary.prompt",
+                   help="UTF-8 .prompt system instruction, no substitution; default: ./prompts/eval-build-summary.prompt "
+                        "relative to the working directory; missing files fail; run trlx init to create defaults "
+                        "or supply a file; no built-in fallback")
     p.add_argument("--max-tokens", type=int, required=True, metavar="TOKENS",
                    help="positive integer completion-token limit per summary; does not limit source chunk size")
     p.add_argument("--concurrency", type=int, default=ENDPOINT_CONCURRENCY, metavar="REQUESTS",

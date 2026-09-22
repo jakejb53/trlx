@@ -15,8 +15,9 @@ trlx init
 trlx sft --model MODEL --dataset DATA
 ```
 
-If `run.toml` already exists, `trlx init --force` replaces it with fresh defaults
-for this environment, discarding saved edits. Without `--force`, the file is preserved.
+`init` also creates `prompts/` beside its output config. Existing config or generated
+prompt files require `--force`, which resets their contents, including edited prompts.
+Other files, including an operator-authored `llm-judge.prompt`, are preserved.
 For an existing installation, see "Installing updates" below.
 
 Replace `MODEL` with your model directory or model ID, and `DATA` with a dataset file
@@ -77,6 +78,45 @@ python -m pip install --force-reinstall --no-deps .
 This keeps installed runtime dependencies and `run.toml` unchanged. If the dependency
 requirements in `pyproject.toml` changed, run the normal installation command first
 to update them.
+
+## Prompt files
+
+`trlx init` copies these editable UTF-8 files into `prompts/` beside `--out`.
+Training paths in `[prompts]` are relative to the config directory; dataset CLI
+paths are relative to the working directory. Absolute paths are accepted.
+
+| File | Training config key / dataset option | Required placeholders |
+| --- | --- | --- |
+| `chat-questions.prompt` | `--questions-prompt` | `{chunk}`, `{n}` |
+| `chat-answers.prompt` | `--answers-prompt` | `{chunk}`, `{question}` |
+| `eval-build-summary.prompt` | `--summary-prompt` | None |
+| `synthetic-eval-summary.prompt` | `synthetic_eval_summary` | `{text}` |
+| `quality-qa.prompt` | `quality_qa` | None |
+| `quality-classification.prompt` | `quality_classification` | `{labels}` |
+| `quality-multiple-choice.prompt` | `quality_multiple_choice` | `{choices}` |
+| `quality-json.prompt` | `quality_json` | `{required_fields}` |
+| `quality-instruction-following-judge.prompt` | `quality_instruction_following_judge` | None |
+| `quality-writing-judge.prompt` | `quality_writing_judge` | None |
+
+For example, `[prompts]` contains
+`quality_qa = "prompts/quality-qa.prompt"`. Only enabled features require their
+files. Missing, unreadable, empty, invalid UTF-8, or invalid templates fail before
+requests or model loading. Installed templates are used only by `init`; runtime
+never falls back to them. The additional `llm-judge.prompt.example` is guidance,
+not an active prompt.
+
+Substitution is one pass: inserted source text is never interpreted as a template.
+`{labels}` is a JSON list; `{choices}` is one `label: text` line per choice.
+The JSON preset uses `[[ The JSON object must contain these top-level keys: {required_fields}.]]`:
+the optional block is omitted when the row has no required fields, otherwise the
+placeholder receives their JSON list. Keep each template's required placeholders.
+
+For an existing configuration, create a fresh scratch directory and run
+`trlx init --out SCRATCH/run.toml`, where `SCRATCH` already exists and contains
+neither that config nor generated prompt files. Copy the needed prompt files and
+`[prompts]` entries into your existing setup; author a separate judge rubric if
+using `llm_judge`. Existing runs need their required prompt files and saved paths
+before they can resume.
 
 ## Training cheat sheet
 
@@ -140,7 +180,7 @@ themselves and leaves their targets alone; healing follows symlinks to repair th
 
 | Command                  | Replacement authorized by --force                         |
 | ------------------------ | --------------------------------------------------------- |
-| trlx init                | Existing config path, replaced with fresh defaults        |
+| trlx init                | Config and named generated prompt files, reset to defaults |
 | trlx merge               | Entire output path, including base/adapter input paths    |
 | trlx replay-build        | Existing output dataset, including an input path          |
 | trlx verify              | Existing verify.json report                               |
@@ -213,7 +253,8 @@ trlx sft --model MODEL --dataset DATA --quality-checks \
 ```
 
 `HELDOUT` is a supported dataset file or Hub reference with the columns below. `prompt` accepts text
-or text messages; generative presets also accept `messages` instead. No custom scorer or rubric is needed.
+or text messages; generative presets also accept `messages` instead. No custom scorer is needed;
+generation and judge presets use the editable prompt files created by `init`.
 
 | Preset | Evaluation rows | Reported evidence |
 | --- | --- | --- |
@@ -223,7 +264,7 @@ or text messages; generative presets also accept `messages` instead. No custom s
 | `multiple_choice` | `prompt`, `choices` mapping labels to text, correct `answer` label | Accuracy, per-class results, invalid/ambiguous answers |
 | `json` | `prompt`; optional `required_fields` list and `reference` object | JSON validity, required fields, supplied reference-value correctness |
 | `preference` | `chosen`, `rejected`; optional `prompt` | Reward-model ranking accuracy, ties, and margins; reward trainer only |
-| `instruction_following`, `writing` | `prompt` | Built-in rubric ratings and rationale from a configured judge |
+| `instruction_following`, `writing` | `prompt` | File-defined rubric ratings and rationale from a configured judge |
 
 QA normalization uses Unicode normalization, case folding, punctuation boundaries, and whitespace.
 Classification requires a complete permitted label; multiple choice also permits label-only forms such
@@ -316,9 +357,9 @@ Training saves its resolved settings with the run and never rewrites `run.toml`.
 trlx sft --model MODEL --dataset DATA \
   --learning-rate 5e-5 --num-train-epochs 3 --output-dir runs/three-epochs
 
-# Use another persistent config.
-trlx init --out experiment.toml
-trlx sft --config experiment.toml --model MODEL --dataset DATA
+# Use another persistent config; NEW_DIR must be an existing empty directory.
+trlx init --out NEW_DIR/experiment.toml
+trlx sft --config NEW_DIR/experiment.toml --model MODEL --dataset DATA
 
 # Booleans have positive/negative forms; lists and tables use shell-quoted TOML.
 trlx sft --model MODEL --dataset DATA --no-verify
@@ -468,6 +509,9 @@ Resume loads the run's saved `config.toml`, not today's `run.toml`; model and da
 arguments need not be repeated. Explicit CLI overrides still apply. Only the current
 snapshot schema is supported. Training settings must match; GPU selection and display
 controls may change, but switching between sharded and unsharded training is rejected.
+Active prompts are copied into the run's `prompts/` directory and referenced by its
+saved config. Workers and resume use those copies. Missing required copies fail before
+resume cleanup; changes to quality prompt contents invalidate baseline reuse.
 
 Resume continues in the original directory. After validation it automatically removes
 metrics and checkpoints beyond the selected saved step and clears stale preflight/verify
@@ -514,7 +558,12 @@ trlx grpo --model MODEL --dataset DATA \
 | phrases         | required and/or forbidden: lists of phrases                                     |
 | json_valid      | Optional keys: list of required JSON keys                                       |
 | length_window   | unit: words / tokens, low, high; tokens also needs tokenizer                    |
-| llm_judge       | url, model, rubric, timeout, retries, concurrency; optional api_key, max_tokens |
+| llm_judge       | url, model, rubric_file, timeout, retries, concurrency; optional api_key, max_tokens |
+
+`llm_judge` requires your own `.prompt` file. `prompts/llm-judge.prompt.example`
+contains authoring guidance and example rubrics; it is never loaded automatically.
+Set `rubric_file` to your authored file, relative to the config directory (absolute
+paths also work). The former inline `rubric` argument is rejected.
 
 Rewards may also name a `trl.rewards` function, reward model, or
 `module:function` / `path.py:function`. `--reward-weights '[1.0,0.5]'` weights two entries
@@ -563,8 +612,9 @@ dataset chat source.txt --out chat.jsonl \
 This generates questions from chunks, then answers each question using its source.
 Here `--max-tokens` limits input chunks; the server controls answer length. Provide
 both `--answers-endpoint` and `--answers-model` to use a different answer model.
-`--questions-prompt FILE` templates use `{chunk}` and `{n}`; `--answers-prompt FILE`
-templates use `{chunk}` and `{question}`.
+`--questions-prompt FILE` defaults to `./prompts/chat-questions.prompt` and requires
+`{chunk}` and `{n}`; `--answers-prompt FILE` defaults to `./prompts/chat-answers.prompt`
+and requires `{chunk}` and `{question}`. Paths are relative to the working directory.
 
 Output contains `messages` and separate `reasoning`. Configure the server's reasoning
 parser; inline reasoning is rejected unless `--strip-reasoning-tags` removes a complete
@@ -586,6 +636,8 @@ For best results, generate summaries using the same model you'll use this data s
 Each input row must contain nonempty string `text`; output contains one factual prose
 summary in `text` per input row, in the same order. JSONL, JSON, CSV, and Parquet are
 supported. `--max-tokens` is a positive completion-token limit, not a source chunk limit.
+`--summary-prompt FILE` defaults to `./prompts/eval-build-summary.prompt`; its contents
+are the system message, with each source row supplied separately as the user message.
 Train on all original chunks; generate summaries once and reuse them for the step-zero
 baseline and subsequent ordinary evaluations through `--dataset-eval`.
 

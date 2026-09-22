@@ -179,7 +179,9 @@ def add_training_options(parser, method_name):
                         "use --max-length as the generation limit. Train on all source rows, skip startup "
                         "eval inspection, and save synthetic-eval.jsonl in this run for evaluation and resume. "
                         "Replaces configured eval sources; conflicts with explicit --split, --eval-fraction, "
-                        "or --dataset-eval. Default: disabled. check validates without generating."))
+                        "or --dataset-eval. Default: disabled. check validates without generating. "
+                        "Requires [prompts].synthetic_eval_summary relative to the config directory; "
+                        "init writes prompts/synthetic-eval-summary.prompt with required {text}. No fallback."))
     if "teacher" in method.blocks:
         wrapper += [
             ("--teacher", "teacher.path", str, "Teacher model directory or ID; required for distillation."),
@@ -236,6 +238,8 @@ def add_training_options(parser, method_name):
             "--reward", action="append", metavar="NAME_OR_TABLE",
             help="Required unless configured. Repeat for multiple rewards; replaces the configured list. "
                  "Use a name, model ID, module:function, or a TOML factory table. "
+                 "llm_judge requires args.rubric_file: an authored .prompt path relative to the config directory; "
+                 "inline rubric is removed. init creates only llm-judge.prompt.example guidance. "
                  "Example: --reward '{name=\"reference_match\",args={column=\"answer\",mode=\"equals\"}}'. "
                  "A running TRL-compatible vLLM weight-transfer server is also required; set --vllm-server-base-url.",
         )
@@ -251,7 +255,11 @@ def add_training_options(parser, method_name):
         ("--quality-checks", "quality_checks", bool,
          "Run built-in quality checks at baseline, evaluation points, and completion, even with evaluation disabled; advisory only."),
         ("--quality-preset", "quality_preset", str | None,
-         "Built-in preset: language_modeling, qa, classification, multiple_choice, json, preference, instruction_following, or writing."),
+         "Built-in preset: language_modeling, qa, classification, multiple_choice, json, preference, instruction_following, or writing. "
+         "Generative presets require their [prompts].quality_PRESET file (judging presets append _judge), "
+         "relative to the config directory. init writes prompts/quality-PRESET.prompt (underscores become hyphens; "
+         "judges append -judge). No fallback. Classification requires {labels}, multiple choice {choices}, JSON "
+         "{required_fields}; JSON [[...]] prose is omitted when required_fields is absent. Other quality prompts use no placeholders."),
         ("--quality-dataset", "quality_dataset", str | None, "Separate evaluation dataset; required when quality checks are enabled."),
         ("--quality-max-length", "quality_max_length", int, "Quality input/window token limit; at least 2. LM windows overlap by one token; generation prompts are not silently truncated."),
         ("--quality-max-new-tokens", "quality_max_new_tokens", int, "Positive generation token budget per quality example."),

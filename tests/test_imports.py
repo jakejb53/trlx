@@ -1,7 +1,7 @@
 """Enforces the PLAN.md import rule by scanning source, not by importing.
 
 dataset/ imports nothing from trl or trlx. trlx/ may import from dataset only
-dataset.io, dataset.endpoint, dataset.env and dataset.progress.
+dataset.io, dataset.endpoint, dataset.env, dataset.progress and dataset.prompts.
 """
 
 import ast
@@ -11,7 +11,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Modules trlx/ is permitted to import from the dataset package.
-ALLOWED_DATASET_IMPORTS = {"dataset.io", "dataset.endpoint", "dataset.env", "dataset.progress"}
+ALLOWED_DATASET_IMPORTS = {"dataset.io", "dataset.endpoint", "dataset.env", "dataset.progress", "dataset.prompts"}
 
 
 # Yields (file, module) for every import statement under a package directory.

@@ -36,6 +36,7 @@ class EvaluationSummaryLogging(unittest.TestCase):
         # Keep real endpoint scheduling while forcing a deterministic completion order.
         def complete(messages, max_tokens=None, **kwargs):
             self.assertEqual(max_tokens, 128)
+            self.assertEqual(messages[0], {"role": "system", "content": "Summarize accurately."})
             self.assertTrue(kwargs["require_stop"])
             if messages[-1]["content"] == sources[0]["text"]:
                 first_started.set()
@@ -48,7 +49,8 @@ class EvaluationSummaryLogging(unittest.TestCase):
 
         progress = Progress("dataset eval-build", emit=emit, clock=lambda: 0.0)
         with patch.object(self.endpoint, "complete_full", side_effect=complete):
-            output = eval_build.build(sources, self.endpoint, 128, 2, progress=progress)
+            output = eval_build.build(sources, self.endpoint, 128, 2,
+                                      summary_prompt="Summarize accurately.", progress=progress)
         self.assertIsNone(progress.error)
         self.assertEqual(output, [{"text": "First summary."}, {"text": "Second summary."}])
         pairs = [line for line in lines if "Summaries generated:" in line]
@@ -74,7 +76,8 @@ class EvaluationSummaryLogging(unittest.TestCase):
                 progress = Progress("dataset eval-build", emit=lines.append)
                 with patch.object(self.endpoint, "complete_full", return_value=Reply(content, "")):
                     with self.assertRaisesRegex(DatasetError, "source row 1"):
-                        eval_build.build([{"text": "Source"}], self.endpoint, 128, 1, strip, progress=progress)
+                        eval_build.build([{"text": "Source"}], self.endpoint, 128, 1, strip,
+                                         summary_prompt="Summarize accurately.", progress=progress)
                 self.assertFalse(any("Summaries generated:" in line for line in lines))
                 self.assertTrue(any("stopping batch:" in line for line in lines))
 
@@ -84,6 +87,7 @@ class EvaluationSummaryLogging(unittest.TestCase):
         with patch.object(self.endpoint, "complete_full",
                           return_value=Reply("<think>hidden thoughts</think>  Clean summary.  ", "separate thoughts")):
             output = eval_build.build([{"text": "Full source"}], self.endpoint, 128, 1, True,
+                                      summary_prompt="Summarize accurately.",
                                       progress=Progress("dataset eval-build", emit=lines.append))
         self.assertEqual(output, [{"text": "Clean summary."}])
         pair = next(line for line in lines if "Summaries generated:" in line)
@@ -94,5 +98,6 @@ class EvaluationSummaryLogging(unittest.TestCase):
     def test_invalid_source_prevents_all_requests(self):
         with patch.object(self.endpoint, "complete_full") as complete:
             with self.assertRaisesRegex(DatasetError, "source row 2"):
-                eval_build.build([{"text": "Valid"}, {"text": ""}], self.endpoint, 128, 2)
+                eval_build.build([{"text": "Valid"}, {"text": ""}], self.endpoint, 128, 2,
+                                 summary_prompt="Summarize accurately.")
         complete.assert_not_called()

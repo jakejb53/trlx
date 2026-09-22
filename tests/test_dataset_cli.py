@@ -127,6 +127,27 @@ class DatasetOutputs(unittest.TestCase):
             status = cli.main([str(value) for value in argv])
         return status, stderr.getvalue()
 
+    # A missing prompt must fail before either endpoint work or output publication.
+    def test_generation_requires_prompt_files_before_requests(self):
+        missing = self.root / "missing.prompt"
+        cases = [
+            ["chat", self.source, "--questions-endpoint", "http://localhost/v1",
+             "--questions-model", "model", "--n", "1", "--max-tokens", "32",
+             "--questions-prompt", missing],
+            ["eval-build", self.source, "--endpoint", "http://localhost/v1", "--model", "model",
+             "--max-tokens", "32", "--summary-prompt", missing],
+        ]
+        for argv in cases:
+            with self.subTest(command=argv[0]):
+                output = self.root / f"{argv[0]}.jsonl"
+                with patch("dataset.endpoint.urllib.request.urlopen") as request:
+                    status, error = self.run_cli([*argv, "--out", output])
+                self.assertEqual(status, 1)
+                self.assertIn(str(missing), error)
+                self.assertIn("trlx init", error)
+                request.assert_not_called()
+                self.assertFalse(output.exists())
+
     # Existing inputs are ordinary replaceable destinations once force is explicit.
     def test_in_place_requires_force_and_preserves_all_rows(self):
         original = self.source.read_bytes()
@@ -222,6 +243,12 @@ class DatasetOutputs(unittest.TestCase):
         text.write_text("A short source paragraph.", encoding="utf-8")
         broken = self.root / "repair.jsonl"
         broken.write_text("{'text': 'repairable'}\n", encoding="utf-8")
+        question_prompt = self.root / "questions.prompt"
+        question_prompt.write_text("Generate {n} questions from {chunk}", encoding="utf-8")
+        answer_prompt = self.root / "answers.prompt"
+        answer_prompt.write_text("Use {chunk} to answer {question}", encoding="utf-8")
+        summary_prompt = self.root / "summary.prompt"
+        summary_prompt.write_text("Summarize accurately.", encoding="utf-8")
         cases = {
             "convert": ([messages, "--to", "prompt-completion"], "converting messages"),
             "shuffle": ([self.source, "--seed", "3"], "shuffling rows"),
@@ -235,9 +262,11 @@ class DatasetOutputs(unittest.TestCase):
             "heal": ([broken], "repairing JSONL lines"),
             "chat": ([text, "--questions-endpoint", "https://example.invalid/v1",
                       "--questions-model", "model", "--n", "1", "--max-tokens", "32",
+                      "--questions-prompt", question_prompt, "--answers-prompt", answer_prompt,
                       "--concurrency", "1", "--timeout", "1", "--retries", "0"], "questions from model"),
             "eval-build": ([self.source, "--endpoint", "https://example.invalid/v1",
                             "--model", "model", "--max-tokens", "32", "--concurrency", "2",
+                            "--summary-prompt", summary_prompt,
                             "--timeout", "1", "--retries", "0"], "source row summaries from model"),
             "stats": ([self.source], "counting tokens in text"),
         }

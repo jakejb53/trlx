@@ -1,6 +1,7 @@
 """Built-in quality criteria on fixed answers, without models or external judges."""
 
 import json
+from pathlib import Path
 import unittest
 
 from trlx import TrlxError
@@ -8,6 +9,13 @@ from trlx.quality_scorers import (
     JUDGE_CRITERIA, PRESETS, generation_diagnostics, generation_prompt, judge_messages,
     parse_judge_reply, score_generation, validate_row,
 )
+
+
+# Tests explicitly select shipped templates; runtime callers must supply loaded files.
+def prompt_templates():
+    folder = Path(__file__).resolve().parents[1] / "trlx" / "prompt_defaults"
+    return {path.stem.replace("-", "_"): path.read_text(encoding="utf-8").rstrip("\n")
+            for path in folder.glob("quality-*.prompt")}
 
 
 class ValidationTest(unittest.TestCase):
@@ -115,10 +123,10 @@ class GenerationInputTest(unittest.TestCase):
         ]
         for preset, row, changed, expected in cases:
             with self.subTest(preset=preset):
-                prompt = generation_prompt(preset, row)
+                prompt = generation_prompt(preset, row, prompt_templates())
                 self.assertTrue(prompt.startswith("Q\n\n"))
                 self.assertIn(expected, prompt)
-                self.assertEqual(prompt, generation_prompt(preset, {**row, **changed}))
+                self.assertEqual(prompt, generation_prompt(preset, {**row, **changed}, prompt_templates()))
                 self.assertNotIn("secret", prompt)
 
     # Chat formatting and extra metadata are preserved without mutating the dataset row.
@@ -127,7 +135,7 @@ class GenerationInputTest(unittest.TestCase):
                             {"role": "user", "content": "My exact question", "metadata": {"id": 2}}],
                "answer": "secret"}
         original = json.dumps(row)
-        prompt = generation_prompt("qa", row)
+        prompt = generation_prompt("qa", row, prompt_templates())
         self.assertEqual(len(prompt), 2)
         self.assertEqual(prompt[0], row["messages"][0])
         self.assertTrue(prompt[-1]["content"].startswith("My exact question\n\n"))
@@ -138,7 +146,7 @@ class GenerationInputTest(unittest.TestCase):
     def test_chat_constraints_after_assistant_message(self):
         messages = [{"role": "user", "content": "Question"},
                     {"role": "assistant", "content": "Prior answer"}]
-        prompt = generation_prompt("qa", {"prompt": messages, "answer": "secret"})
+        prompt = generation_prompt("qa", {"prompt": messages, "answer": "secret"}, prompt_templates())
         self.assertEqual(prompt[:2], messages)
         self.assertEqual(prompt[-1]["role"], "user")
         self.assertEqual(len(messages), 2)
@@ -147,11 +155,33 @@ class GenerationInputTest(unittest.TestCase):
     def test_judged_prompts_remain_unchanged(self):
         for preset in ("writing", "instruction_following"):
             with self.subTest(preset=preset):
-                self.assertEqual(generation_prompt(preset, {"prompt": "Write freely."}), "Write freely.")
+                self.assertEqual(generation_prompt(preset, {"prompt": "Write freely."}, {}), "Write freely.")
                 messages = [{"role": "user", "content": "Write freely."}]
-                result = generation_prompt(preset, {"messages": messages})
+                result = generation_prompt(preset, {"messages": messages}, {})
                 self.assertEqual(result, messages)
                 self.assertIsNot(result, messages)
+
+
+    # Supplied text is authoritative for policy constraints and the judge's system turn.
+    def test_operator_templates_control_requests(self):
+        self.assertEqual(generation_prompt("qa", {"prompt": "Q", "answer": "A"},
+                                           {"quality_qa": "Use three words."}),
+                         "Q\n\nUse three words.")
+        messages = judge_messages("writing", {"prompt": "Q"}, "A",
+                                  {"quality_writing_judge": "My specific rubric."})
+        self.assertEqual(messages[0], {"role": "system", "content": "My specific rubric."})
+
+    # Removing required fields must remove the entire optional instruction, not leave empty prose.
+    def test_json_optional_instruction(self):
+        self.assertEqual(generation_prompt("json", {"prompt": "Q"}, prompt_templates()),
+                         "Q\n\nReturn only valid JSON, without Markdown fences or surrounding text.")
+
+    # Row content containing template tokens is inert, including inside optional template blocks.
+    def test_substitution_does_not_expand_row_content(self):
+        row = {"prompt": "Q", "labels": ["{labels}", "[[data]]"], "label": "{labels}"}
+        self.assertEqual(generation_prompt("classification", row,
+                                           {"quality_classification": "Labels: {labels}"}),
+                         'Q\n\nLabels: ["{labels}", "[[data]]"]')
 
 
 class QATest(unittest.TestCase):
@@ -303,7 +333,7 @@ class JudgeTest(unittest.TestCase):
                             {"role": "user", "content": "Write a poem"}]}
         for preset in ("writing", "instruction_following"):
             with self.subTest(preset=preset):
-                messages = judge_messages(preset, row, injection)
+                messages = judge_messages(preset, row, injection, prompt_templates())
                 self.assertEqual([message["role"] for message in messages], ["system", "user"])
                 self.assertNotIn(injection, messages[0]["content"])
                 payload = json.loads(messages[1]["content"])
@@ -318,8 +348,8 @@ class JudgeTest(unittest.TestCase):
     # Built-in writing and instruction rubrics differ without requiring operator-authored text.
     def test_preset_rubrics_are_task_specific(self):
         row = {"prompt": "Write about trees"}
-        writing = judge_messages("writing", row, "Trees.")[0]["content"]
-        instruction = judge_messages("instruction_following", row, "Trees.")[0]["content"]
+        writing = judge_messages("writing", row, "Trees.", prompt_templates())[0]["content"]
+        instruction = judge_messages("instruction_following", row, "Trees.", prompt_templates())[0]["content"]
         self.assertIn("genre, audience, tone", writing)
         self.assertIn("correctness, relevance, and completeness", instruction)
         self.assertNotEqual(writing, instruction)

@@ -6,8 +6,10 @@ distinguishes those measured capabilities from conservative starting settings.
 """
 
 import dataclasses
+import importlib.resources
+from pathlib import Path
 
-from dataset.io import DatasetError, validate_output, write_text
+from dataset.io import DatasetError, validate_output, validate_text_outputs, write_many_text
 from dataset.progress import stage
 from trlx import TrlxError, config, hardware, trainers
 from trlx.hardware import Hardware
@@ -41,6 +43,15 @@ ASSESSMENT_DEFAULTS = {
     "quality_max_new_tokens": 256,
     "quality_batch_size": 1,
 }
+
+TRAINING_PROMPTS = (
+    "synthetic-eval-summary", "quality-qa", "quality-classification",
+    "quality-multiple-choice", "quality-json", "quality-instruction-following-judge",
+    "quality-writing-judge",
+)
+PROMPT_FILES = tuple(name + ".prompt" for name in (
+    "chat-questions", "chat-answers", "eval-build-summary", *TRAINING_PROMPTS,
+)) + ("llm-judge.prompt.example",)
 
 # These are visible starting values, not a claim that a particular model fits.
 # Native BF16 is a hardware fact; batch sizes require later model/data tuning.
@@ -99,6 +110,13 @@ def render(system: Hardware) -> str:
         w.key(key, value)
     w.comment("Quality checks require a built-in preset and separate evaluation data. "
               "They run at baseline, scheduled evaluations, and completion, even with evaluation disabled.")
+    w.blank()
+
+    w.comment("Prompt paths are relative to this config file. Enabled features require their files; "
+              "edit prompts to change instructions. llm_judge requires an operator-authored rubric_file.")
+    w.table("prompts")
+    for name in TRAINING_PROMPTS:
+        w.key(name.replace("-", "_"), "prompts/" + name + ".prompt")
     w.blank()
 
     w.comment("Supply the base model with --model, or persist its local path / Hub id here.")
@@ -190,11 +208,20 @@ def _default(field):
 # failed inspection cannot damage them, including with direct publication.
 def write(out="run.toml", force=False, no_staging=False, *, progress=None) -> Hardware:
     try:
-        validate_output(out, force=force)
+        path = Path(out)
+        destinations = [path, *(path.parent / "prompts" / name for name in PROMPT_FILES)]
+        # Check every named output before probing hardware or reading packaged templates.
+        validate_output(path, force=force)
+        validate_text_outputs([(destination, "") for destination in destinations], force=force)
         system = hardware.inspect(progress=progress)
         with stage(progress, "preparing environment defaults"):
-            text = render(system)
-        write_text(out, text, force=force, no_staging=no_staging, progress=progress)
+            defaults = importlib.resources.files("trlx").joinpath("prompt_defaults")
+            outputs = [(path, render(system))]
+            for destination, name in zip(destinations[1:], PROMPT_FILES):
+                outputs.append((destination, defaults.joinpath(name).read_text(encoding="utf-8")))
+        write_many_text(outputs, force=force, no_staging=no_staging, progress=progress)
     except DatasetError as exc:
         raise TrlxError(str(exc)) from exc
+    except (OSError, UnicodeError) as exc:
+        raise TrlxError(f"cannot read packaged prompt defaults: {exc}; reinstall trlx") from exc
     return system

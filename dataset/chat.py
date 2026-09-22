@@ -16,46 +16,13 @@ import re
 from dataset.cpt import chunk_text
 from dataset.io import DatasetError
 from dataset.progress import stage
-
-# Built-in instructions. A --*-prompt file replaces the whole text. The
-# placeholders below are substituted in one pass over the template only, so
-# neither other braces in the template nor placeholder-like text inside a
-# chunk or question is ever rewritten.
-QUESTIONS_PROMPT = (
-    "Write {n} questions that can be answered from the text below. "
-    "Output one question per line and nothing else.\n\n{chunk}"
-)
-ANSWERS_PROMPT = (
-    "Answer the question using only the text below.\n\n"
-    "Text:\n{chunk}\n\nQuestion: {question}"
-)
+from dataset.prompts import fill
 
 # Leading list markers a model tends to add: "1.", "1)", "-", "*".
 _LIST_MARKER = re.compile(r"^\s*(\d+[.)]|[-*])\s*")
-_PLACEHOLDER = re.compile(r"\{(n|chunk|question)\}")
 # Any XML-style tag opening a reply, matched by shape rather than by name so
 # no model's reasoning convention is written into this source (SPEC line 7).
 _INLINE_TAG = re.compile(r"^\s*<([A-Za-z][\w-]*)>")
-
-
-# Reads a replacement prompt file, or returns the built-in.
-def load_prompt(path, builtin):
-    if path is None:
-        return builtin
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    except OSError as e:
-        raise DatasetError(f"{path}: cannot read prompt: {e.strerror or e}; check the path and permissions")
-    except UnicodeError:
-        raise DatasetError(f"{path}: prompt is not valid UTF-8; save the prompt as UTF-8")
-
-
-# Single-pass placeholder substitution. Unknown {names} are left as written.
-def _fill(template, **values):
-    return _PLACEHOLDER.sub(
-        lambda m: str(values[m.group(1)]) if m.group(1) in values else m.group(0), template
-    )
 
 
 # Reasoning belongs in the endpoint's reasoning field, not in the content: a
@@ -108,7 +75,7 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
         raise DatasetError("input text is empty")
     skipped = []
 
-    requests = [[{"role": "user", "content": _fill(questions_prompt, n=n, chunk=c)}] for c in chunks]
+    requests = [[{"role": "user", "content": fill(questions_prompt, n=n, chunk=c)}] for c in chunks]
     replies = questions_endpoint.complete_many_full(requests, concurrency, progress=progress, label="questions")
     pairs = []  # (chunk index, question)
     for i, reply in enumerate(replies):
@@ -120,7 +87,7 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
         pairs.extend((i, q) for q in questions)
 
     requests = [
-        [{"role": "user", "content": _fill(answers_prompt, chunk=chunks[i], question=q)}]
+        [{"role": "user", "content": fill(answers_prompt, chunk=chunks[i], question=q)}]
         for i, q in pairs
     ]
     replies = answers_endpoint.complete_many_full(requests, concurrency, progress=progress, label="answers")

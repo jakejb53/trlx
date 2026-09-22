@@ -418,8 +418,8 @@ def write_rows(path, rows, inputs=(), *, force=False, no_staging=False, progress
 
 # Distinct output entries are required even with force: two results cannot occupy one path.
 # Final symlinks are separate entries; regular hard links are treated as conflicting outputs.
-def _validate_outputs(outputs, force):
-    targets = [validate_rows_output(path, force) for path, _ in outputs]
+def _validate_outputs(outputs, force, validator=validate_rows_output):
+    targets = [validator(path, force) for path, _ in outputs]
     for i, target in enumerate(targets):
         for other in targets[:i]:
             same_file = (target.is_file() and other.is_file() and not target.is_symlink()
@@ -432,33 +432,76 @@ def _validate_outputs(outputs, force):
 # Split prepares every serialization before publishing any result. Publication itself is
 # sequential, so a second-output failure must identify results already changed.
 def write_many_rows(outputs, inputs=(), *, force=False, no_staging=False, progress=None):
-    with stage(progress, "writing split outputs", total=None, unit="files") as activity:
+    outputs = list(outputs)
+    try:
+        _validate_outputs(outputs, force)
+    except OSError as error:
+        raise DatasetError(f"cannot inspect outputs: {error}; no destination completed") from error
+    writers = [(path, _rows_writer(path, rows, progress=progress)) for path, rows in outputs]
+    _write_many(writers, force=force, no_staging=no_staging, progress=progress)
+
+
+# Config and prompt initialization share split's prepare-all publication policy.
+def write_many_text(outputs, *, force=False, no_staging=False, progress=None):
+    outputs = list(outputs)
+    targets = validate_text_outputs(outputs, force)
+    for target in targets:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise DatasetError(f"{target}: cannot create output parent: {error}") from error
+    writers = []
+    for path, text in outputs:
+        # Bind each payload before publication; no input is reread after replacement starts.
+        def write(prepared, text=text):
+            prepared.write_text(text, encoding="utf-8")
+
+        writers.append((path, write))
+    _write_many(writers, force=force, no_staging=no_staging, progress=progress)
+
+
+# Initialization may create prompt parents, but no output can contain another output.
+def validate_text_outputs(outputs, force=False):
+    # directory=True allows a missing parent; it does not publish a directory payload.
+    def validate(path, force):
+        target = validate_output(path, force, directory=True)
+        for parent in target.parents:
+            if parent.exists() and not parent.is_dir():
+                raise DatasetError(f"{path}: output parent {parent} is not a directory")
+        return target
+
+    return _validate_outputs(list(outputs), force, validate)
+
+
+# All payloads are staged first; sequential publication reports partial completion.
+def _write_many(outputs, *, force=False, no_staging=False, progress=None):
+    with stage(progress, "writing outputs", total=None, unit="files") as activity:
         outputs = list(outputs)
         prepared = []
         changed = []
         try:
-            targets = _validate_outputs(outputs, force)
+            targets = _validate_outputs(outputs, force, validate_output)
             if not no_staging:
-                for target, (path, rows) in zip(targets, outputs):
+                for target, (path, writer) in zip(targets, outputs):
                     with stage(activity, f"preparing output {path}"):
-                        prepared.append(_prepare_output(target, _rows_writer(path, rows, progress=activity), False))
-            for i, (target, (path, rows)) in enumerate(zip(targets, outputs)):
+                        prepared.append(_prepare_output(target, writer, False))
+            for i, (target, (path, writer)) in enumerate(zip(targets, outputs)):
                 if no_staging:
-                    publish_output(target, _rows_writer(path, rows, progress=activity),
+                    publish_output(target, writer,
                                    force=force, no_staging=True, progress=activity)
                 else:
                     with stage(activity, f"publishing {path}"):
                         _publish_prepared(target, prepared[i], force, False)
                 changed.append(str(path))
-        except (OSError, DatasetError) as e:
+        except (OSError, UnicodeError, DatasetError) as e:
             status = "completed destinations: " + ", ".join(changed) if changed else "no destination completed"
-            raise DatasetError(f"cannot write split outputs: {e}; {status}. Check the named destinations before retrying") from e
+            raise DatasetError(f"cannot write outputs: {e}; {status}. Check the named destinations before retrying") from e
         finally:
             failure = sys.exception()
             cleanup_errors = []
             for folder in prepared:
                 try:
-                    with stage(activity, "cleaning split output staging"):
+                    with stage(activity, "cleaning output staging"):
                         _clean_stage(folder)
                 except OSError as e:
                     cleanup_errors.append(f"{folder}: {e}")

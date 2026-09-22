@@ -1,0 +1,1 @@
+Return only valid JSON, without Markdown fences or surrounding text.[[ The JSON object must contain these top-level keys: {required_fields}.]]

@@ -109,6 +109,7 @@ class LengthWindowTest(unittest.TestCase):
 class _Judge(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.requests.append(body)
         user = body["messages"][1]["content"]
         text = "no score here" if "silent" in user else f"Score: {len(user)}"
         reply = {"choices": [{"message": {"content": text}}]}
@@ -125,7 +126,12 @@ class _Judge(http.server.BaseHTTPRequestHandler):
 
 class LlmJudgeTest(unittest.TestCase):
     def setUp(self):
+        scratch = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parent)
+        self.addCleanup(scratch.cleanup)
+        self.rubric = pathlib.Path(scratch.name) / "judge.prompt"
+        self.rubric.write_text("Return a numeric factual-accuracy score.", encoding="utf-8")
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Judge)
+        self.server.requests = []
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -134,13 +140,29 @@ class LlmJudgeTest(unittest.TestCase):
         port = self.server.server_address[1]
         fn = rewards.llm_judge(
             WHERE,
-            {"url": f"http://127.0.0.1:{port}/v1", "model": "m", "rubric": "r", "timeout": 5, "retries": 0, "concurrency": 2},
+            {"url": f"http://127.0.0.1:{port}/v1", "model": "m", "rubric_file": str(self.rubric),
+             "timeout": 5, "retries": 0, "concurrency": 2},
         )
         with self.assertLogs("trlx.rewards", level="WARNING") as logs:
             scores = fn(["hello", "silent"], prompts=["p", "p"])
         self.assertEqual(scores[0], float(len("Prompt:\np\n\nResponse:\nhello")))
         self.assertEqual(scores[1], 0.0)
         self.assertIn("no number", logs.output[0])
+        self.assertEqual(len(self.server.requests), 2)
+        for request in self.server.requests:
+            self.assertEqual(request["messages"][0],
+                             {"role": "system", "content": "Return a numeric factual-accuracy score."})
+
+    # Legacy inline rubrics and absent files fail when constructing the reward.
+    def test_rubric_errors_precede_requests(self):
+        args = {"url": "http://127.0.0.1/v1", "model": "m", "timeout": 5,
+                "retries": 0, "concurrency": 1}
+        for rubric, error in (({"rubric": "score"}, "rubric was removed"),
+                              ({"rubric_file": str(self.rubric.parent / "missing.prompt")}, "missing.prompt")):
+            with self.subTest(rubric=rubric), patch("dataset.endpoint.urllib.request.urlopen") as request:
+                with self.assertRaisesRegex(TrlxError, error):
+                    rewards.llm_judge(WHERE, {**args, **rubric})
+                request.assert_not_called()
 
 
 class ResolveTest(unittest.TestCase):
@@ -183,11 +205,12 @@ class JudgeProgressTest(unittest.TestCase):
                 lines = []
                 trainer_cls = Mock()
                 entry = RewardEntry("llm_judge", {
-                    "url": "https://judge.invalid/v1", "model": "judge", "rubric": "score",
+                    "url": "https://judge.invalid/v1", "model": "judge", "rubric_file": "judge.prompt",
                     "timeout": 5, "retries": 1, "concurrency": 1, "max_tokens": 16,
-                })
+                }, rubric_text="score")
                 cfg = types.SimpleNamespace(
-                    args=types.SimpleNamespace(), teacher=None, rewards=[entry], replay=None,
+                    args=types.SimpleNamespace(eval_strategy="no"), teacher=None, rewards=[entry], replay=None,
+                    dataset=types.SimpleNamespace(synthetic_dataset_eval=False),
                     peft=None, method=types.SimpleNamespace(trainer_cls=trainer_cls),
                 )
                 replies = iter((TimeoutError(), "Score: 9", "Score: 3"))
@@ -220,10 +243,10 @@ class JudgeProgressTest(unittest.TestCase):
     # Exhausted judge retries remain contextual training errors and never claim success.
     def test_failed_judge_reports_before_propagating_training_error(self):
         lines = []
-        args = {"url": "https://judge.invalid/v1", "model": "judge", "rubric": "score",
+        args = {"url": "https://judge.invalid/v1", "model": "judge", "rubric_file": "judge.prompt",
                 "timeout": 5, "retries": 0, "concurrency": 1}
         with Progress("trlx grpo rank 0", emit=lines.append) as progress:
-            judge = rewards.resolve([RewardEntry("llm_judge", args)], progress=progress)[0]
+            judge = rewards.resolve([RewardEntry("llm_judge", args, rubric_text="score")], progress=progress)[0]
             with patch("dataset.endpoint.urllib.request.urlopen", side_effect=TimeoutError()), \
                  self.assertRaisesRegex(TrlxError, r"\[rewards\].funcs\[0\].*gave up after 1 attempts"):
                 judge(["answer"])
@@ -234,11 +257,11 @@ class JudgeProgressTest(unittest.TestCase):
     # Optional instrumentation must not make direct library reward use print progress.
     def test_judge_without_reporter_preserves_silent_library_use(self):
         reply = json.dumps({"choices": [{"message": {"content": "Score: 4"}}]}).encode()
-        args = {"url": "https://judge.invalid/v1", "model": "judge", "rubric": "score",
+        args = {"url": "https://judge.invalid/v1", "model": "judge", "rubric_file": "judge.prompt",
                 "timeout": 5, "retries": 0, "concurrency": 1}
         with contextlib.redirect_stderr(io.StringIO()) as output, \
              patch("dataset.endpoint.urllib.request.urlopen", return_value=io.BytesIO(reply)):
-            judge = rewards.resolve([RewardEntry("llm_judge", args)])[0]
+            judge = rewards.resolve([RewardEntry("llm_judge", args, rubric_text="score")])[0]
             self.assertEqual(judge(["answer"]), [4.0])
         self.assertEqual(output.getvalue(), "")
 

@@ -75,7 +75,7 @@ input order in their returned results.
 
 | Command | Does |
 |---|---|
-| `trlx init [--out <path>] [--force]` | Writes `run.toml` by default, with shared environment-informed settings and all method sections. Existing files require `--force`, which replaces saved settings with freshly generated defaults. No method, model, dataset, or calibration run is required. |
+| `trlx init [--out <path>] [--force]` | Writes `run.toml` by default, all method sections, and `prompts/` beside the config (§2.2). Existing named outputs require `--force`, which resets config and generated prompt files, including edits. Other files are preserved. No method, model, dataset, or calibration run is required. |
 | `trlx <method> [--config <path>] [--model <model>] [--dataset <data>] [options]` | Uses `run.toml` by default. Explicit CLI settings override this run only. Runs preflight, training, and verification. Model/data must come from config or CLI. |
 | `trlx show <run> [--tui]` | Renders a run's `metrics.jsonl` with the same renderers. |
 | `trlx check <method> [--config <path>] [options]` | Preflight only, with the same training-setting overrides. |
@@ -132,6 +132,26 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 
 Dataset files: JSONL, JSON array, CSV, Parquet, by extension. Applies everywhere a dataset is named.
 
+`[prompts]` maps explicit paths relative to the config directory (or absolute paths):
+`synthetic_eval_summary`, `quality_qa`, `quality_classification`, `quality_multiple_choice`,
+`quality_json`, `quality_instruction_following_judge`, and `quality_writing_judge`.
+`init` writes `prompts/<key-with-hyphens>.prompt` for each, plus `chat-questions.prompt`,
+`chat-answers.prompt`, and `eval-build-summary.prompt` for dataset commands. It writes
+`llm-judge.prompt.example` with guidance and example rubrics, never an active judge rubric.
+All destinations are validated before hardware inspection; staged publication prepares
+all contents before replacing any destination. Publication is not a multi-file transaction;
+failures identify published paths. `--no-staging` writes directly.
+
+Only enabled features load prompts. Missing, unreadable, empty, or invalid UTF-8 files
+and invalid templates fail before endpoint requests, model weights, or resume rewind.
+Packaged templates are initialization resources only, never runtime fallbacks.
+Chat questions require `{n}` and `{chunk}`; answers require `{chunk}` and `{question}`.
+Synthetic summaries require `{text}`; classification requires `{labels}` (JSON list);
+multiple choice requires `{choices}` (newline-separated `label: text`); JSON requires
+`{required_fields}` (JSON list). Other templates are literal text. Substitution is
+nonrecursive. `[[...]]` encloses an optional block, omitted when its placeholder value
+is absent; the JSON default puts its required-fields sentence in such a block.
+
 ### 2.3 Run directory
 
 All methods allocate `<output_dir>/YYYYMMDD-N--model--dataset/` and print its path at startup.
@@ -144,6 +164,7 @@ by `-`; leading/trailing punctuation is removed. Exact inputs remain in the snap
 ```
 <run>/
   config.toml      resolved method + CLI settings, including chosen strategy and GPUs
+  prompts/         copies of active prompt files referenced by config.toml
   metrics.jsonl    one record per log step, written by the trlx callback; the only metric source
   log.txt          complete operational and library diagnostics, with child source attribution
   preflight.json
@@ -158,6 +179,8 @@ The supervisor resolves inputs once and writes the snapshot before spawning work
 is the actual run directory. Workers read that snapshot, not the operator's source file. The source config
 is never rewritten by training. `[launch]` records method, actual strategy, and physical GPU identifiers;
 it is reserved for snapshots. One supervisor owns the run through verification.
+Active prompt contents are copied into the run before workers start. Snapshot paths
+refer to those copies; workers and resume never reload the operator's originals.
 
 `resume_from_checkpoint` selects an existing run and loads its saved snapshot, then applies explicit CLI
 overrides. Explicit CLI resume does not read the operator's config. Only the current snapshot schema is
@@ -165,7 +188,7 @@ supported. After config and checkpoint metadata validation, resume automatically
 checkpoint directories and quality rounds beyond the saved `trainer_state.json` global_step, and clears
 stale assessment, preflight, and verification reports. Records through that step remain. Logs are
 preserved with an appended resume marker. Assessment settings may change on resume; quality baselines
-are reused only when dataset, tokenizer, scorer, and evaluation conditions match.
+are reused only when dataset, tokenizer, scorer, prompt contents, and evaluation conditions match.
 The selected checkpoint is preserved; no `--force` is required for this rewind. Live line output starts
 at the continuation; `show` and the TUI retain access to historical metrics. Check-only execution never rewinds.
 
@@ -250,7 +273,11 @@ Built into trlx, resolved by bare name alongside `trl.rewards`, each a factory t
 - `phrases`: reward for required phrases, penalty for forbidden ones.
 - `json_valid`: parseable JSON, optional required keys.
 - `length_window`: target range in tokens or words, linear falloff outside.
-- `llm_judge`: OpenAI-compatible endpoint, rubric prompt, parsed score. Batching, timeout, retry.
+- `llm_judge`: OpenAI-compatible endpoint, required operator-authored `rubric_file`, parsed score.
+  Relative paths resolve against the config directory. Inline `rubric` is rejected.
+  The file is the system message; prompt and response are user-message data. The first
+  returned number is the reward, without clamping; a reply without a number scores zero.
+  The initialized `.prompt.example` is never used automatically. Batching, timeout, retry.
 
 ### 2.9 Replay (SFT)
 
@@ -297,7 +324,8 @@ quality checks start disabled. CLI overrides include `--quality-checks` / `--no-
 Independent checks require a separate dataset and a built-in preset: `language_modeling`, `qa`,
 `classification`, `multiple_choice`, `json`, `preference`, `instruction_following`, or `writing`.
 Only reward training uses `preference`; the other presets assess generative models. No custom scorer
-or authored rubric is required. Judging presets require `[assessment.judge]`: explicit `url`, `model`,
+is required. Generative and judging instructions come from the explicit files in `[prompts]`.
+Judging presets require `[assessment.judge]`: explicit `url`, `model`,
 `api_key` (environment-variable name or `"None"`), positive `timeout`, nonnegative `retries`, and positive
 `max_tokens`. Judge results are model judgments. Invalid judge output is a failed check, not a zero score.
 
@@ -328,14 +356,16 @@ Replacing an existing output or input requires `--force`; writers support `--no-
 | `cpt` | Text file to a `text` field dataset. Paragraph-aware chunks up to a token limit estimated by a conservative heuristic. |
 | `pairs` | Two `messages` datasets into `prompt`/`chosen`/`rejected`, aligned by user-turn content with system messages excluded. Unmatched rows reported and dropped; `--strict` makes them fatal. One `messages` dataset into `prompt`/`completion` for distillation. |
 | `heal` | Deterministic JSON and JSONL repairs: truncated last line, trailing commas, unclosed final brace or bracket, single quotes, unquoted keys, Python literals, concatenated objects. Ambiguous errors are reported with line and column and left alone. Every repair is listed. |
-| `chat` | Text file to `messages` via endpoint. Pass 1: chunk plus instruction yields N questions. Pass 2: each question plus its chunk yields the answer. Each pass has its own endpoint and model flags, and a built-in instruction replaceable by `--prompt <file>`. Unparseable replies reported and skipped. Rows carry the answer's reasoning in a `reasoning` column, from the endpoint's reasoning field, `""` when it returns none. The endpoint must return reasoning in that field; a reply with reasoning inline in the content is fatal unless `--strip-reasoning-tags` removes it. |
+| `chat` | Text file to `messages` via endpoint. Pass 1: chunk plus instruction yields N questions. Pass 2: each question plus its chunk yields the answer. Each pass has its own endpoint, model, and prompt-file flags. Unparseable replies reported and skipped. Rows carry the answer's reasoning in a `reasoning` column, from the endpoint's reasoning field, `""` when it returns none. The endpoint must return reasoning in that field; a reply with reasoning inline in the content is fatal unless `--strip-reasoning-tags` removes it. |
 | `stats` | Token length distribution per column. With `--model`, per-token log-prob of response columns. |
 | `eval-build` | One factual prose summary per input `text` row via an OpenAI-compatible endpoint; writes ordered `text` rows for ordinary CPT evaluation. |
 
 `dataset eval-build INPUT --out OUTPUT --endpoint URL --model NAME --max-tokens N`
 requires nonempty string `text` in every row and a positive completion-token limit.
-It does not sample, re-chunk, or withhold source rows. Built-in instructions preserve key
-facts, names, numbers, and relationships without invented facts, commentary, or Q&A formatting.
+It does not sample, re-chunk, or withhold source rows. `--summary-prompt` defaults to
+`./prompts/eval-build-summary.prompt`; its literal contents form the system message,
+with source text in a separate user message. The initialized instructions preserve
+key facts, names, numbers, and relationships without invented facts, commentary, or Q&A formatting.
 Inputs and destination are validated before requests. Empty, malformed, or incomplete
 responses fail with the source row number; every summary requires `finish_reason = "stop"`.
 No incomplete generation set is published. Separate reasoning is excluded; inline reasoning
@@ -344,6 +374,11 @@ Train on all original chunks; generate summaries once and reuse them as `--datas
 for the step-zero baseline and subsequent ordinary evaluations.
 
 For best results, generate summaries using the same model you'll use this data set to train.
+
+`chat --questions-prompt` defaults to `./prompts/chat-questions.prompt`;
+`--answers-prompt` defaults to `./prompts/chat-answers.prompt`. All dataset prompt
+paths resolve against the working directory; neither command reads training config.
+Prompt validation and placeholders follow §2.2; absent files never select built-in text.
 
 `chat` and `eval-build` share explicit runtime-default exceptions: concurrency 4,
 timeout 120 seconds, retries 2. Optional CLI overrides require positive integer concurrency,

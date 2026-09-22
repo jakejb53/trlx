@@ -132,16 +132,20 @@ def build_parser(method=None):
 
     p = sub.add_parser("init", help="inspect the environment and write defaults for all methods",
                        formatter_class=HelpFormatter,
-                       description="Write shared hardware-informed defaults and all method sections. "
+                       description="Write shared hardware-informed defaults, all method sections, and prompt files "
+                                   "in prompts/ beside --out. llm-judge.prompt.example is guidance only; "
+                                   "create your own rubric before enabling llm_judge. "
                                    "No model, dataset, training method, or calibration run is needed.",
                        epilog="Examples:\n  trlx init\n  trlx init --force\n  trlx init --out experiment.toml\n\n"
-                              "Existing files require --force, which replaces saved settings with fresh defaults. "
+                              "Existing files require --force, which resets config and named prompt files, "
+                              "including edited prompts, to fresh defaults. "
                               "Training still needs a CUDA GPU. "
                               "Batch/memory defaults are estimates, not a model-fit guarantee.")
     p.add_argument("--out", default="run.toml", help="config file to create (default: run.toml)")
     p.add_argument("--force", action="store_true",
-                   help="overwrite the config with fresh environment defaults, discarding saved edits")
-    p.add_argument("--no-staging", action="store_true", help="write directly; failure can discard saved settings")
+                   help="reset config and generated prompt files to defaults, discarding saved edits")
+    p.add_argument("--no-staging", action="store_true",
+                   help="write directly; failure can leave incomplete config and prompt outputs")
     p.set_defaults(func=_cmd_init)
 
     # One subparser per method; all share the run flag set.

@@ -1,0 +1,3 @@
+Write {n} questions that can be answered from the text below. Output one question per line and nothing else.
+
+{chunk}
