@@ -5,7 +5,8 @@ Pass 2: each question plus its chunk yields the answer. Each pass runs over
 all its requests concurrently; pass 2 starts after pass 1 completes.
 
 Rows carry the answer's reasoning in a `reasoning` column beside `messages`,
-taken from the endpoint's reasoning field and "" when it returns none. The
+taken from the endpoint's reasoning field and "" when it returns none, unless
+--exclude-reasoning omits the column. This does not change inline handling. The
 endpoint must return reasoning in that field, which means a reasoning parser
 on a self-hosted server; a reply with the reasoning inline is fatal unless
 --strip-reasoning-tags removes it (see strip_inline_reasoning).
@@ -65,9 +66,9 @@ def parse_questions(reply, n):
 
 
 # Runs both passes. Returns (rows, skipped) where skipped lists messages for
-# chunks that yielded no questions and questions that yielded empty answers.
+# chunks that yielded no questions, duplicate questions, and empty answers.
 def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_prompt,
-          answers_prompt, concurrency, strip_reasoning_tags=False, *, progress=None):
+          answers_prompt, concurrency, strip_reasoning_tags=False, *, exclude_reasoning=False, progress=None):
     with stage(progress, "chunking source text") as activity:
         chunks = chunk_text(text, max_tokens, progress=activity)
         activity.note(f"{len(chunks)} source chunks; requesting up to {n} questions per chunk")
@@ -78,13 +79,20 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
     requests = [[{"role": "user", "content": fill(questions_prompt, n=n, chunk=c)}] for c in chunks]
     replies = questions_endpoint.complete_many_full(requests, concurrency, progress=progress, label="questions")
     pairs = []  # (chunk index, question)
+    seen = {}  # Cleaned question -> first source chunk, in source order rather than completion order.
     for i, reply in enumerate(replies):
         # Pass 1 discards reasoning: its output is question strings, not data.
         content = strip_inline_reasoning(reply.content, f"chunk {i}", strip_reasoning_tags)
         questions = parse_questions(content, n)
         if not questions:
             skipped.append(f"chunk {i}: no questions parsed from reply")
-        pairs.extend((i, q) for q in questions)
+        for question in questions:
+            # Deduplicate before paid answer requests; keep the first question's source context.
+            if question in seen:
+                skipped.append(f"chunk {i}: duplicate question (first in chunk {seen[question]}): {question}")
+                continue
+            seen[question] = i
+            pairs.append((i, question))
 
     requests = [
         [{"role": "user", "content": fill(answers_prompt, chunk=chunks[i], question=q)}]
@@ -98,12 +106,11 @@ def build(text, max_tokens, n, questions_endpoint, answers_endpoint, questions_p
         if not answer:
             skipped.append(f"chunk {i}: empty answer for question: {q}")
             continue
-        # The answer's reasoning is kept in its own column rather than folded
-        # into the assistant turn: the endpoint returns it separately, and
-        # wrapping it back into the content would invent a format the model
-        # never emitted. "" when the endpoint returned none.
-        rows.append({
+        row = {
             "messages": [{"role": "user", "content": q}, {"role": "assistant", "content": answer}],
-            "reasoning": reply.reasoning,
-        })
+        }
+        # Column exclusion is independent of stripping tagged reasoning from content.
+        if not exclude_reasoning:
+            row["reasoning"] = reply.reasoning
+        rows.append(row)
     return rows, skipped

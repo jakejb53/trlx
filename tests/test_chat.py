@@ -61,6 +61,52 @@ class StripInlineReasoningTest(unittest.TestCase):
 
 
 class BuildTest(unittest.TestCase):
+    # Duplicates within/across chunks never reach the answer endpoint; first context wins.
+    def test_duplicate_questions_removed_before_answers(self):
+        questions = StubEndpoint([
+            Reply("1. What falls?\n2) What falls?\n3. Where does water go?", ""),
+            Reply("- What falls?  \n* What flows?\n3. Where does water go?", ""),
+            Reply("What flows?", ""),
+        ])
+        answers = StubEndpoint([Reply("Rain.", ""), Reply("The sea.", ""), Reply("Rivers.", "")])
+        with patch("dataset.chat.chunk_text", return_value=["first source", "second source", "third source"]):
+            rows, skipped = build(TEXT, 1000, 3, questions, answers,
+                                  QUESTIONS_PROMPT, ANSWERS_PROMPT, 1)
+        self.assertEqual([row["messages"][0]["content"] for row in rows],
+                         ["What falls?", "Where does water go?", "What flows?"])
+        self.assertEqual([request[0]["content"] for request in answers.requests], [
+            "Use first source to answer What falls?", "Use first source to answer Where does water go?",
+            "Use second source to answer What flows?",
+        ])
+        self.assertEqual(len(skipped), 4)
+        self.assertIn("chunk 0: duplicate question (first in chunk 0): What falls?", skipped)
+        self.assertIn("chunk 2: duplicate question (first in chunk 1): What flows?", skipped)
+
+    # The CLI flags independently control inline content and the output column.
+    def test_reasoning_controls_are_independent(self):
+        from dataset.cli import build_parser
+
+        for strip in (False, True):
+            for exclude in (False, True):
+                with self.subTest(strip=strip, exclude=exclude):
+                    flags = (["--strip-reasoning-tags"] if strip else []) + (["--exclude-reasoning"] if exclude else [])
+                    args = build_parser().parse_args([
+                        "chat", "input.txt", "--out", "output.jsonl", "--questions-endpoint", "https://example.invalid",
+                        "--questions-model", "test", "--n", "1", "--max-tokens", "1000", *flags,
+                    ])
+                    answer = "<think>inline</think>Rain falls." if strip else "Rain falls."
+                    rows, _ = build(TEXT, 1000, 1, StubEndpoint([Reply("What falls?", "question reasoning")]),
+                                    StubEndpoint([Reply(answer, "answer reasoning")]), QUESTIONS_PROMPT,
+                                    ANSWERS_PROMPT, 1, args.strip_reasoning_tags, exclude_reasoning=args.exclude_reasoning)
+                    self.assertEqual(rows[0]["messages"][1]["content"], "Rain falls.")
+                    self.assertEqual("reasoning" in rows[0], not exclude)
+                    if not exclude:
+                        self.assertEqual(rows[0]["reasoning"], "answer reasoning")
+        with self.assertRaisesRegex(DatasetError, "reasoning parser"):
+            build(TEXT, 1000, 1, StubEndpoint([Reply("What falls?", "")]),
+                  StubEndpoint([Reply("<think>inline</think>Rain falls.", "separate")]),
+                  QUESTIONS_PROMPT, ANSWERS_PROMPT, 1, exclude_reasoning=True)
+
     # Inserted source and question text must never be interpreted as placeholders.
     def test_supplied_templates_control_requests_without_recursive_substitution(self):
         questions = StubEndpoint([Reply("What is {chunk}?", "")])

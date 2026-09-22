@@ -176,7 +176,7 @@ def _cmd_chat(args):
         text, args.max_tokens, args.n, q_ep, a_ep,
         load_prompt(args.questions_prompt, required=("n", "chunk"), allowed=("n", "chunk")),
         load_prompt(args.answers_prompt, required=("chunk", "question"), allowed=("chunk", "question")),
-        args.concurrency, args.strip_reasoning_tags, progress=args.progress,
+        args.concurrency, args.strip_reasoning_tags, exclude_reasoning=args.exclude_reasoning, progress=args.progress,
     )
     for s in skipped:
         print(f"skipped {s}", file=sys.stderr)
@@ -385,7 +385,10 @@ def build_parser():
 
     p = add("chat", "generate question/answer messages from text via an endpoint", _cmd_chat,
             "Chunk text, generate questions, then answer them using their source chunk.\n"
-            "Outputs messages plus a separate reasoning column. Empty replies are\n"
+            "Exact duplicate questions are always removed across chunks after list-marker\n"
+            "and surrounding-whitespace cleanup, before answering. First occurrence wins;\n"
+            "each removal is reported. Case, internal whitespace, and punctuation matter.\n"
+            "Outputs messages plus a separate reasoning column unless --exclude-reasoning is set. Empty replies are\n"
             "reported and skipped. Uses an OpenAI-compatible /chat/completions API.\n"
             "Provide both answers endpoint/model flags, or neither to reuse questions.\n"
             "--max-tokens limits source chunks; completion length is controlled by\n"
@@ -432,6 +435,9 @@ def build_parser():
                    help="name of variable holding the key, shared by both endpoints; default: no Authorization header")
     requests.add_argument("--strip-reasoning-tags", action="store_true",
                    help="discard a leading inline reasoning block; default: fail; unclosed blocks always fail")
+    requests.add_argument("--exclude-reasoning", action="store_true",
+                   help="omit the separate reasoning column from output; default: retain it; "
+                        "does not strip inline tags or disable model reasoning; use --strip-reasoning-tags independently")
 
     p = add("eval-build", "generate factual summaries for CPT evaluation", _cmd_eval_build,
             "Summarize every input text chunk through an OpenAI-compatible endpoint.\n"

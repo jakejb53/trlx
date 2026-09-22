@@ -610,15 +610,20 @@ dataset chat source.txt --out chat.jsonl \
 ```
 
 This generates questions from chunks, then answers each question using its source.
+Exact duplicate questions are always removed across the run after list-marker and
+surrounding-whitespace cleanup, before answer requests. The first occurrence is kept;
+each removal is reported. Case, internal whitespace, and punctuation remain significant.
 Here `--max-tokens` limits input chunks; the server controls answer length. Provide
 both `--answers-endpoint` and `--answers-model` to use a different answer model.
 `--questions-prompt FILE` defaults to `./prompts/chat-questions.prompt` and requires
 `{chunk}` and `{n}`; `--answers-prompt FILE` defaults to `./prompts/chat-answers.prompt`
 and requires `{chunk}` and `{question}`. Paths are relative to the working directory.
 
-Output contains `messages` and separate `reasoning`. Configure the server's reasoning
+Output contains `messages` and separate `reasoning` by default. `--exclude-reasoning`
+omits the reasoning column; it does not disable model reasoning. Configure the server's reasoning
 parser; inline reasoning is rejected unless `--strip-reasoning-tags` removes a complete
-leading block. An unclosed block is always an error.
+leading block. An unclosed block is always an error. The two flags are independent;
+use both to strip inline tags and omit the separate reasoning column.
 
 For a synthetic CPT evaluation dataset:
 

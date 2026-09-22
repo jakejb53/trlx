@@ -360,6 +360,13 @@ Replacing an existing output or input requires `--force`; writers support `--no-
 | `stats` | Token length distribution per column. With `--model`, per-token log-prob of response columns. |
 | `eval-build` | One factual prose summary per input `text` row via an OpenAI-compatible endpoint; writes ordered `text` rows for ordinary CPT evaluation. |
 
+`chat --exclude-reasoning` omits the separate `reasoning` column. Its default is false.
+It is independent of `--strip-reasoning-tags` and does not disable endpoint reasoning.
+
+`chat` always removes exact duplicate questions across all chunks before answer generation,
+after list-marker and surrounding-whitespace cleanup. Keep the first occurrence in source
+order and report each removal. Case, internal whitespace, and punctuation remain significant.
+
 `dataset eval-build INPUT --out OUTPUT --endpoint URL --model NAME --max-tokens N`
 requires nonempty string `text` in every row and a positive completion-token limit.
 It does not sample, re-chunk, or withhold source rows. `--summary-prompt` defaults to
