@@ -167,12 +167,27 @@ def callback_class():
         def _report_assessment(self, args, state, *, final=False):
             if self.assessment_settings is None:
                 return
-            from trlx import assessment, review
+            from trlx import assessment, review, run_dirs, show
 
             try:
+                checkpoint_steps, checkpoint_errors = [], []
+                # A directory name alone does not establish a usable checkpoint.
+                # Incomplete saves qualify advice, never interrupt training.
+                try:
+                    checkpoints = show._checkpoints(self.path.parent, self.records)
+                except TrlxError as error:
+                    checkpoints = []
+                    checkpoint_errors.append(str(error))
+                for checkpoint in checkpoints:
+                    try:
+                        saved = run_dirs.inspect_checkpoint(self.path.parent / f"checkpoint-{checkpoint.step}")
+                        checkpoint_steps.append(saved.step)
+                    except (TrlxError, OSError) as error:
+                        checkpoint_errors.append(str(error))
                 result = assessment.run_assessment(self.method, self.records, args,
                                                    completed_steps=state.global_step, planned_steps=state.max_steps,
-                                                   ranges=self.ranges)
+                                                   ranges=self.ranges, checkpoint_steps=checkpoint_steps,
+                                                   checkpoint_errors=checkpoint_errors)
                 print(review.render_run_assessment(result, args, final=final), flush=True)
             except Exception as error:
                 print(f"assessment unavailable: {type(error).__name__}: {error}; training metrics remain in {self.path}",

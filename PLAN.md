@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, and optional random evaluation splitting complete. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator.
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, and assessment recommendation overhaul complete. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -538,6 +538,38 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
 - Validation: 125 focused tests passed. The broader supervisor suite's 7 failures and 17 errors
   reproduced with the original loading calls; those process-control fixtures were subsequently corrected
   and the supervisor suite passed during cooperative cancellation work above.
+
+### Assessment recommendation overhaul (complete, 2026-09-22)
+
+- Supersedes earlier runtime assessment rules. Reports separate whole-run outcome from recent
+  behavior over up to three measured intervals, using actual step spacing. Full history remains
+  available; outliers, warmup, non-finite recovery, and diminishing gains qualify conclusions.
+- Advice incorporates recorded learning rates and matching independent quality comparisons,
+  preserves conflicting signals and warning evidence, and never automatically halves learning rate,
+  doubles steps, or adds an epoch. Completed runs receive completion-aware advice.
+- Best measured steps are distinguished from checkpoints verified through metadata and saved-weight
+  checks. Assessments remain advisory and perform no additional evaluation or training-state changes.
+- Updated `trlx/assessment.py`, `trlx/review.py`, `trlx/metrics.py`, assessment/config/lifecycle/quality
+  callback tests, `README.md`, and `SPEC.md`. Added `tests/test_assessment_trends.py`,
+  `tests/test_assessment_scenarios.py`, and `tests/test_assessment_presentation.py`.
+- Validation: 305 of 310 tests passed. Independent review found no remaining assessment blockers.
+  Read-only replay of `runs/sft/20260922-2--jakejb53-qwen3.8-27b-heretic--friends-train`
+  reports diminishing gains and available checkpoint 32 without prescribing another epoch.
+  No live training was run; operator configs and existing run artifacts were unchanged.
+- Five unrelated stale tests in `tests.test_metrics.StreamingLines` remain unresolved:
+  `test_columns_change_repeats_headings`, `test_narrow_terminal_groups_keep_names_and_values`,
+  `test_present_columns_and_phase_headings`, `test_repeats_headings_after_twenty_rows_and_interrupt`,
+  and `test_resume_retains_history_without_replaying_old_rows`. Their assertions expect the old table format.
+
+Validation command, from the repo root using the project environment's absolute Python executable:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
+  tests.test_assessment tests.test_assessment_trends tests.test_assessment_scenarios \
+  tests.test_assessment_config tests.test_assessment_lifecycle tests.test_quality_callback \
+  tests.test_assessment_presentation tests.test_review tests.test_metrics tests.test_train \
+  tests.test_quality tests.test_quality_scorers tests.test_preflight tests.test_resolution tests.test_imports -q
+```
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

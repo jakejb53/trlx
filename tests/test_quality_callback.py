@@ -25,7 +25,7 @@ class CallbackFixture(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix=".test-quality-callback-", dir=Path(__file__).resolve().parents[1])
         self.addCleanup(temporary.cleanup)
         self.folder = Path(temporary.name)
-        self.settings = settings(runtime_window=6, runtime_min_evaluations=3, runtime_relative_change=0.1)
+        self.settings = settings()
         self.args = SimpleNamespace(load_best_model_at_end=False, eval_strategy="steps",
                                     get_warmup_steps=Mock(return_value=0))
         self.state = SimpleNamespace(global_step=0, max_steps=10, epoch=0.0, num_train_epochs=1.0,
@@ -46,7 +46,7 @@ class CallbackFixture(unittest.TestCase):
         self.load = self.enterContext(patch.object(quality, "load_data", return_value=self.rows))
         self.series = self.enterContext(patch.object(quality, "series_id", return_value="series-a"))
         self.evaluate = self.enterContext(patch.object(quality, "evaluate", return_value=self.results))
-        self.advice = self.enterContext(patch.object(assessment, "runtime_findings", return_value=[]))
+        self.advice = self.enterContext(patch.object(assessment, "run_assessment", wraps=assessment.run_assessment))
         self.output = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.output))
         self.callback = quality.callback_class()(self.settings, self.folder, self.writer, 0)
@@ -235,11 +235,12 @@ class MetricsWriterTest(CallbackFixture):
         self.writer.on_log(self.args, self.state, self.control, logs={"loss": 1.0})
         self.writer.quality(self.args, self.state, {"quality/score": 0.5},
                             {"phase": "completion", "preset": "qa", "series": "series-a", "status": "complete"})
+        self.writer.on_evaluate(self.args, self.state, self.control)
+        self.writer.on_evaluate(self.args, self.state, self.control)
         self.assertEqual(len(metrics.read(self.folder / metrics.FILENAME)), 3)
-        self.assertEqual(self.advice.call_count, 1)
-        self.assertTrue(self.writer._assessment_failed)
+        self.assertEqual(self.advice.call_count, 2)
         self.assertEqual(vars(self.control), control)
-        self.assertEqual(self.output.getvalue().count("assessment unavailable"), 1)
+        self.assertEqual(self.output.getvalue().count("assessment unavailable"), 2)
 
 
 if __name__ == "__main__":

@@ -637,21 +637,29 @@ _RUN_ASSESSMENT_SETTINGS = {
 }
 
 
-# Lead with an action, then its evidence. Analysis details and routine metrics do
-# not compete with actual issues; exact values remain in the authoritative JSONL.
+# Keep the measured outcome visible even when warnings qualify the next action.
 def render_run_assessment(report, args, *, final=False, width=None):
     width = width if width is not None else shutil.get_terminal_size().columns
     available = {item.key: item for item in options.settings(report["method"])}
     title = "Final assessment" if final else "Assessment"
     lines = [f"{title} — step {report['completed_steps']}"]
     issues = report["final_issues"] if final else report["issues"]
-    if not issues:
-        decision = report["final_decision"] if final else report["decision"]
-        if decision == "No changes recommended." and not final:
-            decision = "Continue training. No changes recommended."
-        lines.extend(_assessment_paragraph(decision, width))
+    decision = report["final_decision"] if final else report["decision"]
+    lines.extend(_assessment_paragraph(decision, width))
+    evidence = [report.get(key) for key in ("outcome", "recent", "schedule")]
+    evidence.extend(report.get("quality", []))
+    evidence.append(report.get("checkpoint"))
+    # Older reports carry only combined support; new reports provide each part
+    # separately so the same outcome is not printed twice.
+    if not any(evidence):
+        evidence.append(report["final_support"] if final else report["support"])
+    for paragraph in evidence:
+        if paragraph:
+            lines.extend(_assessment_paragraph(paragraph, width))
     for issue in issues:
         lines.extend(_assessment_paragraph(issue["message"], width))
+        if issue.get("support"):
+            lines.extend(_assessment_paragraph(issue["support"], width, "    "))
         flags = []
         for key in _RUN_ASSESSMENT_SETTINGS.get(issue["code"], "").split():
             setting = available.get(key)
@@ -668,9 +676,6 @@ def render_run_assessment(report, args, *, final=False, width=None):
             flags.append(argument if argument is not None else f"{setting.flag}: automatic/unset")
         if flags:
             lines.extend(_assessment_paragraph("Current: " + "; ".join(flags), width))
-    support = report["final_support"] if final else report["support"]
-    if support:
-        lines.extend(_assessment_paragraph(support, width))
     return "\n".join(lines) + "\n"
 
 

@@ -308,23 +308,28 @@ Findings identify measured facts, preparation projections, or heuristics, with e
 The trainer remains authoritative on prepared data; preflight checks projections against actual row counts.
 Startup and `check` display only warnings and errors, with relevant settings. Disabled ordinary evaluation
 is a warning. After every evaluation, rank zero assesses the full chronological metric history, including
-any quality results from that evaluation. Recency weighting, noise handling, and warmup interpretation
-are internal analysis policy. Sparse evidence limits conclusions without suppressing the assessment.
+any quality results from that evaluation. Overall outcome is separate from recent behavior over up to
+the last three measured intervals, using actual step spacing. Full history is retained; sparse or noisy
+evidence limits conclusions, and recovered non-finite failures remain visible. Warmup and recorded
+learning rates qualify trends; disagreements between objective and independent quality scores remain explicit.
 Assessment never changes settings, optimizer/scheduler state, control flags, or
 checkpoint selection. Scores do not establish an optimal learning rate or universally correct reward.
 At training completion, the same analysis produces a final report after any enabled quality checks.
 Reports appear inline and in `log.txt`; `metrics.jsonl` remains authoritative. Assessment performs no
 additional evaluation. Completion alone does not establish model improvement.
-Displayed assessments lead with a recommendation and only the measurements supporting it. Routine
-observations, analysis labels, and generic disclaimers are omitted; actionable problems remain visible.
-The final assessment states the whole-run outcome and next action, rather than repeating interim advice.
+Displayed assessments lead with a recommendation and supporting measurements. Warnings retain their
+qualifications and metric evidence without hiding the overall outcome. The final assessment states the
+whole-run outcome and next action; a completed run is never told to continue its planned evaluations.
 Fresh runs with ordinary evaluation enabled first evaluate at step zero, before any optimizer update,
 using the trainer's normal held-out data and scoring. `eval_on_start` is managed by trlx, not a setting.
 The baseline stays in `metrics.jsonl` across resume; resumed runs do not replace it. Independent quality
 checks do not repeat their own baseline round for this ordinary step-zero evaluation.
-Loss assessments compare against the step-zero baseline and identify the best measured step. Suggested
-experiments name the changed flag and proposed value. An unevaluated endpoint is not presented as a
-measured final result; a small loss decrease alone does not establish success or justify longer training.
+Loss assessments compare against the step-zero baseline and distinguish the best measured step from
+available checkpoints verified through saved metadata and weights. An unevaluated endpoint is not a
+measured final result. A small loss decrease alone does not establish success or justify longer training;
+rising training loss alone does not identify its cause. Advice never automatically halves learning rate,
+doubles steps, or adds an epoch, and does not imply an optimal numeric setting from trend direction.
+Duration changes may change the scheduler trajectory even with the same configured learning rate.
 
 `[assessment]` requires `quality_checks`,
 `quality_preset`, `quality_dataset` (both nullable using `"None"`), `quality_max_length` (at least 2),

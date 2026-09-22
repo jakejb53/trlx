@@ -5,6 +5,7 @@ import copy
 import io
 import os
 import pathlib
+import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -16,11 +17,7 @@ from tests.test_review import configuration
 
 
 # These values are the operator-approved generated contract, not runtime fallbacks.
-DEFAULTS = {
-    "quality_checks": False, "runtime_window": 20, "runtime_min_evaluations": 3,
-    "runtime_relative_change": 0.05, "quality_preset": "None", "quality_dataset": "None",
-    "quality_max_length": 2048, "quality_max_new_tokens": 256, "quality_batch_size": 1,
-}
+DEFAULTS = dict(init_cmd.ASSESSMENT_DEFAULTS)
 
 
 # Every supplied judge table must state all connection and generation controls.
@@ -62,24 +59,26 @@ class AssessmentConfiguration(unittest.TestCase):
             for method in cli.METHODS:
                 with self.subTest(method=method):
                     cfg = configuration(method, {"assessment": dict(DEFAULTS)})
-                    self.assertEqual(cfg.assessment.runtime_window, 20)
+                    self.assertFalse(cfg.assessment.quality_checks)
 
     # Python bool/int subtype behavior must not loosen the operator-visible types.
     def test_boolean_integer_and_numeric_validation(self):
         cases = {
             "quality_checks": (0, 1, "false", None),
-            "runtime_window": (True, 1, 2.0, "2"),
-            "runtime_min_evaluations": (False, 1, 3.0),
             "quality_max_length": (True, 1, 2.0),
             "quality_max_new_tokens": (False, 0, -1, 1.0),
             "quality_batch_size": (True, 0, 1.0),
-            "runtime_relative_change": (True, 0, -0.1, float("nan"), float("inf"), "0.1"),
         }
         for key, invalid in cases.items():
             for value in invalid:
                 with self.subTest(key=key, value=value), self.assertRaisesRegex(TrlxError, key):
                     assessment(**{key: value})
-        self.assertEqual(assessment(runtime_relative_change=1).runtime_relative_change, 1.0)
+
+    # Removed heuristic controls must not silently alter the current evidence rules.
+    def test_removed_runtime_settings_rejected(self):
+        for key in ("runtime_window", "runtime_min_evaluations", "runtime_relative_change"):
+            with self.subTest(key=key), self.assertRaisesRegex(TrlxError, key):
+                assessment(**{key: 2})
 
     # Unknown keys fail loudly at each ownership boundary.
     def test_unknown_keys_and_wrong_table_type(self):
@@ -160,17 +159,13 @@ class AssessmentCLI(unittest.TestCase):
 
     # Exercise every public assessment option through actual argparse conversion.
     def test_all_cli_controls(self):
-        args = cli.parse_args(["sft", "--assessment-window", "6", "--assessment-min-evaluations", "4",
-                               "--assessment-relative-change", "0.2", "--quality-preset", "qa",
+        args = cli.parse_args(["sft", "--quality-preset", "qa",
                                "--quality-dataset", "quality.jsonl", "--quality-max-length", "128",
                                "--quality-max-new-tokens", "64", "--quality-batch-size", "2",
                                "--quality-judge-url", "None", "--quality-judge-model", "None",
                                "--quality-judge-api-key", "None", "--quality-judge-timeout", "10",
                                "--quality-judge-retries", "2", "--quality-judge-max-tokens", "32"])
         values = options.overrides(args)
-        self.assertEqual(values["assessment.runtime_window"], 6)
-        self.assertEqual(values["assessment.runtime_min_evaluations"], 4)
-        self.assertEqual(values["assessment.runtime_relative_change"], 0.2)
         self.assertEqual(values["assessment.quality_max_length"], 128)
         self.assertEqual(values["assessment.quality_max_new_tokens"], 64)
         self.assertEqual(values["assessment.quality_batch_size"], 2)
@@ -184,32 +179,36 @@ class AssessmentCLI(unittest.TestCase):
     # The method overlay and CLI merge nested assessment fields without mutating shared input.
     def test_shared_method_cli_precedence(self):
         source = configuration(extra={"assessment": dict(DEFAULTS)}).document
-        source["methods"] = {"sft": {"assessment": {"runtime_window": 8, "quality_checks": True,
+        source["methods"] = {"sft": {"assessment": {"quality_batch_size": 8, "quality_checks": True,
                                                     "quality_preset": "qa", "quality_dataset": "held-out.jsonl"}}}
+        temporary = tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).parent)
+        self.addCleanup(temporary.cleanup)
+        prompt = pathlib.Path(temporary.name).resolve() / "qa.prompt"
+        prompt.write_text("Answer concisely.", encoding="utf-8")
+        source["prompts"] = {"quality_qa": str(prompt)}
         before = copy.deepcopy(source)
         with patch.object(config, "_read_toml", return_value=source):
             selected = config.load("memory.toml", "sft")
-            values = options.overrides(cli.parse_args(["sft", "--assessment-window", "5", "--no-quality-checks"]))
+            values = options.overrides(cli.parse_args(["sft", "--quality-batch-size", "5", "--no-quality-checks"]))
             overridden = config.load("memory.toml", "sft", overrides=values)
-        self.assertEqual(selected.assessment.runtime_window, 8)
+        self.assertEqual(selected.assessment.quality_batch_size, 8)
         self.assertTrue(selected.assessment.quality_checks)
-        self.assertEqual(overridden.assessment.runtime_window, 5)
+        self.assertEqual(overridden.assessment.quality_batch_size, 5)
         self.assertFalse(overridden.assessment.quality_checks)
-        self.assertEqual(overridden.assessment.runtime_min_evaluations, 3)
         self.assertEqual(overridden.assessment.quality_preset, "qa")
         self.assertEqual(source, before)
 
     # Explicit resume reads assessment settings from its snapshot, never today's run.toml.
     def test_resume_uses_snapshot_then_cli(self):
-        snapshot = configuration(extra={"assessment": {**DEFAULTS, "runtime_window": 9}}).document
+        snapshot = configuration(extra={"assessment": {**DEFAULTS, "quality_batch_size": 9}}).document
         snapshot["launch"] = {"method": "sft"}
         checkpoint = pathlib.Path("runs/example/checkpoint-12").absolute()
         values = options.overrides(cli.parse_args(["sft", "--resume-from-checkpoint", str(checkpoint),
-                                                   "--assessment-window", "7"]))
+                                                   "--quality-batch-size", "7"]))
         with patch.object(config, "_read_toml", return_value=snapshot) as read:
             cfg = config.load("unused-current.toml", "sft", overrides=values)
         read.assert_called_once_with(checkpoint.parent / "config.toml")
-        self.assertEqual(cfg.assessment.runtime_window, 7)
+        self.assertEqual(cfg.assessment.quality_batch_size, 7)
         self.assertEqual(cfg.assessment.quality_max_length, 2048)
 
     # Help may inspect library metadata but cannot read configuration or load datasets.

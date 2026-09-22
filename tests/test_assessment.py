@@ -22,6 +22,7 @@ def config(method="sft", **overrides):
         **overrides,
     )
     return SimpleNamespace(method=SimpleNamespace(name=method), args=args, peft=None,
+                           dataset=SimpleNamespace(synthetic_dataset_eval=False),
                            document={"generation_batch_size": 8} if method in ("grpo", "rloo") else {})
 
 
@@ -229,10 +230,9 @@ class StaticAssessment(unittest.TestCase):
 
 
 class RuntimeAssessment(unittest.TestCase):
-    # Tests pass every heuristic setting explicitly to avoid hidden operational thresholds.
+    # Runtime evidence consumes recorded history rather than removed window settings.
     def assess(self, records, method="sft", **kwargs):
-        return indexed(assessment.runtime_findings(method, records, window=2, min_evaluations=3,
-                                                   relative_change=0.1, **kwargs))
+        return indexed(assessment.runtime_findings(method, records, **kwargs))
 
     # A numerical failure is immediate even during warmup and outside displayed ranges.
     def test_nonfinite_immediate_every_method(self):
@@ -250,21 +250,20 @@ class RuntimeAssessment(unittest.TestCase):
 
     # Sparse metrics are legitimate; missing observations cannot establish a trend.
     def test_missing_data_and_repeat_logs(self):
-        self.assertEqual(self.assess([]), {})
-        self.assertEqual(self.assess([record(1, loss=1), record(2, learning_rate=0.1)]), {})
+        self.assertIn("evaluation_missing", self.assess([]))
+        self.assertNotIn("rising_training_loss", self.assess([record(1, loss=1), record(2, learning_rate=0.1)]))
         duplicated = [record(1, loss=1)] * 4 + [record(2, loss=2)] * 4
         self.assertNotIn("rising_training_loss", self.assess(duplicated))
 
-    # Distinct windows retain raw values and do not attribute a trend to an optimal LR.
+    # Sustained growth retains evidence without prescribing an optimal learning rate.
     def test_sustained_loss_with_supporting_evidence(self):
-        records = [record(i, loss=value, learning_rate=0.001) for i, value in enumerate([1, 1, 2, 2], 1)]
+        records = [record(i, loss=value, learning_rate=0.001) for i, value in enumerate([1, 2, 3, 4], 1)]
         before = copy.deepcopy(records)
         findings = self.assess(records)
-        self.assertEqual(findings["rising_training_loss"]["evidence"]["loss"]["previous"]["step_range"], [1, 2])
-        self.assertEqual(findings["rising_training_loss"]["evidence"]["loss"]["recent"]["values"], [2, 2])
-        self.assertIn("separate run", findings["rising_training_loss"]["recommendation"])
+        self.assertEqual(findings["rising_training_loss"]["evidence"]["loss"]["direction"], "up")
+        self.assertNotIn("halve", findings["rising_training_loss"]["recommendation"])
         self.assertEqual(records, before)
-        self.assertNotIn("rising_training_loss", self.assess(records, warmup_steps=2))
+        self.assertNotIn("rising_training_loss", self.assess(records, warmup_steps=4))
 
     # On-policy losses and a noisy crossing of the old median do not support convergence claims.
     def test_noisy_and_onpolicy_losses(self):
@@ -276,11 +275,10 @@ class RuntimeAssessment(unittest.TestCase):
 
     # Overfitting needs repeated evaluation deterioration and aligned train improvement.
     def test_possible_overfit_only_aligned_evidence(self):
-        records = [record(1, True, eval_loss=1), record(1, loss=4), record(2, loss=3),
-                   record(3, True, eval_loss=2), record(3, loss=2), record(4, loss=1),
-                   record(4, True, eval_loss=3)]
+        records = [item for step in range(1, 5) for item in
+                   (record(step, True, eval_loss=step), record(step, loss=5-step))]
         self.assertIn("possible_overfitting", self.assess(records))
-        self.assertNotIn("possible_overfitting", self.assess(records[:-1]))
+        self.assertNotIn("possible_overfitting", self.assess(records[:2]))
         eval_only = [r for r in records if r["eval"]]
         findings = self.assess(eval_only)
         self.assertNotIn("possible_overfitting", findings)
@@ -326,7 +324,7 @@ class RuntimeAssessment(unittest.TestCase):
     # Enough comparable quality observations support advice independently of training reward.
     def test_quality_deterioration_and_judge_attribution(self):
         rounds = []
-        for step, score in enumerate((0.9, 0.6, 0.3)):
+        for step, score in enumerate((0.9, 0.7, 0.5, 0.3)):
             row = record(step, **{"quality/judge_score": score, "quality/word_count": 10 - step})
             row["quality"] = {"series": "judge", "phase": "baseline" if step == 0 else "scheduled", "status": "complete"}
             rounds.append(row)
@@ -352,12 +350,13 @@ class RuntimeAssessment(unittest.TestCase):
         del rounds[0]["quality"]["status"]
         self.assertNotIn("quality_baseline:one", self.assess(rounds))
 
-    # Flatness must cover every observation; medians alone hide oscillations.
+    # Flat and noisy histories retain distinct interpretations for fixed objectives.
     def test_plateau_and_distillation_progress(self):
-        self.assertIn("little_loss_change", self.assess([record(i, loss=1) for i in range(1, 5)]))
-        self.assertNotIn("little_loss_change", self.assess([
+        flat = self.assess([record(i, loss=1) for i in range(1, 5)])
+        self.assertEqual(flat["training_progress"]["evidence"]["loss"]["direction"], "flat")
+        self.assertNotIn("rising_training_loss", self.assess([
             record(i, loss=value) for i, value in enumerate((0.1, 2, 0.1, 2), 1)]))
-        self.assertIn("distillation_loss_trend", self.assess([
+        self.assertIn("generated_objective", self.assess([
             record(i, loss=value) for i, value in enumerate((4, 3, 2, 1), 1)], "distillation"))
 
 
@@ -370,17 +369,15 @@ class AssessmentCoverageAndCompletion(unittest.TestCase):
         cfg.args.logging_first_step = False
         cfg.args.eval_delay = 0
         cfg.args.get_warmup_steps = lambda steps: 0
-        cfg.assessment = SimpleNamespace(runtime_window=20, runtime_min_evaluations=3, runtime_relative_change=.05)
         return cfg
 
-    # The real 19-update failure mode must be visible before any weights load.
-    def test_short_run_warns_about_both_unreachable_windows(self):
+    # Short runs no longer claim that removed configurable windows block all advice.
+    def test_short_run_retains_budget_without_removed_window_requirements(self):
         cfg = self.configuration()
         findings = indexed(assessment.static_findings(cfg, profile(152), 2))
         self.assertEqual(findings["training_budget"]["evidence"]["updates"], 19)
-        self.assertEqual(findings["assessment_training_coverage"]["evidence"]["projected_observations"], 19)
-        self.assertEqual(findings["assessment_training_coverage"]["evidence"]["required_observations"], 40)
-        self.assertEqual(findings["assessment_evaluation_coverage"]["evidence"]["projected_evaluations"], 1)
+        self.assertNotIn("assessment_training_coverage", findings)
+        self.assertNotIn("assessment_evaluation_coverage", findings)
 
     # Disabled evaluation is actionable; optional independent quality checks are not required.
     def test_disabled_evaluation_warns_with_or_without_eval_data(self):
@@ -390,18 +387,6 @@ class AssessmentCoverageAndCompletion(unittest.TestCase):
             finding = indexed(assessment.static_findings(cfg, data, 2))["evaluation_coverage"]
             self.assertEqual(finding["severity"], "warning")
             self.assertIn("disabled", finding["summary"])
-
-    # Ratio schedules round up; warmup removes observations and eval delay is inclusive.
-    def test_ratios_warmup_and_delays(self):
-        args = self.configuration().args
-        args.logging_steps = .2
-        args.logging_first_step = True
-        self.assertEqual(assessment._scheduled_observations(args, "logging", 19, 0, 19), 5)
-        self.assertEqual(assessment._scheduled_observations(args, "logging", 19, 4, 19), 3)
-        args.eval_strategy, args.eval_steps, args.eval_delay = "steps", 4, 8
-        self.assertEqual(assessment._scheduled_observations(args, "eval", 19, 0, 19), 3)
-        args.eval_strategy, args.eval_delay = "epoch", 1.5
-        self.assertEqual(assessment._scheduled_observations(args, "eval", 30, 0, 19), 1)
 
     # Resume can retain sufficient historical evidence; unknown schedules cannot justify a warning.
     def test_resume_and_unknown_schedule_do_not_claim_known_counts(self):
@@ -417,48 +402,42 @@ class AssessmentCoverageAndCompletion(unittest.TestCase):
         self.assertNotIn("assessment_training_coverage", findings)
         self.assertNotIn("assessment_evaluation_coverage", findings)
 
-    # Final results use actual observations, retain the final eval, and never relax configured windows.
+    # Completion retains actual observations without inventing a starting-model baseline.
     def test_final_short_run_reports_evidence_gaps_without_mutation(self):
         cfg = self.configuration()
         records = [record(step, loss=2.2, grad_norm=.1) for step in range(1, 20)]
         records += [record(19, True, eval_loss=2.28), record(19, train_loss=2.197)]
         original = copy.deepcopy(records)
-        result = assessment.final_assessment("sft", records, cfg.args, cfg.assessment, completed_steps=19, planned_steps=19)
-        findings = indexed(result["findings"])
+        result = assessment.run_assessment("sft", records, cfg.args, completed_steps=19, planned_steps=19)
         self.assertEqual(result["evaluation_metrics"], {"eval_loss": 2.28})
         self.assertEqual(result["train_loss"], 2.197)
         self.assertEqual(result["evaluation_records"], 1)
-        self.assertEqual(findings["final_training_coverage"]["evidence"]["usable_loss_observations"], 19)
-        self.assertEqual(findings["final_evaluation_coverage"]["evidence"]["usable_evaluations"], 1)
-        self.assertNotIn("final_training_progress", findings)
+        self.assertIn("baseline", result["final_decision"].lower())
         self.assertEqual(records, original)
 
-    # Improving, worsening, and noisy held-out series use the same sensitivity as live advice.
+    # Final and live assessment share method-specific runtime evidence.
     def test_supported_conclusions_and_method_limits(self):
         cfg = self.configuration()
-        cfg.assessment.runtime_window = 2
-        cfg.assessment.runtime_min_evaluations = 2
-        for evaluation_losses, expected in (((3, 2), "final_evaluation_progress"), ((2, 3), "possible_overfitting")):
+        for evaluation_losses, expected in (((4, 3, 2, 1), "evaluation_progress"), ((1, 2, 3, 4), "possible_overfitting")):
             records = [record(i, loss=5 - i) for i in range(1, 5)]
-            records += [record(1, True, eval_loss=evaluation_losses[0]), record(4, True, eval_loss=evaluation_losses[1])]
-            result = assessment.final_assessment("sft", records, cfg.args, cfg.assessment, completed_steps=4, planned_steps=4)
+            records += [record(i, True, eval_loss=value) for i, value in enumerate(evaluation_losses, 1)]
+            result = assessment.run_assessment("sft", records, cfg.args, completed_steps=4, planned_steps=4)
             self.assertIn(expected, indexed(result["findings"]))
         for method in ("grpo", "rloo", "distillation"):
-            result = assessment.final_assessment(method, records, cfg.args, cfg.assessment, completed_steps=4, planned_steps=4)
+            result = assessment.run_assessment(method, records, cfg.args, completed_steps=4, planned_steps=4)
             findings = indexed(result["findings"])
-            self.assertIn("final_objective_limits", findings)
-            self.assertNotIn("final_training_progress", findings)
+            self.assertIn("generated_objective", findings)
             self.assertNotIn("possible_overfitting", findings)
 
     # Recovered numerical failures remain part of the final assessment; missing eval is explicit.
     def test_recovered_nonfinite_and_missing_evaluation(self):
         cfg = self.configuration()
         records = [record(1, loss=float("nan")), record(2, loss=1)]
-        result = assessment.final_assessment("sft", records, cfg.args, cfg.assessment, completed_steps=2, planned_steps=2)
+        result = assessment.run_assessment("sft", records, cfg.args, completed_steps=2, planned_steps=2)
         findings = indexed(result["findings"])
         self.assertEqual(result["nonfinite_observations"], 1)
         self.assertIn("final_numerical_issues", findings)
-        self.assertIn("final_evaluation_missing", findings)
+        self.assertIn("evaluation_missing", findings)
 
 
 if __name__ == "__main__":

@@ -192,9 +192,11 @@ class Rendering(unittest.TestCase):
         self.assertNotIn("private-hub-secret", output)
         self.assertNotIn("--hub-token", output)
         self.assertIn("--eos-token", output)
-        cfg = configuration("grpo", {"rewards": {"funcs": [
-            {"name": "llm_judge", "args": {"api_key": "private-key", "url": "https://u:private-pass@host/v1?token=private-token"}}
-        ]}})
+        with patch.object(config, "_read_prompt", return_value="Operator-authored judging rubric."):
+            cfg = configuration("grpo", {"rewards": {"funcs": [
+                {"name": "llm_judge", "args": {"api_key": "private-key", "rubric_file": "judge.prompt",
+                                               "url": "https://u:private-pass@host/v1?token=private-token"}}
+            ]}})
         output = review.render(cfg)
         for secret in ("private-key", "private-pass", "private-token"):
             self.assertNotIn(secret, output)

@@ -173,10 +173,9 @@ class AssessmentLifecycleTests(unittest.TestCase):
                 self.assertEqual(callback.has_baseline("same-series"), status == "complete")
                 self.assertFalse(callback.has_baseline("different-series"))
 
-    # Every completed round refreshes its measured comparison, even at the same step;
-    # intervening training logs still coalesce that unchanged comparison.
+    # Evidence is durable immediately, but advice is emitted at evaluation boundaries.
     def test_completed_quality_round_refreshes_baseline_evidence(self):
-        settings = SimpleNamespace(runtime_window=6, runtime_min_evaluations=3, runtime_relative_change=.1)
+        settings = SimpleNamespace()
         callback = metrics.callback_class()(self.directory, assessment_settings=settings, method="sft", ranges={})
         state = SimpleNamespace(global_step=0, max_steps=40, epoch=0.0, num_train_epochs=1.0)
         args = SimpleNamespace(get_warmup_steps=Mock(return_value=0))
@@ -187,24 +186,26 @@ class AssessmentLifecycleTests(unittest.TestCase):
             emitted.assert_not_called()
             state.global_step = 20
             callback.quality(args, state, {"quality/accuracy": .75}, quality_context(20, "scheduled"))
+            callback.on_evaluate(args, state, control)
             self.assertEqual(emitted.call_count, 1)
             callback.on_log(args, state, control, logs={"loss": 1.0})
             self.assertEqual(emitted.call_count, 1)
             callback.quality(args, state, {"quality/accuracy": 1.0}, quality_context(20, "completion"))
+            callback.on_evaluate(args, state, control)
             self.assertEqual(emitted.call_count, 2)
             callback.on_log(args, state, control, logs={"loss": .9})
             self.assertEqual(emitted.call_count, 2)
         first, second = [call.args[0] for call in emitted.call_args_list]
-        self.assertIn('"current": 0.75', first)
-        self.assertIn('"phase": "scheduled"', first)
-        self.assertIn('"current": 1.0', second)
-        self.assertIn('"phase": "completion"', second)
-        self.assertIn('"delta": 0.5', second)
+        self.assertIn("Assessment", first)
+        self.assertIn("Assessment", second)
+        contexts = [item["quality"] for item in callback.records if item.get("quality")]
+        self.assertEqual([item["phase"] for item in contexts], ["baseline", "scheduled", "completion"])
+        self.assertEqual(callback.records[-2]["log"]["quality/accuracy"], 1.0)
         self.assertFalse(control.should_training_stop)
 
     # Advice retains exactly the serialized evidence when later trainer callbacks mutate logs.
     def test_callback_records_snapshot_mutable_input_logs(self):
-        settings = SimpleNamespace(runtime_window=6, runtime_min_evaluations=3, runtime_relative_change=.1)
+        settings = SimpleNamespace()
         callback = metrics.callback_class()(self.directory, assessment_settings=settings, method="sft", ranges={})
         state = SimpleNamespace(global_step=1, max_steps=40, epoch=0.0, num_train_epochs=1.0)
         args = SimpleNamespace(get_warmup_steps=Mock(return_value=0))
@@ -224,7 +225,7 @@ class AssessmentLifecycleTests(unittest.TestCase):
         from tests.test_review import configuration
 
         cfg = configuration(extra={"eval_strategy": "epoch"})
-        settings = SimpleNamespace(runtime_window=20, runtime_min_evaluations=3, runtime_relative_change=.05)
+        settings = SimpleNamespace()
         callback = metrics.callback_class()(self.directory, settings, "sft", {})
         state = SimpleNamespace(global_step=19, max_steps=19, epoch=1.0, num_train_epochs=1.0)
         control = SimpleNamespace(should_training_stop=False)
@@ -236,11 +237,11 @@ class AssessmentLifecycleTests(unittest.TestCase):
             before = path.read_bytes()
             callback.on_train_end(cfg.args, state, control)
             callback.on_train_end(cfg.args, state, control)
-        text = [call.args[0] for call in emitted.call_args_list if call.args[0].startswith("Final training assessment:")]
+        text = [call.args[0] for call in emitted.call_args_list if call.args[0].startswith("Final assessment")]
         self.assertEqual(len(text), 1)
-        self.assertIn("Eval loss: 2.28", text[0])
-        self.assertIn("--assessment-window 20", text[0])
-        self.assertIn("--assessment-min-evaluations 3", text[0])
+        self.assertIn(str(2.28), text[0])
+        self.assertNotIn("--assessment-window", text[0])
+        self.assertNotIn("--assessment-min-evaluations", text[0])
         self.assertIsNone(callback._file)
         self.assertEqual(path.read_bytes(), before)
         self.assertFalse(control.should_training_stop)
