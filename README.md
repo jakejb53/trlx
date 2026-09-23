@@ -208,18 +208,18 @@ trlx merge --base BASE --adapter ADAPTER --out BASE --force
 
 ## Settings assessment and independent quality checks
 
-All seven trainers provide a full pre-run scan, an assessment after every evaluation, and a final
-assessment at training completion. Findings distinguish
+All seven trainers provide a full pre-run scan. Startup findings distinguish
 measurements, preparation projections, and heuristics, and include their evidence. They never change
 training settings, stop a run, or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
-runtime notices appear inline and in the TUI log pane. Training metrics remain in `metrics.jsonl`.
-Startup shows only problems, including disabled evaluation. Runtime assessments present metric recaps
-and deterministic interpretation of learning effectiveness, diminishing gains, deterioration, and possible
-overfitting. Intermediate reports emphasize the latest evaluation interval; final reports compare initial
-and latest training/evaluation losses and relevant method/quality scores. Measurements retain their steps;
-training loss starts at the first logged value, not the whole-run average. Accuracy changes use percentage
-points. Missing values and non-finite failures remain explicit. Reports preserve conflicting signals and
-warnings, omit routine tuning advice and generic disclaimers, appear in `log.txt`, and add no evaluation passes.
+training metrics remain in `metrics.jsonl`. Startup shows only problems, including disabled evaluation.
+Every evaluation and completion shows factual metric comparisons and training/evaluation loss charts,
+without assessment prose or tuning advice. The two charts occupy 100 columns with 13 plot rows;
+each uses its own observed Y range and the complete run through the current optimizer step, including
+resume history. Missing data is explicit; non-finite measurements break chart lines.
+Intermediate reports compare previous and latest values; final reports compare initial and latest values.
+Training starts at the first logged loss, not the whole-run average. Accuracy changes use percentage points.
+Reports appear inline and in `log.txt` and add no evaluation passes. Ordinary terminal output omits rank
+prefixes; explicit diagnostics and log lines retain source attribution.
 Line-mode metric tables retain their column headers, use `Change` for differences, and omit repeated legend sentences.
 They show `training_loss`, the latest measured `eval_loss`, and its `eval_step` together, including on
 resume and in `trlx show`. Blank evaluation fields mean no evaluation has been recorded yet.
@@ -227,9 +227,7 @@ resume and in `trlx show`. Blank evaluation fields mean no evaluation has been r
 When ordinary evaluation is enabled, fresh runs measure the starting model at step zero using the
 same held-out data as later evaluations. This adds one evaluation pass; resume keeps the original
 baseline. No extra flag or quality benchmark is needed. Final evaluation comparisons use that baseline;
-missing baselines and measurements before the final step are identified. Recent trends use up to three
-measured intervals and actual step spacing. Learning-rate context appears only when relevant to the
-interpretation; metric changes do not automatically prescribe settings.
+missing baselines and measurements before the final step are identified by their recorded steps.
 
 Training and `check` require the following explicit block, supplied by new `trlx init` configurations.
 Add it to older configs; initialization with `--force` replaces the entire file.
@@ -244,10 +242,8 @@ quality_max_new_tokens = 256
 quality_batch_size = 1
 ```
 
-Evaluation frequency controls when assessment happens. There are no user-configured assessment
-windows, minimum evaluation counts, or sensitivity thresholds. Insufficient evidence limits individual
-conclusions without suppressing the assessment.
-Ordinary evaluation and metric assessment do not require `--quality-checks`.
+Evaluation frequency controls metric-report timing; reports use the recorded history without
+minimum observation counts. Ordinary evaluation and metric reports do not require `--quality-checks`.
 
 Independent checks are optional and require a separate evaluation dataset and a built-in preset:
 

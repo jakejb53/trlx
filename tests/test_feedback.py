@@ -67,7 +67,7 @@ os.write(2, b"warning before carriage return\\rnew diagnostic\\rfinal output")
         for event in collector.take():
             view.consume(event)
         expected = ["warning before carriage return", "new diagnostic", "final output"]
-        self.assertEqual(lines, [f"[rank 0] {message}" for message in expected])
+        self.assertEqual(lines, expected)
         for message in expected:
             self.assertIn(f"[rank 0] {message}\n", log.getvalue().decode())
 
@@ -92,6 +92,30 @@ client.close()
         events = collector.take()
         self.assertEqual([(e["level"], e["logger"]) for e in events],
                          [("INFO", "transformers"), ("WARNING", "transformers")])
+
+    # A multiline report crosses pipe buffers intact and is emitted atomically.
+    def test_metric_report_preserves_width_and_per_line_log_attribution(self):
+        log = io.BytesIO()
+        collector = feedback.Collector(log, "log.txt")
+        child = self.spawn(collector, '''
+from trlx.feedback import connect
+client = connect()
+message = "Metrics — step 70\\n\\n" + "\\n".join("|" + " " * 98 + "|" for _ in range(1000))
+client({"kind": "metric_report", "message": message})
+client.close()
+''')
+        self.finish(collector, child)
+        events = collector.take()
+        self.assertEqual(len(events), 1)
+        report = "Metrics — step 70\n\n" + "\n".join("|" + " " * 98 + "|" for _ in range(1000))
+        self.assertEqual(events[0]["message"], report)
+        lines = []
+        view = feedback.View(lines.append)
+        view.consume(events[0])
+        self.assertEqual(lines, [report])
+        self.assertTrue(all(len(line) == 100 for line in lines[0].split("\n")[2:]))
+        self.assertEqual(log.getvalue().decode(),
+                         "".join(f"[rank 0] {line}\n" for line in report.split("\n")))
 
     # Both pipes exceed kernel buffering before supervision consumes a single event.
     def test_large_payloads_and_multiple_ranks_drain_without_deadlock(self):
@@ -296,10 +320,23 @@ class Presentation(unittest.TestCase):
         self.view.consume(self.event("library", "configuration aligned", logger="library", level="INFO"))
         self.view.consume(self.event("raw", "raw information after warning"))
         self.view.consume(self.event("warning", "new unknown warning", logger="library", level="WARNING"))
-        self.assertEqual(len(self.lines), 4)
-        for line, expected in zip(self.lines, ("first warning", "configuration aligned",
-                                              "raw information after warning", "new unknown warning")):
-            self.assertIn(expected, line)
+        self.assertEqual(self.lines, ["WARNING [rank 0] library: first warning",
+                                      "configuration aligned", "raw information after warning",
+                                      "WARNING [rank 0] library: new unknown warning"])
+
+    # Explicit logging severity, not words in raw text, identifies attributable errors.
+    def test_structured_error_retains_rank(self):
+        self.view.consume(self.event("warning", "worker failure", source="rank 1",
+                                     logger="library", level="ERROR"))
+        self.assertEqual(self.lines, ["ERROR [rank 1] library: worker failure"])
+
+    # Expected CLI failures retain their worker identity without labelling ordinary text.
+    def test_cli_error_retains_rank_but_command_text_does_not(self):
+        self.view.consume(self.event("raw", "trlx sft: CUDA memory exhausted during training",
+                                     source="rank 1"))
+        self.view.consume(self.event("raw", "trlx show run", source="rank 1"))
+        self.assertEqual(self.lines, ["[rank 1] trlx sft: CUDA memory exhausted during training",
+                                      "trlx show run"])
 
     # Internal filesystem and option plumbing cannot interrupt metric headings.
     def test_internal_events_are_log_only_and_unknown_raw_output_is_visible(self):
@@ -307,7 +344,7 @@ class Presentation(unittest.TestCase):
         self.view.consume(self.event("diagnostic", "finished operation"))
         self.assertEqual(self.lines, [])
         self.view.consume(self.event("raw", "unexpected library error"))
-        self.assertEqual(self.lines, ["[rank 0] unexpected library error"])
+        self.assertEqual(self.lines, ["unexpected library error"])
 
 
 class LoggingSetup(unittest.TestCase):

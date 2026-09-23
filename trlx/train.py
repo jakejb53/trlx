@@ -515,7 +515,8 @@ def _train_worker(args):
                                             no_staging=getattr(args, "no_staging", False), progress=progress)]
     if synthetic_callback is not None:
         callbacks.append(synthetic_callback)
-    writer = metrics.callback_class()(run_dir, settings, cfg.method.name, cfg.ranges) if rank == 0 else None
+    writer = metrics.callback_class()(run_dir, settings, cfg.method.name, cfg.ranges,
+                                      events=progress.events if progress is not None else None) if rank == 0 else None
     quality_callback = None
     if settings.quality_checks:
         quality_callback = quality.callback_class()(settings, run_dir, writer, rank,

@@ -58,7 +58,9 @@ Training records complete diagnostics in `log.txt`. The supervisor collects type
 feedback and raw child output separately and owns terminal presentation. Line mode
 shows useful operations, measured progress, findings, and unknown output; internal
 bookkeeping stays in the log. Identical warnings and rank progress are consolidated,
-with warning counts and affected ranks retained. Library preparation bars come from
+with warning counts and affected ranks retained. Ordinary terminal output has no rank prefix;
+explicit diagnostics retain source attribution. Every log line retains its source. Metric reports
+travel as complete structured events so their chart lines remain together. Library preparation bars come from
 rank zero; other ranks still report their phases and diagnostics. Only the known PyTorch
 `all_gather_into_tensor` FutureWarning is log-only. Waiting notices are log-only
 while any worker is training, including evaluation and checkpoint pauses. Outside
@@ -308,33 +310,23 @@ except synthetic evaluation rows (§2.2).
 Findings identify measured facts, preparation projections, or heuristics, with evidence and recommendations.
 The trainer remains authoritative on prepared data; preflight checks projections against actual row counts.
 Startup and `check` display only warnings and errors, with relevant settings. Disabled ordinary evaluation
-is a warning. After every evaluation, rank zero assesses the full chronological metric history, including
-any quality results from that evaluation. Overall outcome is separate from recent behavior over up to
-the last three measured intervals, using actual step spacing. Full history is retained; sparse or noisy
-evidence limits conclusions, and recovered non-finite failures remain visible. Warmup and recorded
-learning rates qualify trends; disagreements between objective and independent quality scores remain explicit.
-Assessment never changes settings, optimizer/scheduler state, control flags, or
-checkpoint selection. Scores do not establish an optimal learning rate or universally correct reward.
-At training completion, the same analysis produces a final report after any enabled quality checks.
-Reports appear inline and in `log.txt`; `metrics.jsonl` remains authoritative. Assessment performs no
-additional evaluation. Completion alone does not establish model improvement.
-Runtime assessments present metric comparisons followed by deterministic interpretation, without
-routine tuning advice, generic disclaimers, or checkpoint-selection prose. Intermediate reports emphasize
-the previous-to-latest evaluation interval; final reports recap initial-to-latest training loss, evaluation
-loss, and relevant method/quality scores, with measured steps and absolute/relative changes (accuracy in
-percentage points). Training loss starts at the first logged value, never the whole-run average;
-evaluation starts at the step-zero baseline. Missing/non-finite endpoints remain unavailable and stale
-measurements retain their steps. Interpret effectiveness, diminishing gains, deterioration, conflicting
-scores, and possible overfitting from aligned training/evaluation trends. Preserve concrete failures and
-warnings with their evidence. Learning-rate context appears only when relevant to that interpretation.
+is a warning. Every evaluation and completion produces a factual metric report, without runtime
+interpretation or tuning advice. Reports include available quality scores and use `metrics.jsonl` as
+the authoritative history. They appear inline and in `log.txt`, add no evaluation, and change no
+training controls or checkpoint selection.
+Intermediate recaps compare previous-to-latest measurements; final recaps compare initial-to-latest
+measurements, retaining steps and absolute/relative changes (accuracy in percentage points). Training
+starts at its first logged value when no earlier comparison exists, never the whole-run average;
+evaluation starts at the step-zero baseline. Missing/non-finite values remain unavailable and non-finite
+observations remain explicit after recovery.
+Every report contains training-loss and evaluation-loss ASCII charts spanning step zero through the
+current step, including retained resume history. The pair is fixed at 100 columns with 13 plot rows.
+Each Y axis fits its observed finite range; empty and constant series are explicit. Optimizer-step
+spacing determines X coordinates; compression preserves plotted extrema. Invalid values break lines.
 Fresh runs with ordinary evaluation enabled first evaluate at step zero, before any optimizer update,
 using the trainer's normal held-out data and scoring. `eval_on_start` is managed by trlx, not a setting.
 The baseline stays in `metrics.jsonl` across resume; resumed runs do not replace it. Independent quality
 checks do not repeat their own baseline round for this ordinary step-zero evaluation.
-An unevaluated endpoint is not a measured final result. Two observations establish a difference,
-not a sustained trend. A small loss decrease alone does not establish success; rising training loss
-alone does not identify its cause. Assessment neither diagnoses an optimal learning rate nor prescribes
-duration changes from trend direction.
 
 `[assessment]` requires `quality_checks`,
 `quality_preset`, `quality_dataset` (both nullable using `"None"`), `quality_max_length` (at least 2),

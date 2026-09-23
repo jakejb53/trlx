@@ -46,7 +46,7 @@ class CallbackFixture(unittest.TestCase):
         self.load = self.enterContext(patch.object(quality, "load_data", return_value=self.rows))
         self.series = self.enterContext(patch.object(quality, "series_id", return_value="series-a"))
         self.evaluate = self.enterContext(patch.object(quality, "evaluate", return_value=self.results))
-        self.advice = self.enterContext(patch.object(assessment, "run_assessment", wraps=assessment.run_assessment))
+        self.advice = self.enterContext(patch.object(assessment, "run_metrics_report", wraps=assessment.run_metrics_report))
         self.output = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.output))
         self.callback = quality.callback_class()(self.settings, self.folder, self.writer, 0)
@@ -240,7 +240,7 @@ class MetricsWriterTest(CallbackFixture):
         self.assertEqual(len(metrics.read(self.folder / metrics.FILENAME)), 3)
         self.assertEqual(self.advice.call_count, 2)
         self.assertEqual(vars(self.control), control)
-        self.assertEqual(self.output.getvalue().count("assessment unavailable"), 2)
+        self.assertEqual(self.output.getvalue().count("metrics report unavailable"), 2)
 
 
 if __name__ == "__main__":

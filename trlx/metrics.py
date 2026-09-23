@@ -112,14 +112,15 @@ def callback_class():
     # most one partial line, which the reader skips.
     class MetricsCallback(TrainerCallback):
         # Delay opening until the first record; rank zero owns this run's metric stream.
-        def __init__(self, run_dir, assessment_settings=None, method=None, ranges=None):
+        def __init__(self, run_dir, assessment_settings=None, method=None, ranges=None, *, events=None):
             self.path = pathlib.Path(run_dir) / FILENAME
             self._file = None
             self.assessment_settings = assessment_settings
             self.method = method
             self.ranges = ranges
+            self.events = events
             self.records = read(self.path) if assessment_settings is not None and self.path.exists() else []
-            self._final_assessment_reported = False
+            self._final_metrics_reported = False
 
         # Persist and flush each trainer record so live readers see progress immediately.
         def on_log(self, args, state, control, logs=None, **kwargs):
@@ -128,9 +129,9 @@ def callback_class():
             self._append(record(state, logs, time.time()))
 
         # Training registers the quality callback first, so its scheduled evidence
-        # is already durable when this evaluation-level assessment runs.
+        # is already durable when this evaluation-level report runs.
         def on_evaluate(self, args, state, control, **kwargs):
-            self._report_assessment(args, state)
+            self._report_metrics(args, state)
 
         # Quality results share this writer without calling Trainer.log or changing its counters.
         def quality(self, args, state, logs, context):
@@ -145,7 +146,7 @@ def callback_class():
                        and item["quality"].get("phase") == "baseline"
                        and item["quality"].get("status") == "complete" for item in self.records)
 
-        # Publish first, then expose the record to advice; evidence always points at durable metrics.
+        # Publish first, then expose the record to reports; evidence always points at durable metrics.
         def _append(self, item):
             if self._file is None:
                 try:
@@ -159,38 +160,26 @@ def callback_class():
             except OSError as e:
                 raise TrlxError(f"{self.path}: cannot append metrics: {e}; check available space and permissions") from e
             if self.assessment_settings is not None:
-                # Later trainer callbacks may mutate logs; advice must match the durable evidence.
+                # Later trainer callbacks may mutate logs; reports must match the durable evidence.
                 self.records.append(json.loads(serialized))
 
-        # Every eval receives a complete interpretation; one reporting failure
-        # cannot suppress later assessments or change trainer control.
-        def _report_assessment(self, args, state, *, final=False):
+        # Reports use durable history; display failures never change trainer controls.
+        def _report_metrics(self, args, state, *, final=False):
             if self.assessment_settings is None:
                 return
-            from trlx import assessment, review, run_dirs, show
+            from trlx import assessment, review
 
             try:
-                checkpoint_steps, checkpoint_errors = [], []
-                # A directory name alone does not establish a usable checkpoint.
-                # Incomplete saves qualify advice, never interrupt training.
-                try:
-                    checkpoints = show._checkpoints(self.path.parent, self.records)
-                except TrlxError as error:
-                    checkpoints = []
-                    checkpoint_errors.append(str(error))
-                for checkpoint in checkpoints:
-                    try:
-                        saved = run_dirs.inspect_checkpoint(self.path.parent / f"checkpoint-{checkpoint.step}")
-                        checkpoint_steps.append(saved.step)
-                    except (TrlxError, OSError) as error:
-                        checkpoint_errors.append(str(error))
-                result = assessment.run_assessment(self.method, self.records, args,
-                                                   completed_steps=state.global_step, planned_steps=state.max_steps,
-                                                   ranges=self.ranges, checkpoint_steps=checkpoint_steps,
-                                                   checkpoint_errors=checkpoint_errors)
-                print(review.render_run_assessment(result, args, final=final), flush=True)
+                result = assessment.run_metrics_report(self.method, self.records,
+                    completed_steps=state.global_step, planned_steps=state.max_steps, ranges=self.ranges)
+                text = review.render_metrics_report(result, final=final)
+                # Keep the full block on one structured event so other ranks cannot split its charts.
+                if self.events is not None:
+                    self.events({"kind": "metric_report", "message": text.rstrip("\n")})
+                else:
+                    print(text, flush=True)
             except Exception as error:
-                print(f"assessment unavailable: {type(error).__name__}: {error}; training metrics remain in {self.path}",
+                print(f"metrics report unavailable: {type(error).__name__}: {error}; training metrics remain in {self.path}",
                       flush=True)
 
         # Surface final flush/close failures before reporting a completed metrics stream.
@@ -203,9 +192,9 @@ def callback_class():
                 self._file = None
             # Rank zero runs this after completion quality callbacks. Close the
             # authoritative stream first; reporting cannot alter training control.
-            if self.assessment_settings is not None and not self._final_assessment_reported:
-                self._final_assessment_reported = True
-                self._report_assessment(args, state, final=True)
+            if self.assessment_settings is not None and not self._final_metrics_reported:
+                self._final_metrics_reported = True
+                self._report_metrics(args, state, final=True)
 
     return MetricsCallback
 

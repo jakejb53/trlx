@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, assessment recommendation overhaul, and checkpoint defaults complete. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, and runtime metrics/loss charts complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -585,6 +585,22 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   installed trainer save decisions through step 1001. No live training was run.
 - Existing `run.toml` was not modified; its explicit `save_strategy = "epoch"` still overrides
   these defaults. Removing that setting requires separate configuration approval.
+
+### Runtime metrics and loss charts (complete, 2026-09-22)
+
+- Supersedes runtime assessment prose and recommendations. Every evaluation and completion shows
+  factual metric comparisons and full-history training/evaluation loss charts, including resume history.
+  Charts occupy 100 columns combined with 13 plot rows, independent observed Y ranges, and actual
+  optimizer-step spacing. Missing data is explicit; non-finite observations break connecting lines.
+- Ordinary terminal output omits rank prefixes. Explicit warnings and CLI errors retain attribution;
+  every log line retains its source. Reports use one structured event to keep chart lines together.
+  Startup checks, metric persistence, training controls, and checkpoint scheduling are unchanged.
+- Updated `trlx/assessment.py`, `trlx/review.py`, `trlx/metrics.py`, `trlx/feedback.py`, `trlx/train.py`,
+  assessment/quality-callback/feedback tests, `SPEC.md`, and `README.md`.
+- Validation: 156 tests passed across assessment, scenarios, presentation, loss history, lifecycle,
+  quality callbacks, feedback, review, training supervision, and imports. Independent review findings
+  were fixed and re-reviewed with no remaining runtime blockers. No live training was run;
+  operator configurations and existing runs were unchanged.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

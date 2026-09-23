@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import enum
 import json
+import math
 import re
 import shlex
 import shutil
@@ -659,20 +660,103 @@ def _recap_lines(rows, *, final, width):
     return lines
 
 
-# Runtime reports state measured changes and their interpretation; they never prescribe settings.
-def render_run_assessment(report, args, *, final=False, width=None):
-    width = width if width is not None else shutil.get_terminal_size().columns
-    title = "Final assessment" if final else "Assessment"
-    lines = _assessment_paragraph(f"{title} — step {report['completed_steps']}", width, "")
+# Fixed display geometry: both panels together occupy 100 columns, including axes and gutter.
+_CHART_ROWS = 13
+_CHART_COLUMNS = 39
+_AXIS_COLUMNS = 7
+
+
+# Axis rounding must neither expand the panel nor turn tiny nonzero losses into zero.
+def _axis_label(value, resolution=None):
+    # Precision follows the tick interval, so a tightly fitted range is not labelled as one value.
+    decimals = max(3, math.ceil(-math.log10(resolution))) if resolution else 3
+    text = f"{value:.{decimals}f}"
+    if len(text) > _AXIS_COLUMNS or (value != 0 and float(text) == 0):
+        for precision in range(7, 0, -1):
+            text = f"{value:.{precision}g}".replace("e+", "e")
+            if len(text) <= _AXIS_COLUMNS:
+                break
+    return text.rjust(_AXIS_COLUMNS)
+
+
+# Rasterize every observation with actual step spacing; invalid values break connecting segments.
+def _loss_panel(points, completed_steps):
+    grid = [[" "] * _CHART_COLUMNS for _ in range(_CHART_ROWS)]
+    points = [(step, value) for step, value in points if 0 <= step <= completed_steps]
+    finite = [value for _, value in points if isinstance(value, (int, float))
+              and not isinstance(value, bool) and math.isfinite(value)]
+    low, high = (min(finite), max(finite)) if finite else (None, None)
+    # Normalize before subtracting: finite opposite-sign extremes can overflow high - low.
+    scale = (max(abs(low), abs(high)) or 1.0) if finite else 1.0
+    lower, upper = (low / scale, high / scale) if finite else (0., 0.)
+    span = upper - lower
+    previous = None
+    marks = []
+    for step, value in points:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            previous = None
+            continue
+        x = round(step / max(completed_steps, 1) * (_CHART_COLUMNS - 1))
+        y = round((upper - value / scale) / span * (_CHART_ROWS - 1)) if span else _CHART_ROWS // 2
+        y = min(_CHART_ROWS - 1, max(0, y))
+        if previous is not None:
+            x0, y0 = previous
+            distance = max(abs(x - x0), abs(y - y0))
+            # Multiple measurements sharing a column retain their vertical extent.
+            for offset in range(1, distance):
+                column = round(x0 + (x - x0) * offset / distance)
+                row = round(y0 + (y - y0) * offset / distance)
+                grid[row][column] = "."
+        marks.append((x, y))
+        previous = (x, y)
+    # Draw points last so connecting segments can never erase a recorded observation.
+    for x, y in marks:
+        grid[y][x] = "*"
+    if not finite:
+        label = "No finite measurements" if points else "No measurements"
+        start = (_CHART_COLUMNS - len(label)) // 2
+        grid[_CHART_ROWS // 2][start:start + len(label)] = label
+    lines = []
+    for row, cells in enumerate(grid):
+        if not finite or (not span and row != _CHART_ROWS // 2):
+            label = " " * _AXIS_COLUMNS
+        else:
+            fraction = row / (_CHART_ROWS - 1)
+            value = ((1 - fraction) * upper + fraction * lower) * scale if span else low
+            label = _axis_label(value, span / (_CHART_ROWS - 1) * scale if span else None)
+        lines.append(label + " |" + "".join(cells) + "|")
+    lines.append(" " * (_AXIS_COLUMNS + 1) + "+" + "-" * _CHART_COLUMNS + "+")
+    ticks = [" "] * _CHART_COLUMNS
+    for step in sorted({0, completed_steps // 2, completed_steps}):
+        text = str(step)
+        x = min(round(step / max(completed_steps, 1) * (_CHART_COLUMNS - 1)), _CHART_COLUMNS - len(text))
+        ticks[x:x + len(text)] = text
+    lines.append(" " * (_AXIS_COLUMNS + 2) + "".join(ticks) + " ")
+    return lines
+
+
+# Both panels retain the full run; each Y axis spans only that curve's observed finite range.
+def _loss_charts(curves, completed_steps):
+    left = _loss_panel(curves["training"], completed_steps)
+    right = _loss_panel(curves["evaluation"], completed_steps)
+    panel_width = _AXIS_COLUMNS + _CHART_COLUMNS + 3
+    lines = ["TRAINING LOSS".center(panel_width) + "  " + "EVALUATION LOSS".center(panel_width)]
+    lines.extend(a + "  " + b for a, b in zip(left, right))
+    lines.append("Optimizer step".center(100))
+    lines.append("* recorded value; dots connect observations; independent Y scales.")
+    return lines
+
+
+# Every evaluation and completion shows factual comparisons and full-history loss charts.
+def render_metrics_report(report, *, final=False):
+    title = "Final metrics" if final else "Metrics"
+    lines = [f"{title} — step {report['completed_steps']}/{report['planned_steps']}"]
     rows = report["recap"] if final else report["recent_recap"]
-    lines.extend(_recap_lines(rows, final=final, width=width))
+    lines.extend(_recap_lines(rows, final=final, width=100))
     lines.append("")
-    for paragraph in report["final_interpretation"] if final else report["interpretation"]:
-        lines.extend(_assessment_paragraph(paragraph, width))
-    for issue in report["issues"]:
-        lines.extend(_assessment_paragraph(issue["message"], width))
-        if issue.get("support"):
-            lines.extend(_assessment_paragraph(issue["support"], width, "    "))
+    lines.extend(_loss_charts(report["curves"], report["completed_steps"]))
+    for notice in report["notices"]:
+        lines.extend(_assessment_paragraph(notice, 100))
     return "\n".join(lines) + "\n"
 
 

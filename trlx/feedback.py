@@ -193,7 +193,10 @@ class Collector:
             try:
                 identity = (f"{event['level']} {event['logger']}: "
                             if "logger" in event and "level" in event else "")
-                text = f"[{source}] {identity}{event['message']}\n"
+                # A report is one display event, but every persisted line retains
+                # its source so multiline charts remain attributable in the log.
+                text = "".join(f"[{source}] {identity}{line}\n"
+                               for line in event["message"].split("\n"))
                 self.log_file.write(text.encode("utf-8"))
                 self.log_file.flush()
                 if self.display and display:
@@ -359,8 +362,16 @@ class View:
             entry[0] += 1
             entry[1].add(source)
             return
-        if kind in ("raw", "library"):
-            self.write(f"[{source}] {message}")
+        if kind in ("raw", "library", "metric_report"):
+            # CLI TrlxError diagnostics use this exact command prefix on stderr;
+            # ordinary library text must not be classified by error-like words.
+            prefix, separator, _ = message.partition(":")
+            command = prefix.split()
+            if kind == "raw" and separator and len(command) == 2 and command[0] == "trlx":
+                self.write(f"[{source}] {message}")
+                return
+            # Emit complete reports together; prefixes would change chart widths.
+            self.write(message)
             return
         label = event.get("label")
         if kind == "start":

@@ -196,8 +196,8 @@ class AssessmentLifecycleTests(unittest.TestCase):
             callback.on_log(args, state, control, logs={"loss": .9})
             self.assertEqual(emitted.call_count, 2)
         first, second = [call.args[0] for call in emitted.call_args_list]
-        self.assertIn("Assessment", first)
-        self.assertIn("Assessment", second)
+        self.assertIn("Metrics", first)
+        self.assertIn("Metrics", second)
         contexts = [item["quality"] for item in callback.records if item.get("quality")]
         self.assertEqual([item["phase"] for item in contexts], ["baseline", "scheduled", "completion"])
         self.assertEqual(callback.records[-2]["log"]["quality/accuracy"], 1.0)
@@ -237,11 +237,32 @@ class AssessmentLifecycleTests(unittest.TestCase):
             before = path.read_bytes()
             callback.on_train_end(cfg.args, state, control)
             callback.on_train_end(cfg.args, state, control)
-        text = [call.args[0] for call in emitted.call_args_list if call.args[0].startswith("Final assessment")]
+        text = [call.args[0] for call in emitted.call_args_list if call.args[0].startswith("Final metrics")]
         self.assertEqual(len(text), 1)
         self.assertIn(str(2.28), text[0])
+        self.assertIn("quality/accuracy", text[0])
         self.assertNotIn("--assessment-window", text[0])
         self.assertNotIn("--assessment-min-evaluations", text[0])
         self.assertIsNone(callback._file)
         self.assertEqual(path.read_bytes(), before)
         self.assertFalse(control.should_training_stop)
+
+    # A resumed report includes retained baseline/history, not just this process's new observations.
+    def test_resumed_report_keeps_full_history(self):
+        from trlx import assessment
+
+        retained = [record(0, evaluation=True), record(1), record(5, evaluation=True)]
+        self.write_records(metrics.FILENAME, retained)
+        callback = metrics.callback_class()(self.directory, SimpleNamespace(), "sft", {})
+        args = SimpleNamespace()
+        state = SimpleNamespace(global_step=10, max_steps=40, epoch=.25, num_train_epochs=1.)
+        control = SimpleNamespace(should_training_stop=False)
+        self.addCleanup(callback.on_train_end, args, state, control)
+        with patch.object(assessment, "run_metrics_report", wraps=assessment.run_metrics_report) as report, \
+             patch("builtins.print"):
+            callback.on_log(args, state, control, logs={"eval_loss": 1.2})
+            callback.on_evaluate(args, state, control)
+        history = report.call_args.args[1]
+        self.assertEqual(history[:3], retained)
+        self.assertEqual(history[-1]["step"], 10)
+        self.assertEqual(len(history), 4)
