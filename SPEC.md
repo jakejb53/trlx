@@ -318,19 +318,23 @@ checkpoint selection. Scores do not establish an optimal learning rate or univer
 At training completion, the same analysis produces a final report after any enabled quality checks.
 Reports appear inline and in `log.txt`; `metrics.jsonl` remains authoritative. Assessment performs no
 additional evaluation. Completion alone does not establish model improvement.
-Displayed assessments lead with a recommendation and supporting measurements. Warnings retain their
-qualifications and metric evidence without hiding the overall outcome. The final assessment states the
-whole-run outcome and next action; a completed run is never told to continue its planned evaluations.
+Runtime assessments present metric comparisons followed by deterministic interpretation, without
+routine tuning advice, generic disclaimers, or checkpoint-selection prose. Intermediate reports emphasize
+the previous-to-latest evaluation interval; final reports recap initial-to-latest training loss, evaluation
+loss, and relevant method/quality scores, with measured steps and absolute/relative changes (accuracy in
+percentage points). Training loss starts at the first logged value, never the whole-run average;
+evaluation starts at the step-zero baseline. Missing/non-finite endpoints remain unavailable and stale
+measurements retain their steps. Interpret effectiveness, diminishing gains, deterioration, conflicting
+scores, and possible overfitting from aligned training/evaluation trends. Preserve concrete failures and
+warnings with their evidence. Learning-rate context appears only when relevant to that interpretation.
 Fresh runs with ordinary evaluation enabled first evaluate at step zero, before any optimizer update,
 using the trainer's normal held-out data and scoring. `eval_on_start` is managed by trlx, not a setting.
 The baseline stays in `metrics.jsonl` across resume; resumed runs do not replace it. Independent quality
 checks do not repeat their own baseline round for this ordinary step-zero evaluation.
-Loss assessments compare against the step-zero baseline and distinguish the best measured step from
-available checkpoints verified through saved metadata and weights. An unevaluated endpoint is not a
-measured final result. A small loss decrease alone does not establish success or justify longer training;
-rising training loss alone does not identify its cause. Advice never automatically halves learning rate,
-doubles steps, or adds an epoch, and does not imply an optimal numeric setting from trend direction.
-Duration changes may change the scheduler trajectory even with the same configured learning rate.
+An unevaluated endpoint is not a measured final result. Two observations establish a difference,
+not a sustained trend. A small loss decrease alone does not establish success; rising training loss
+alone does not identify its cause. Assessment neither diagnoses an optimal learning rate nor prescribes
+duration changes from trend direction.
 
 `[assessment]` requires `quality_checks`,
 `quality_preset`, `quality_dataset` (both nullable using `"None"`), `quality_max_length` (at least 2),

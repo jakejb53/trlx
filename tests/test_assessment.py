@@ -412,7 +412,11 @@ class AssessmentCoverageAndCompletion(unittest.TestCase):
         self.assertEqual(result["evaluation_metrics"], {"eval_loss": 2.28})
         self.assertEqual(result["train_loss"], 2.197)
         self.assertEqual(result["evaluation_records"], 1)
-        self.assertIn("baseline", result["final_decision"].lower())
+        recap = {row["metric"]: row for row in result["recap"]}
+        self.assertIsNone(recap["eval_loss"]["initial"])
+        self.assertEqual(recap["loss"]["initial"], 2.2)
+        self.assertEqual(recap["loss"]["latest"], 2.2)
+        self.assertEqual(recap["loss"]["initial_kind"], "first logged")
         self.assertEqual(records, original)
 
     # Final and live assessment share method-specific runtime evidence.

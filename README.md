@@ -213,23 +213,23 @@ assessment at training completion. Findings distinguish
 measurements, preparation projections, and heuristics, and include their evidence. They never change
 training settings, stop a run, or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
 runtime notices appear inline and in the TUI log pane. Training metrics remain in `metrics.jsonl`.
-Startup shows only problems, including disabled evaluation. Runtime assessments separate overall
-outcome from recent behavior using up to the last three measured intervals and their actual step spacing.
-They retain the full history, qualify sparse or noisy evidence, and preserve earlier non-finite failures
-after recovery. Warmup, recorded learning rates, and conflicting objective or independent quality scores
-qualify the advice. Reports remain advisory, appear in `log.txt`, and add no evaluation passes.
-Reports keep the outcome visible alongside warnings and their metric evidence. Completion guidance
-does not tell a finished run to continue or automatically prescribe a learning-rate reduction or longer budget.
+Startup shows only problems, including disabled evaluation. Runtime assessments present metric recaps
+and deterministic interpretation of learning effectiveness, diminishing gains, deterioration, and possible
+overfitting. Intermediate reports emphasize the latest evaluation interval; final reports compare initial
+and latest training/evaluation losses and relevant method/quality scores. Measurements retain their steps;
+training loss starts at the first logged value, not the whole-run average. Accuracy changes use percentage
+points. Missing values and non-finite failures remain explicit. Reports preserve conflicting signals and
+warnings, omit routine tuning advice and generic disclaimers, appear in `log.txt`, and add no evaluation passes.
 Line-mode metric tables retain their column headers, use `Change` for differences, and omit repeated legend sentences.
 They show `training_loss`, the latest measured `eval_loss`, and its `eval_step` together, including on
 resume and in `trlx show`. Blank evaluation fields mean no evaluation has been recorded yet.
 
 When ordinary evaluation is enabled, fresh runs measure the starting model at step zero using the
 same held-out data as later evaluations. This adds one evaluation pass; resume keeps the original
-baseline. No extra flag or quality benchmark is needed. Final guidance compares with that baseline,
-reports the best measured step separately from verified available checkpoints, and identifies missing
-endpoint evaluation. Numerical changes alone do not establish useful improvement or an optimal setting;
-changing duration can also change the learning-rate schedule.
+baseline. No extra flag or quality benchmark is needed. Final evaluation comparisons use that baseline;
+missing baselines and measurements before the final step are identified. Recent trends use up to three
+measured intervals and actual step spacing. Learning-rate context appears only when relevant to the
+interpretation; metric changes do not automatically prescribe settings.
 
 Training and `check` require the following explicit block, supplied by new `trlx init` configurations.
 Add it to older configs; initialization with `--force` replaces the entire file.

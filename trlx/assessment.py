@@ -2,7 +2,7 @@
 
 No rule owns training control or mutates its inputs. Projected schedules are
 estimates until the trainer constructs its dataloader; observed metric changes
-are evidence for comparison experiments, not causal diagnoses or optimal values.
+support interpretation of learning, not causal diagnoses or optimal settings.
 """
 
 import copy
@@ -158,9 +158,10 @@ def run_assessment(method, records, args, *, completed_steps, planned_steps, ran
     report = {"method": method, "completed_steps": completed_steps, "planned_steps": planned_steps,
             "train_loss": final_train, "evaluation_records": len(evaluation), "evaluation_metrics": eval_values,
             "evaluation_step": latest_eval["step"] if latest_eval else None,
-            "metric_records": len(records), "nonfinite_observations": len(invalid), "findings": findings}
-    report.update(_run_recommendation(method, findings, training, evaluation, args, completed_steps, planned_steps,
-                                     records, checkpoint_steps, checkpoint_errors))
+            "metric_records": len(records), "nonfinite_observations": len(invalid), "findings": findings,
+            "checkpoint_steps": list(checkpoint_steps) if checkpoint_steps is not None else None}
+    report.update(_run_interpretation(method, findings, training, evaluation, args, completed_steps, planned_steps,
+                                     records, ranges, checkpoint_errors))
     return report
 
 
@@ -192,90 +193,130 @@ def _recent_text(trend, label):
             f"{direction}.{shape}")
 
 
-# Schedule observations qualify attribution; changing duration can also change the LR trajectory.
+# A recap preserves the actual first/last records, including failed endpoints.
+# Filtering to finite values here would silently substitute older successful measurements.
+def _metric_row(records, key, label, *, percentage=False, higher=False, previous_step=None):
+    observations = {r["step"]: r for r in records if (key in r.get("log", {}) or r.get("quality"))
+                    and _finite(r.get("step"))}
+    ordered = [observations[step] for step in sorted(observations)]
+    initial = ordered[0] if ordered else None
+    if previous_step is not None:
+        initial = next((r for r in reversed(ordered) if r["step"] <= previous_step), None)
+    latest = ordered[-1] if ordered else None
+    # Failed quality rounds retain diagnostics but never contribute a score.
+    def value(record):
+        if record is None or (record.get("quality") and record["quality"].get("status") != "complete"):
+            return None
+        raw = record.get("log", {}).get(key)
+        return raw if _finite(raw) else None
+
+    first, last = value(initial), value(latest)
+    delta = last - first if (first is not None and last is not None
+                            and initial["step"] != latest["step"]) else None
+    return dict(metric=key, label=label, initial=first, latest=last,
+                initial_step=initial["step"] if initial else None,
+                latest_step=latest["step"] if latest else None,
+                initial_kind="baseline" if initial and ((initial.get("eval") and initial["step"] == 0) or
+                             initial.get("quality", {}).get("phase") == "baseline") else "first logged",
+                delta=delta, relative_change=delta / abs(first) if delta is not None and first else None,
+                percentage=percentage, higher=higher)
+
+
+# Built-in semantics determine interpretation; arbitrary configured metrics remain factual rows.
+def _metric_comparisons(method, records, ranges):
+    training = [r for r in records if not r.get("eval") and not r.get("quality")]
+    evaluation = [r for r in records if r.get("eval") and not r.get("quality")]
+    eval_steps = sorted({r["step"] for r in evaluation if _finite(r.get("step"))})
+    previous = eval_steps[-2] if len(eval_steps) > 1 else None
+    definitions = [("loss", "Training loss", training, False, False),
+                   ("eval_loss", "Evaluation loss", evaluation, False, False)]
+    extras = {
+        "sft": [("mean_token_accuracy", "Training token accuracy", True, True),
+                ("eval_mean_token_accuracy", "Evaluation token accuracy", True, True)],
+        "dpo": [("eval_rewards/accuracies", "Evaluation preference accuracy", True, True),
+                ("rewards/accuracies", "Training preference accuracy", True, True),
+                ("rewards/margins", "Training reward margin", False, True)],
+        "kto": [("rewards/chosen", "Chosen reward", False, True),
+                ("rewards/rejected", "Rejected reward", False, False), ("kl", "KL", False, False)],
+        "reward": [("eval_accuracy", "Evaluation accuracy", True, True),
+                   ("accuracy", "Training accuracy", True, True)],
+        "grpo": [("reward", "Training reward", False, True), ("reward_std", "Reward spread", False, False),
+                 ("kl", "KL", False, False)],
+        "rloo": [("reward", "Training reward", False, True), ("reward_std", "Reward spread", False, False),
+                 ("kl", "KL", False, False)],
+        "distillation": [],
+    }
+    for key, label, percentage, higher in extras[method]:
+        source = evaluation if key.startswith("eval_") else training
+        if any(key in r.get("log", {}) for r in source):
+            definitions.append((key, label, source, percentage, higher))
+    known = {entry[0] for entry in definitions}
+    for key in ranges or {}:
+        # Infrastructure and step diagnostics are already in the live metrics tables.
+        if key in known or key in {"grad_norm", "learning_rate", "epoch", "num_tokens"} or key.startswith("quality/"):
+            continue
+        source = evaluation if key.startswith("eval_") else training
+        if any(key in r.get("log", {}) for r in source):
+            definitions.append((key, key, source, False, False))
+    quality = [r for r in records if r.get("quality")]
+    if quality:
+        active = quality[-1]["quality"].get("series")
+        matching = [r for r in quality if r["quality"].get("series") == active]
+        baseline = next((r for r in matching if r["quality"].get("phase") == "baseline"
+                         and r["quality"].get("status") == "complete"), None)
+        # A new unmatched series cannot borrow an older series' baseline.
+        source = matching[matching.index(baseline):] if baseline else [matching[-1]]
+        # Quality writers also emit sample/token accounting; those are not performance scores.
+        keys = sorted({key for r in source for key in r.get("log", {}) if key.startswith("quality/")
+                       and key not in {"quality/rows", "quality/tokens", "quality/scored_rows"}
+                       and not key.startswith("quality/metric_rows/")
+                       and not (key.startswith("quality/class/") and key.endswith("/rows"))})
+        for key in keys:
+            name = key.removeprefix("quality/")
+            percent = (name in {"accuracy", "exact_match", "token_f1", "json_valid", "required_fields_present"}
+                       or (name.startswith("class/") and name.endswith("/accuracy")))
+            definitions.append((key, key, source, percent, name in QUALITY_HIGHER_BETTER))
+    recap, recent = [], []
+    for key, label, source, percentage, higher in definitions:
+        row = _metric_row(source, key, label, percentage=percentage, higher=higher)
+        if key.startswith("eval_") and row["initial_step"] != 0:
+            row.update(initial=None, initial_step=None, delta=None, relative_change=None)
+        if key.startswith("quality/") and (not source or source[0].get("quality", {}).get("phase") != "baseline"):
+            row.update(initial=None, initial_step=None, delta=None, relative_change=None)
+        recap.append(row)
+        recent.append(_metric_row(source, key, label, percentage=percentage, higher=higher,
+                                  previous_step=previous) if previous is not None else dict(row))
+    return recap, recent
+
+
+# A single observed difference can establish improvement without establishing a sustained trend.
+def _movement(row):
+    if row is None or row["delta"] is None:
+        return None
+    tolerance = 1e-6 * max(1., abs(row["initial"]), abs(row["latest"]))
+    delta = row["delta"] if row["higher"] else -row["delta"]
+    return "improved" if delta > tolerance else "worsened" if delta < -tolerance else "unchanged"
+
+
+# Schedule context is relevant to warmup or changing progress, never appended to every report.
 def _schedule_context(training, args, completed_steps, planned_steps, trend):
     warmup = args.get_warmup_steps(planned_steps)
     if warmup and completed_steps <= warmup:
-        return f"Warmup is still active ({completed_steps}/{warmup} steps); post-warmup behavior is not established."
-    recent = trend.get("post_warmup", trend["recent"]) if trend else {}
-    start = recent.get("step_range", [0])[0]
+        return f"Warmup is still active ({completed_steps}/{warmup} steps); these measurements cover learning-rate ramp-up."
+    if not trend or not (trend["diminishing"] or trend["direction"] in {"up", "flat", "mixed"}):
+        return None
+    start = trend.get("post_warmup", trend["recent"]).get("step_range", [0])[0]
     rates = [p for p in _series(training, "learning_rate") if start <= p[0] <= completed_steps]
-    if len(rates) < 2:
+    if len(rates) < 2 or all(p[1] == rates[0][1] for p in rates):
         return None
     first, last = rates[0][1], rates[-1][1]
-    if all(point[1] == first for point in rates):
-        return f"Recorded learning rate stayed at {_display_number(last)} over steps {rates[0][0]}–{rates[-1][0]}."
     if first == last:
-        return (f"Recorded learning rate varied from {_display_number(min(p[1] for p in rates))} to "
-                f"{_display_number(max(p[1] for p in rates))} over steps {rates[0][0]}–{rates[-1][0]}; "
-                "equal endpoints do not establish a constant schedule.")
+        return (f"During this recent behavior, recorded learning rate varied between "
+                f"{_display_number(min(p[1] for p in rates))} and {_display_number(max(p[1] for p in rates))} "
+                f"over steps {rates[0][0]}–{rates[-1][0]}.")
     direction = "fell" if last < first else "rose"
-    return (f"Recorded learning rate {direction} from {_display_number(first)} to {_display_number(last)} "
-            f"over steps {rates[0][0]}–{rates[-1][0]}; loss changes alone cannot separate schedule effects from learning saturation.")
-
-
-# Only the latest quality series is relevant to current advice; failed rounds never become scores.
-def _quality_context(records, findings, completed_steps):
-    rounds = [r for r in records if r.get("quality")]
-    if not rounds:
-        return [], False, False, False
-    latest = rounds[-1]
-    context = latest["quality"]
-    series = context.get("series")
-    if context.get("status") != "complete":
-        return [f"Independent quality check at step {latest['step']} was incomplete or failed; no current quality conclusion."], False, False, True
-    comparisons = [f for f in findings if f["code"] == f"quality_baseline:{series}"]
-    if not comparisons:
-        return [f"Independent quality at step {latest['step']} has no completed comparison against a matching baseline yet."], False, False, True
-    evidence = comparisons[-1]["evidence"]
-    higher, lower = QUALITY_HIGHER_BETTER, QUALITY_LOWER_BETTER
-    lines, better, worse = [], False, False
-    for key, change in evidence["metrics"].items():
-        name = key.removeprefix("quality/")
-        if name not in higher | lower:
-            continue
-        gain = change["delta"] if name in higher else -change["delta"]
-        # This tolerance prevents numerical artifacts, not a claim of practical significance.
-        tolerance = 1e-6 * max(1., abs(change["baseline"]), abs(change["current"]))
-        better |= gain > tolerance
-        worse |= gain < -tolerance
-        # Aggregate judge score is accompanied only by criteria that moved against it.
-        if name.startswith("judge_") and name != "judge_score" and gain >= 0:
-            continue
-        lines.append(f"{key}, steps {evidence['baseline_step']}–{evidence['current_step']}: "
-                     f"{_change_text(change['baseline'], change['current'])}." +
-                     (" Model judgment." if name.startswith("judge_") else ""))
-    current_findings = [f for f in findings if f.get("evidence", {}).get("series") == series]
-    worse |= any(f["code"].startswith("quality_deterioration:") for f in current_findings)
-    stale = latest["step"] != completed_steps
-    if stale:
-        lines.append(f"Independent quality was last measured at step {latest['step']}, not step {completed_steps}.")
-    return lines, better, worse, stale or not lines
-
-
-# Availability is supplied from verified artifacts, never inferred from an evaluation step number.
-def _checkpoint_context(points, checkpoint_steps, checkpoint_errors):
-    if not points:
-        return None
-    best = min(points, key=lambda p: p[1])
-    text = f"Lowest measured evaluation loss: {_display_number(best[1])} at step {best[0]}."
-    if best[0] == 0:
-        text += " This is the starting-model baseline."
-    elif checkpoint_steps is None:
-        text += " Saved checkpoint availability has not been checked."
-    elif best[0] in checkpoint_steps:
-        text += f" Checkpoint-{best[0]} is available for comparison."
-    else:
-        text += " No verified saved checkpoint is available at that measured step."
-    if checkpoint_steps is not None:
-        candidates = [p for p in points if p[0] in checkpoint_steps]
-        if candidates:
-            saved = min(candidates, key=lambda p: p[1])
-            if saved[0] != best[0]:
-                text += f" Lowest measured loss among available checkpoints: {_display_number(saved[1])} at step {saved[0]}."
-    if checkpoint_errors:
-        text += " Checkpoint inspection: " + "; ".join(checkpoint_errors)
-    return text
+    return (f"During this recent behavior, recorded learning rate {direction} from {_display_number(first)} "
+            f"to {_display_number(last)} over steps {rates[0][0]}–{rates[-1][0]}.")
 
 
 # Keep finding qualifications and attach the measurements that support each warning.
@@ -306,116 +347,209 @@ def _assessment_issues(findings, active_quality_series):
         elif evidence.get("observations") and code == "final_numerical_issues":
             support = "; ".join(f"{r['metric']}={r['value']} at step {r['step']}" for r in evidence["observations"])
         issues.append({"code": code.split(":")[0],
-                       "message": finding["summary"] + (" " + finding["recommendation"] if finding.get("recommendation") else ""),
+                       "message": finding["summary"],
                        "support": support})
     issues.sort(key=lambda item: 0 if item["code"] == "final_numerical_issues" else 1)
     return issues
 
 
-# Compare total outcome, recent trajectory, and independent evidence before choosing an action.
-# No observed slope identifies an optimal duration or learning-rate value.
-def _run_recommendation(method, findings, training, evaluation, args, completed_steps, planned_steps,
-                        records, checkpoint_steps, checkpoint_errors):
+# Interpret endpoint comparisons in the units and objective that produced them.
+# No endpoint difference establishes a cause or an optimal hyperparameter.
+def _interpret_metrics(method, rows):
+    metrics = {row["metric"]: row for row in rows}
     fixed = method in {"sft", "dpo", "kto", "reward"}
     key = "eval_loss" if fixed else "loss" if method == "distillation" else "reward"
-    label = "evaluation loss" if fixed else "distillation training loss" if method == "distillation" else "training reward"
+    primary = metrics.get(key)
+    movement = _movement(primary)
+    lines = []
+    auxiliary = {"sft": "eval_mean_token_accuracy", "dpo": "eval_rewards/accuracies",
+                 "reward": "eval_accuracy"}.get(method)
+    score_row = metrics.get(auxiliary)
+    # Corroboration requires the same observed interval, not a carried-forward old score.
+    aligned = primary and score_row and all(primary[field] == score_row[field]
+                                           for field in ("initial_step", "latest_step"))
+    score = _movement(score_row) if aligned else None
+    if primary and primary["initial_step"] == primary["latest_step"] == 0:
+        lines.append("Starting-model baseline recorded; no training updates are represented in this comparison.")
+    elif primary and primary["initial_step"] is not None and primary["initial_step"] == primary["latest_step"]:
+        lines.append(f"Only one {primary['label'].lower()} measurement is available for this comparison, "
+                     f"at step {primary['latest_step']}.")
+    elif fixed:
+        if movement == "improved":
+            if score == "worsened":
+                lines.append("The evaluation measures conflict: loss improved while accuracy worsened, "
+                             "so the lower objective loss did not translate into more correct predictions.")
+            elif method == "sft":
+                lines.append("Lower held-out loss means better prediction of evaluation text: learning extended "
+                             "beyond the training examples." + (" Higher token accuracy corroborates that improvement."
+                             if score == "improved" else ""))
+            else:
+                lines.append("The held-out training objective improved." + (
+                    " Evaluation accuracy improved too, showing better discrimination on the evaluated examples."
+                    if score == "improved" else ""))
+        elif movement == "worsened":
+            lines.append("Held-out loss worsened: the latest model fits the evaluation objective less well." + (
+                " Accuracy improved, so the evaluation measures conflict." if score == "improved" else ""))
+        elif movement == "unchanged":
+            lines.append("Held-out loss is unchanged within numerical tolerance; the compared updates produced "
+                         "no measurable loss improvement." + (
+                         " Accuracy improved despite the unchanged loss." if score == "improved" else ""))
+        elif primary and primary["latest"] is not None:
+            lines.append("The recorded initial evaluation loss is non-finite; a loss change cannot be calculated."
+                         if primary["initial_step"] is not None else
+                         "No step-zero evaluation baseline was recorded; the recap cannot measure baseline-to-latest learning.")
+        else:
+            lines.append("Evaluation loss is unavailable for this comparison.")
+    elif movement is not None:
+        if method == "distillation":
+            lines.append({"improved": "Distillation loss improved: the student better fits the sampled teacher objective.",
+                          "worsened": "Distillation loss worsened: the student fits the sampled teacher objective less well.",
+                          "unchanged": "Distillation loss is unchanged within numerical tolerance."}[movement])
+        else:
+            lines.append({"improved": "Training reward increased: generated responses scored better under the configured reward.",
+                          "worsened": "Training reward decreased: generated responses scored worse under the configured reward.",
+                          "unchanged": "Training reward is unchanged within numerical tolerance."}[movement])
+    # Quality comparisons have their own matching series and measurement steps.
+    quality = [row for row in rows if row["metric"].startswith("quality/") and
+               row["metric"].removeprefix("quality/") in QUALITY_HIGHER_BETTER | QUALITY_LOWER_BETTER]
+    quality_moves = {_movement(row) for row in quality} - {None}
+    # Different quality schedules can leave older comparisons in the same report.
+    # Only matching intervals support a cross-objective conflict, not stale scores.
+    aligned_quality = {_movement(row) for row in quality if primary and all(
+        row[field] == primary[field] for field in ("initial_step", "latest_step"))} - {None}
+    if "improved" in quality_moves and "worsened" in quality_moves:
+        lines.append("Independent quality results conflict: some measured task scores improved while others deteriorated.")
+    elif "worsened" in quality_moves:
+        lines.append("Independent task scores deteriorated" + (
+            " despite improvement in the training objective; the results conflict because objective gains did not carry over to these tasks."
+            if movement == "improved" and "worsened" in aligned_quality else " on the matching quality benchmark."))
+    elif "improved" in quality_moves:
+        lines.append("Independent task scores improved" + (
+            " while the primary objective worsened; the two evaluations give conflicting signals."
+            if movement == "worsened" and "improved" in aligned_quality else ", showing gains on the matching quality benchmark."))
+    if any(row["metric"].startswith("quality/judge_") and row["latest"] is not None for row in quality):
+        lines.append("The quality scores above are model-judge ratings.")
+    train_movement = _movement(metrics.get("loss"))
+    if fixed and train_movement == "improved" and movement is None:
+        lines.append("Training loss decreased: fitting improved on training batches; held-out improvement was not measured.")
+    elif fixed and train_movement == "worsened" and movement == "improved":
+        lines.append("Training and held-out losses moved in opposite directions: loss increased on training "
+                     "batches while evaluation predictions improved.")
+    return lines
+
+
+# Describe measured trajectory separately from endpoints; no interpolation or causal attribution.
+def _trajectory_context(points, trend, *, higher=False, label="evaluation loss"):
+    if len(points) < 3 or trend is None:
+        return []
+    recent = trend.get("post_warmup", trend["recent"])
+    start, end = recent.get("step_range", [points[0][0], points[-1][0]])
+    direction = trend["direction"]
+    favorable = "up" if higher else "down"
+    lines = []
+    if direction == favorable and trend["diminishing"]:
+        lines.append(f"Over steps {start}–{end}, {label} kept improving with diminishing gains per optimizer update: "
+                     "later updates contributed progressively less improvement.")
+    elif direction == "flat":
+        lines.append(f"Over steps {start}–{end}, {label} plateaued within numerical tolerance; "
+                     "additional updates produced no measurable progress on this metric.")
+    elif direction == "mixed":
+        lines.append(f"Over steps {start}–{end}, {label} fluctuated rather than improving consistently.")
+    elif direction in {"up", "down"} and direction != favorable:
+        lines.append(f"Over steps {start}–{end}, {label} repeatedly worsened; recent updates lost performance "
+                     "on this metric.")
+    elif direction == favorable:
+        lines.append(f"Over steps {start}–{end}, {label} improved across successive evaluations; "
+                     "learning was still progressing at the latest measurement.")
+        # Two intervals establish a change in improvement rate, not sustained diminishing returns.
+        intervals = trend["intervals"]
+        if len(intervals) >= 2 and abs(intervals[-1]["rate"]) < abs(intervals[-2]["rate"]):
+            lines.append("The latest interval added less improvement per optimizer update than the preceding interval.")
+    return lines
+
+
+# Compare work before/after an actually evaluated midpoint, not an invented half-run result.
+def _efficiency_context(points, *, higher=False, label="evaluation loss"):
+    if len(points) < 3:
+        return None
+    sign = 1 if higher else -1
+    gains = [sign * (b[1] - a[1]) for a, b in zip(points, points[1:])]
+    total = sign * (points[-1][1] - points[0][1])
+    if total <= 0 or any(gain < 0 for gain in gains):
+        return None
+    midpoint = (points[0][0] + points[-1][0]) / 2
+    pivot = next((p for p in reversed(points[1:-1]) if p[0] <= midpoint), None)
+    if pivot is None:
+        return None
+    early = sign * (pivot[1] - points[0][1])
+    late = sign * (points[-1][1] - pivot[1])
+    early_rate = early / (pivot[0] - points[0][0])
+    late_rate = late / (points[-1][0] - pivot[0])
+    if early_rate <= late_rate:
+        return None
+    return (f"Steps {points[0][0]}–{pivot[0]} accounted for {100 * early / total:.3g}% of the observed "
+            f"{label} improvement. The remaining {points[-1][0] - pivot[0]} updates contributed "
+            f"{100 * late / total:.3g}%; improvement per update was lower in that later period.")
+
+
+# One factual report supplies separate interval and whole-run interpretations without tuning advice.
+def _run_interpretation(method, findings, training, evaluation, args, completed_steps, planned_steps,
+                        records, ranges, checkpoint_errors):
+    recap, recent = _metric_comparisons(method, records, ranges)
+    live = _interpret_metrics(method, recent)
+    final = _interpret_metrics(method, recap)
+    fixed = method in {"sft", "dpo", "kto", "reward"}
+    key = "eval_loss" if fixed else "loss" if method == "distillation" else "reward"
+    label = "evaluation loss" if fixed else "distillation loss" if method == "distillation" else "training reward"
     source = evaluation if fixed else training
     points = _series(source, key)
     trend = _metric_trend(source, key, args.get_warmup_steps(planned_steps))
-    baseline = next((p for p in points if p[0] == 0), None) if fixed else None
-    quality, quality_better, quality_worse, quality_uncertain = _quality_context(records, findings, completed_steps)
-    quality_records = [r for r in records if r.get("quality")]
-    active_series = quality_records[-1]["quality"].get("series") if quality_records else None
-    issues = _assessment_issues(findings, active_series)
-    direction = trend["direction"] if trend else "unknown"
-    recent = _recent_text(trend, label) if points else None
-    outcome = f"No finite {label} measurements were recorded."
-    if points:
-        first = baseline or points[0]
-        prefix = "Baseline → latest" if baseline else "First → latest measured"
-        outcome = f"{prefix} {label}, steps {first[0]}–{points[-1][0]}: {_change_text(first[1], points[-1][1])}."
-        if len(points) == 1:
-            outcome = f"{'Baseline' if baseline else 'First measured'} {label}: {_display_number(first[1])} at step {first[0]}."
-        if fixed and baseline is None:
-            outcome += " No step-zero baseline; total training gain is unknown."
+    # Invalid observations stay visible and cannot be skipped to claim uninterrupted progress.
+    uninterrupted = not any(key in r.get("log", {}) and not _finite(r["log"][key]) for r in source)
+    trajectory = _trajectory_context(points, trend, higher=key == "reward", label=label)
+    if uninterrupted:
+        live.extend(trajectory)
+        final.extend(trajectory)
+        efficiency = _efficiency_context(points, higher=key == "reward", label=label)
+        if efficiency:
+            final.append(efficiency)
+        if fixed and len(points) >= 3 and all(b[1] < a[1] for a, b in zip(points, points[1:])):
+            final.append("Held-out loss improved at every recorded evaluation; no evaluation-loss reversal "
+                         "indicating overfitting appeared in those measurements.")
     schedule = _schedule_context(training, args, completed_steps, planned_steps, trend)
-    checkpoint = _checkpoint_context(points, checkpoint_steps, checkpoint_errors) if fixed else None
-    # A conflicting training trend remains visible even when it is not an instability warning.
-    for finding in findings:
-        if finding["code"] == "rising_training_loss" and finding["severity"] == "info":
-            recent = (recent + " " if recent else "") + _recent_text(finding["evidence"]["loss"], "training loss")
-            recent += " Training and held-out losses describe different samples; these measurements do not establish instability."
-    # Auxiliary held-out scores can disagree with the optimized loss; never hide that conflict.
-    auxiliary = {"sft": "eval_mean_token_accuracy", "dpo": "eval_rewards/accuracies", "reward": "eval_accuracy"}.get(method)
-    auxiliary_worse = False
-    if auxiliary:
-        scores = _series(evaluation, auxiliary)
-        if len(scores) > 1:
-            quality.append(f"{auxiliary}, steps {scores[0][0]}–{scores[-1][0]}: {_change_text(scores[0][1], scores[-1][1])}.")
-            auxiliary_worse = scores[-1][1] < scores[0][1]
-    final = "Review held-out task results before deciding whether to train longer."
-    live = "Monitor the next evaluation before changing settings; recent evidence is limited."
-    if fixed and points:
-        improved = baseline is not None and points[-1][1] < baseline[1]
-        if len(points) == 1 and baseline is not None:
-            live = "Starting-model baseline recorded. Training can begin."
-            final = "Only the starting-model baseline was measured. Evaluate the trained model before judging the result."
-        elif direction == "up":
-            live = final = "Recent held-out loss is rising. Compare measured earlier results before extending training."
-        elif direction == "down":
-            live = "Held-out loss is falling. Monitor its measured gains through the planned evaluations."
-            if trend["diminishing"]:
-                final = "Held-out loss improved with diminishing recent gains. Retain the result for task-level comparison; do not extend on these gains alone."
-            else:
-                final = ("Held-out loss improved. Compare the measured recent gain against task quality before choosing a longer-run experiment; "
-                         "the slope alone does not establish a useful extension.")
-        elif direction in {"flat", "mixed"}:
-            live = "Recent held-out results are flat or mixed. Inspect the measurements before changing settings."
-            final = "Retain the measured results for comparison; there is no clear recent loss trend supporting longer training."
-        if baseline is None:
-            final = "No starting-model baseline is available. Compare measured checkpoints, but do not infer total training improvement or an optimal duration."
-        elif len(points) > 1 and not improved:
-            final = "The latest held-out loss did not beat the starting model. Compare the baseline and earlier measured results; do not increase duration on this loss evidence."
-    elif not fixed:
-        live = f"Assess task scores alongside {label}; its movement alone does not justify changing settings."
-        final = f"Compare held-out task results before selecting a model or increasing duration; {label} alone is insufficient."
-    elif (quality_records and quality_records[-1]["quality"].get("status") == "complete" and
-          any(f["code"] == f"quality_baseline:{active_series}" for f in findings)):
-        live = final = "Use the independent quality measurements for task-specific comparison; ordinary evaluation loss is unavailable."
-    else:
-        live = final = "No completed held-out comparison is available. Obtain suitable evaluation before judging improvement or increasing duration."
-    # Quality regressions override favorable optimization metrics, without declaring their cause.
-    if quality_worse or auxiliary_worse:
-        live = final = "The measured scores conflict or show deterioration. Compare the affected task results and available checkpoints before extending training."
-    elif quality_better and not quality_uncertain:
-        if fixed and (direction == "up" or (baseline is not None and points[-1][1] > baseline[1])):
-            live = final = "Independent task scores improved while held-out loss deteriorated recently or relative to baseline. Compare both objectives before choosing a checkpoint or changing settings."
-        else:
-            live = "Independent task scores improved. Monitor the planned evaluations and the size of further gains."
-            final = "Independent task scores improved. Retain the measured result for comparison; further training is an experiment, not an established benefit."
-    if quality_uncertain and quality_records:
-        final += " Obtain a complete matching quality comparison for the endpoint before relying on task-quality advice."
-    if any(issue["code"] == "final_numerical_issues" for issue in issues):
-        live = final = "Investigate the recorded non-finite metrics before relying on this run's results; later finite values do not erase the failure."
-    # Independent scores cannot make an unmeasured ordinary-loss endpoint appear measured.
-    if fixed and points and points[-1][0] != completed_steps:
-        final += f" Ordinary loss at step {completed_steps} was not evaluated; measure it before drawing a final loss conclusion."
-    # Training completion and premature exit never emit advice to wait for another in-run evaluation.
+    if schedule:
+        live.append(schedule)
+        final.append(schedule)
+    quality = [r for r in records if r.get("quality")]
+    active_series = quality[-1]["quality"].get("series") if quality else None
+    if quality:
+        latest = quality[-1]
+        if latest["quality"].get("status") != "complete":
+            notice = f"Independent quality check at step {latest['step']} was incomplete or failed."
+            live.append(notice)
+            final.append(notice)
+        elif not any(f["code"] == f"quality_baseline:{active_series}" for f in findings):
+            notice = f"Independent quality at step {latest['step']} has no completed matching baseline comparison."
+            live.append(notice)
+            final.append(notice)
+        if latest["step"] != completed_steps:
+            notice = f"Independent quality was last measured at step {latest['step']}; step {completed_steps} was not measured."
+            live.append(notice)
+            final.append(notice)
+    # Endpoint dates make missing final measurements visible rather than implying they are current.
+    loss_row = next(row for row in recap if row["metric"] == "eval_loss")
+    if loss_row["latest_step"] is not None and loss_row["latest_step"] != completed_steps:
+        notice = f"Ordinary loss at step {completed_steps} was not evaluated; the last recorded value is at step {loss_row['latest_step']}."
+        live.append(notice)
+        final.append(notice)
     if completed_steps < planned_steps:
-        final = f"Training ended at {completed_steps}/{planned_steps} updates. Review the stopping reason before increasing the budget. " + final
-    else:
-        live = final
-    if completed_steps == 0 and planned_steps > 0 and baseline is not None:
-        live = "Starting-model baseline recorded. Training can begin." if not issues else live
-    if completed_steps >= planned_steps or "experiment" in final:
-        scheduler = getattr(args, "lr_scheduler_type", None)
-        scheduler = getattr(scheduler, "value", scheduler)
-        if scheduler not in (None, "constant", "constant_with_warmup"):
-            schedule = (schedule + " " if schedule else "") + "Changing duration can change the learning-rate trajectory even with the same configured learning rate."
-    support = " ".join(part for part in (outcome, recent, schedule) if part)
-    return {"decision": live, "support": support, "issues": issues,
-            "final_decision": final, "final_support": support, "final_issues": list(issues),
-            "outcome": outcome, "recent": recent, "schedule": schedule, "quality": quality, "checkpoint": checkpoint}
+        final.insert(0, f"Training ended at {completed_steps}/{planned_steps} planned updates.")
+    issues = _assessment_issues(findings, active_series)
+    if checkpoint_errors:
+        issues.append(dict(code="checkpoint_inspection", message="Checkpoint inspection failed.",
+                           support="; ".join(checkpoint_errors)))
+    return dict(recap=recap, recent_recap=recent, interpretation=live,
+                final_interpretation=final, issues=issues)
 
 
 # Report method-specific contracts of the installed trainers, not universal tuning targets.
@@ -818,7 +952,7 @@ def runtime_findings(method, records, *, warmup_steps=0, ranges=None):
                 evidence["aligned_training_fit"] = {**_observations(aligned_points), **aligned_fit,
                                                     "evaluation_step_range": interval}
                 findings.append(_finding("possible_overfitting", "warning", "heuristic",
-                                         "Training loss is falling within the recent evaluation interval while held-out loss is rising.", evidence,
+                                         "Possible overfitting: training loss is falling while held-out loss is rising over the same interval; additional fitting is reducing held-out performance.", evidence,
                                          "Check that evaluation data and masking/objective remain comparable; compare shorter training or stronger regularization in another run. This pattern can indicate overfitting."))
             else:
                 findings.append(_finding("worsening_evaluation", "warning", "heuristic",

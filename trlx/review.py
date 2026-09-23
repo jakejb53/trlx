@@ -622,60 +622,57 @@ def render_assessment(report, cfg, *, will_publish=True, width=None):
     return "\n".join(lines) + "\n"
 
 
-# Recommendations refer to existing controls; values still come from the completed trainer.
-_RUN_ASSESSMENT_SETTINGS = {
-    "evaluation_missing": "eval_strategy",
-    "evaluation_sparse": "eval_strategy eval_steps",
-    "rising_training_loss": "learning_rate",
-    "possible_overfitting": "num_train_epochs max_steps",
-    "worsening_evaluation": "num_train_epochs max_steps",
-    "generation_cutoffs": "max_completion_length",
-    "constant_reward": "temperature num_generations",
-    "zero_variance_groups": "temperature num_generations",
-    "quality_deterioration": "num_train_epochs max_steps",
-    "final_numerical_issues": "bf16 fp16",
-}
+# Render the same recorded endpoints in a wide table or lossless labelled rows.
+def _recap_lines(rows, *, final, width):
+    headers = ("Metric", "Initial" if final else "Previous", "Latest", "Change")
+    cells = []
+    for row in rows:
+        percentage = row["percentage"]
+        # Labels retain the measured step even when the recorded value is unavailable.
+        def endpoint(value, step, kind=None):
+            text = "unavailable" if value is None else f"{100 * value:.2f}%" if percentage else f"{value:.6g}"
+            if step is not None:
+                text += f" (step {step}" + (f", {kind}" if kind else "") + ")"
+            return text
+
+        initial = endpoint(row["initial"], row["initial_step"], row["initial_kind"] if final else None)
+        latest = endpoint(row["latest"], row["latest_step"])
+        delta = row["delta"]
+        if delta is None:
+            change = "unavailable"
+        elif percentage:
+            change = f"{100 * delta:+.2f} pp"
+        else:
+            change = f"{delta:+.6g}"
+            if row["relative_change"] is not None:
+                change += f" ({100 * row['relative_change']:+.3g}%)"
+        cells.append((row["label"], initial, latest, change))
+    widths = [max(len(header), *(len(row[i]) for row in cells)) for i, header in enumerate(headers)]
+    if sum(widths) + 8 <= width:
+        return ["  " + "  ".join(cell.ljust(size) for cell, size in zip(row, widths)).rstrip()
+                for row in [headers, *cells]]
+    lines = []
+    for label, initial, latest, change in cells:
+        lines.extend(_assessment_paragraph(label + ":", width))
+        for header, value in zip(headers[1:], (initial, latest, change)):
+            lines.extend(_assessment_paragraph(f"{header}: {value}", width, "    "))
+    return lines
 
 
-# Keep the measured outcome visible even when warnings qualify the next action.
+# Runtime reports state measured changes and their interpretation; they never prescribe settings.
 def render_run_assessment(report, args, *, final=False, width=None):
     width = width if width is not None else shutil.get_terminal_size().columns
-    available = {item.key: item for item in options.settings(report["method"])}
     title = "Final assessment" if final else "Assessment"
-    lines = [f"{title} — step {report['completed_steps']}"]
-    issues = report["final_issues"] if final else report["issues"]
-    decision = report["final_decision"] if final else report["decision"]
-    lines.extend(_assessment_paragraph(decision, width))
-    evidence = [report.get(key) for key in ("outcome", "recent", "schedule")]
-    evidence.extend(report.get("quality", []))
-    evidence.append(report.get("checkpoint"))
-    # Older reports carry only combined support; new reports provide each part
-    # separately so the same outcome is not printed twice.
-    if not any(evidence):
-        evidence.append(report["final_support"] if final else report["support"])
-    for paragraph in evidence:
-        if paragraph:
-            lines.extend(_assessment_paragraph(paragraph, width))
-    for issue in issues:
+    lines = _assessment_paragraph(f"{title} — step {report['completed_steps']}", width, "")
+    rows = report["recap"] if final else report["recent_recap"]
+    lines.extend(_recap_lines(rows, final=final, width=width))
+    lines.append("")
+    for paragraph in report["final_interpretation"] if final else report["interpretation"]:
+        lines.extend(_assessment_paragraph(paragraph, width))
+    for issue in report["issues"]:
         lines.extend(_assessment_paragraph(issue["message"], width))
         if issue.get("support"):
             lines.extend(_assessment_paragraph(issue["support"], width, "    "))
-        flags = []
-        for key in _RUN_ASSESSMENT_SETTINGS.get(issue["code"], "").split():
-            setting = available.get(key)
-            if setting is None or not hasattr(args, key):
-                continue
-            if key == "eval_steps" and args.eval_strategy != "steps":
-                continue
-            if key == "logging_steps" and args.logging_strategy != "steps":
-                continue
-            if key == "num_train_epochs" and args.max_steps > 0 or key == "max_steps" and args.max_steps <= 0:
-                continue
-            value = _redact(_plain(getattr(args, key)), key)
-            argument = _argument(setting, value)
-            flags.append(argument if argument is not None else f"{setting.flag}: automatic/unset")
-        if flags:
-            lines.extend(_assessment_paragraph("Current: " + "; ".join(flags), width))
     return "\n".join(lines) + "\n"
 
 
