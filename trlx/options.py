@@ -174,6 +174,11 @@ def add_training_options(parser, method_name):
         ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source; implies --no-split and conflicts with explicit --split; omit for training only."),
     ]
     if method_name == "sft":
+        wrapper.append(("--include-reasoning", "dataset.include_reasoning", bool,
+                        "Include a nonempty separate reasoning column in raw messages rows with exactly "
+                        "one assistant response. Map in memory to the validated template's native field "
+                        "for training, evaluation, and replay. Missing or conflicting reasoning, rendering "
+                        "failures, and reasoning excluded by the loss mask are errors. Default: disabled."))
         wrapper.append(("--synthetic-dataset-eval", "dataset.synthetic_dataset_eval", bool,
                         "CPT text only: generate one summary per source row with the starting model; "
                         "use --max-length as the generation limit. Train on all source rows, skip startup "

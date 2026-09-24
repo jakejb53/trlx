@@ -48,6 +48,7 @@ from trlx import (
     preflight,
     quality,
     ranges,
+    reasoning,
     render_lines,
     review,
     run_dirs,
@@ -136,6 +137,7 @@ def _assess(cfg, gpu_count, *, progress=None):
             activity.note("synthetic evaluation: startup eval-data inspection skipped; summaries belong to this run")
     primary_rows = train_set.num_rows
     train_set = _mix_replay(cfg, train_set, progress=progress)
+    train_set, eval_set = reasoning.prepare(cfg, processor, train_set, eval_set, progress=progress)
     profile = data_profile.scan(cfg, processor, train_set, eval_set, primary_rows=primary_rows, progress=progress)
     teacher_metadata = None
     teacher_findings = []
@@ -500,6 +502,7 @@ def _train_worker(args):
                 no_staging=getattr(args, "no_staging", False), progress=progress,
             )
     train_set = _mix_replay(cfg, train_set, progress=progress)
+    train_set, eval_set = reasoning.prepare(cfg, processor, train_set, eval_set, progress=progress)
     if rank == 0:
         evaluation = ("synthetic evaluation rows pending generation" if synthetic_callback is not None
                       else f"{eval_set.num_rows if eval_set is not None else 0} evaluation rows")
@@ -598,6 +601,7 @@ def check(args):
     train_set, eval_set = data_load.load(cfg.dataset, cfg.method.dataset_format, progress=progress,
                                         seed=cfg.args.data_seed if cfg.args.data_seed is not None else cfg.args.seed)
     train_set = _mix_replay(cfg, train_set, progress=progress)
+    train_set, eval_set = reasoning.prepare(cfg, processor, train_set, eval_set, progress=progress)
     report = preflight.Report()
     # The Trainer creates output_dir on construction. check writes nothing,
     # so a directory that did not exist before is removed if still empty.

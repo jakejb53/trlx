@@ -101,6 +101,8 @@ def _selected(cfg):
         selected.add("data_seed")
     if cfg.method.name == "sft":
         selected.add("dataset.synthetic_dataset_eval")
+        if cfg.dataset.include_reasoning:
+            selected.add("dataset.include_reasoning")
     for feature, details in _FEATURES.items():
         if getattr(cfg.args, feature, False):
             selected.update(details)

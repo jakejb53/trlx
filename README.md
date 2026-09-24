@@ -138,6 +138,15 @@ Conversational columns contain lists of `{role, content}` messages. An SFT JSONL
 {"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4"}]}
 ```
 
+For SFT datasets with a separate `reasoning` column, add `--include-reasoning` to train on it.
+Each train/evaluation/replay row must contain nonempty reasoning and exactly one assistant response,
+at the end of its text conversation. The model's response metadata and chat template determine the
+native field; unsupported templates, conflicting fields, or reasoning lost to masks/truncation/packing
+are errors. Tokenizer offset mappings are required for validation. Source datasets are not rewritten.
+The option defaults off, persists as `[dataset].include_reasoning`, and can be overridden with
+`--no-include-reasoning`. Use `--assistant-only-loss` independently to exclude user tokens from loss.
+Already embedded native reasoning continues through the normal template path without this option.
+
 The normal command for SFT, DPO, KTO, or reward-model training is:
 
 ```sh

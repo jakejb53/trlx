@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, and runtime metrics/loss charts complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, and SFT reasoning inclusion complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -601,6 +601,25 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   quality callbacks, feedback, review, training supervision, and imports. Independent review findings
   were fixed and re-reviewed with no remaining runtime blockers. No live training was run;
   operator configurations and existing runs were unchanged.
+
+### SFT reasoning inclusion (complete, 2026-09-23)
+
+- `--include-reasoning` / `[dataset].include_reasoning` maps a nonempty separate `reasoning`
+  string into the sole final assistant message's native field. Default disabled;
+  `--no-include-reasoning` overrides configuration. Snapshots preserve the setting.
+- Shared in-memory preparation covers training, evaluation, and replay in startup inspection,
+  workers, and `check`. Response metadata or TRL's recognized-template schema supplies the field;
+  rendering, token offsets, masks, truncation, and packing must preserve supervision of all reasoning
+  tokens. Ambiguous rows, conflicting fields, prepared masks, and unsupported mappings fail explicitly.
+  Full-sequence versus assistant-only loss remains an independent choice.
+- Added `trlx/reasoning.py` and `tests/test_reasoning.py`; updated configuration, CLI options,
+  tuning review, training integration, model template-override metadata, resolution tests,
+  `SPEC.md`, and `README.md`.
+- Validation: 194 tests passed across reasoning, resolution, review, imports, data profiling,
+  preflight profiling, training supervision, preflight, data loading, and CLI. Synthetic templates
+  exercised actual TRL preparation and loss masks. Independent review findings were fixed and
+  re-reviewed with no remaining blockers. No live training was run; source datasets, operator
+  configurations, and existing runs were unchanged.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

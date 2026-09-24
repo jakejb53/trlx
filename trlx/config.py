@@ -95,6 +95,7 @@ class DatasetSpec:
     eval_source: DatasetRef | None
     synthetic_dataset_eval: bool = False
     shuffle_eval_data: bool = False
+    include_reasoning: bool = False
 
     # Synthetic rows are generated after model placement, but evaluation is enabled now.
     @property
@@ -207,11 +208,17 @@ def from_document(doc, method_name, fsdp=None, path="run.toml"):
             raise TrlxError(f"{path}: {method.name} requires a [{needed}] block")
 
     dataset = _dataset(path, blocks["dataset"])
+    if dataset.include_reasoning and method_name != "sft":
+        raise TrlxError(f"{path}: include_reasoning is supported only for sft")
+    if dataset.include_reasoning and dataset.synthetic_dataset_eval:
+        raise TrlxError(f"{path}: include_reasoning cannot be combined with synthetic_dataset_eval")
     if dataset.synthetic_dataset_eval and method_name != "sft":
         raise TrlxError(f"{path}: synthetic_dataset_eval is supported only for sft with CPT text data")
     # Parsed before the TRL config: the KL term decides a forced field there.
     replay = _replay(path, blocks["replay"]) if "replay" in blocks else None
     args = _build_args(path, method, top, dataset.eval_enabled, fsdp, replay)
+    if dataset.include_reasoning and (args.dataset_kwargs or {}).get("skip_prepare_dataset"):
+        raise TrlxError(f"{path}: include_reasoning requires preparation of raw messages rows")
     if dataset.synthetic_dataset_eval:
         if isinstance(args.max_length, bool) or not isinstance(args.max_length, int) or args.max_length < 1:
             raise TrlxError(f"{path}: --synthetic-dataset-eval requires a positive --max-length")
@@ -701,8 +708,10 @@ def _dataset(path, table):
     if "train" in table:
         raise TrlxError(f"{path}: [dataset].train is no longer supported; use eval_fraction (for example 0.1)")
     _check_keys(path, block, table, ("split", "dataset", "eval_fraction", "dataset_train", "dataset_eval",
-                                    "synthetic_dataset_eval", "shuffle_eval_data"))
+                                    "synthetic_dataset_eval", "shuffle_eval_data", "include_reasoning"))
     split = _require(path, block, table, "split", bool)
+    include_reasoning = (_require(path, block, table, "include_reasoning", bool)
+                         if "include_reasoning" in table else False)
     shuffle = _require(path, block, table, "shuffle_eval_data", bool) if "shuffle_eval_data" in table else False
     if shuffle and not split:
         raise TrlxError(f"{path}: shuffle_eval_data requires the percentage split (split = true)")
@@ -722,7 +731,7 @@ def _dataset(path, table):
         if "dataset" not in table:
             raise TrlxError(f"{path}: [dataset] requires 'dataset'; supply --dataset or save the source in the config")
         return DatasetSpec(True, dataset_ref(path, "[dataset].dataset", table["dataset"]), float(fraction), None,
-                           shuffle_eval_data=shuffle)
+                           shuffle_eval_data=shuffle, include_reasoning=include_reasoning)
     for wrong in ("dataset", "eval_fraction"):
         if wrong in table:
             raise TrlxError(f"{path}: [dataset] split = false uses 'dataset_train' and 'dataset_eval'; '{wrong}' is for split = true")
@@ -730,7 +739,7 @@ def _dataset(path, table):
         raise TrlxError(f"{path}: [dataset] requires 'dataset_train'; supply --dataset or --dataset-train")
     eval_ref = dataset_ref(path, "[dataset].dataset_eval", table["dataset_eval"]) if "dataset_eval" in table else None
     return DatasetSpec(False, dataset_ref(path, "[dataset].dataset_train", table["dataset_train"]),
-                       None, eval_ref, synthetic)
+                       None, eval_ref, synthetic, include_reasoning=include_reasoning)
 
 
 # PEFT validates field combinations after nullable CLI/config values are decoded.

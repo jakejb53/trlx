@@ -120,6 +120,15 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
   - Optional `shuffle_eval_data = true` / `--shuffle-eval-data` selects that same evaluation count randomly without replacement instead of from the end. Only valid with `split = true`. Uses `data_seed` when set, otherwise `seed`; preserves source order within both disjoint sets. Omission or false retains the end split.
   - `split = false`: `dataset_train`, optional `dataset_eval`. Without `dataset_eval` or synthetic evaluation, evaluation is disabled and `eval_*` fields are rejected.
   - Key mismatch with `split` is an error.
+  - SFT `--include-reasoning` / `include_reasoning = true` maps each nonempty separate `reasoning`
+    string into the native reasoning field of its sole, final assistant message. Requires raw text
+    `messages` rows in training, evaluation, and replay. Conflicting native reasoning is rejected.
+    Tokenizer response metadata or TRL's recognized-template schema supplies the field; the effective
+    training template must render it and supervise all reasoning tokens after truncation/packing.
+    Unsupported mappings, ambiguous conversations, and discarded reasoning fail with row context.
+    Transformation is in memory and shared by startup, workers, and `check`; snapshots retain the flag.
+    Default disabled; `--no-include-reasoning` disables a configured value. Loss mode remains separately
+    controlled. Synthetic CPT evaluation and skipped preparation are incompatible.
   - CLI `--dataset` selects the primary source in either mode. Explicit `--dataset-train` or `--dataset-eval` implies `--no-split`, overriding the configured split default; explicit `--split` conflicts. `--no-split` removes fractional-split keys and inherited shuffle selection; without a separate or synthetic evaluation source, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
   - SFT CPT `text` rows only: `--synthetic-dataset-eval` / `synthetic_dataset_eval = true` replaces configured splitting and evaluation sources, trains on all primary rows, and retains the evaluation schedule. Explicit CLI `--split`, `--eval-fraction`, or `--dataset-eval` conflicts. The resolved snapshot uses `split = false`, `dataset_train`, and `synthetic_dataset_eval`.
     Generate one factual prose summary per primary row from the loaded model after distributed placement, before the step-zero evaluation or optimizer updates; replay rows are excluded. The positive `max_length` is also the generated-token limit. Full prompts must fit the model context; no silent truncation. Model response templates separate reasoning; unparsed tagged responses, empty summaries, and token-limit exhaustion without EOS are fatal.

@@ -100,6 +100,48 @@ class Resolution(unittest.TestCase):
         with self.assertRaisesRegex(TrlxError, "shuffle_eval_data must be bool"):
             self.load()
 
+    # Reasoning is opt-in, and explicit CLI disabling overrides the persisted dataset flag.
+    def test_include_reasoning_default_and_overrides(self):
+        self.assertFalse(self.load().dataset.include_reasoning)
+        self.assertTrue(self.load(extra=["--include-reasoning"]).dataset.include_reasoning)
+        self.source["dataset"]["include_reasoning"] = True
+        self.assertTrue(self.load().dataset.include_reasoning)
+        self.assertFalse(self.load(extra=["--no-include-reasoning"]).dataset.include_reasoning)
+
+    # The same setting reaches workers for percentage splits and separate sources without changing loss.
+    def test_include_reasoning_snapshot_round_trip(self):
+        for extra in ([], ["--no-split", "--dataset-eval", "eval.jsonl"]):
+            with self.subTest(extra=extra):
+                cfg = self.load(extra=["--include-reasoning", *extra])
+                self.assertFalse(cfg.args.assistant_only_loss)
+                snapshot = self.snapshot(cfg)
+                self.assertIs(snapshot["dataset"]["include_reasoning"], True)
+                with patch.object(config, "_read_toml", return_value=snapshot):
+                    worker = config.load("snapshot", "sft", resolved=True)
+                self.assertEqual(worker.dataset, cfg.dataset)
+                self.assertEqual(preflight.compare_snapshot(cfg.document, snapshot, "single"), [])
+
+    # Reject incompatible preparation before data/model access, including config-only entry points.
+    def test_include_reasoning_rejects_incompatible_settings(self):
+        for extra, message in (
+            (["--synthetic-dataset-eval"], "cannot be combined"),
+            (["--dataset-kwargs", '{skip_prepare_dataset = true}'], "raw messages"),
+        ):
+            with self.subTest(extra=extra), self.assertRaisesRegex(TrlxError, message):
+                self.load(extra=["--include-reasoning", *extra])
+        self.source["dataset"]["include_reasoning"] = True
+        with self.assertRaisesRegex(TrlxError, "supported only for sft"):
+            self.load("dpo")
+
+    # Bool-like strings and numbers must not silently opt a run into reasoning training.
+    def test_include_reasoning_requires_bool_in_both_split_modes(self):
+        for extra in ([], ["--no-split"]):
+            for value in ("yes", 1, None):
+                with self.subTest(extra=extra, value=value):
+                    self.source["dataset"]["include_reasoning"] = value
+                    with self.assertRaisesRegex(TrlxError, "include_reasoning must be bool"):
+                        self.load(extra=extra)
+
     # Exercise the actual assessment loading boundary, including data_seed=0 precedence.
     def test_assessment_passes_effective_split_seed(self):
         for extra, expected in ((["--seed", "17"], 17), (["--seed", "17", "--data-seed", "0"], 0)):

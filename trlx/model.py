@@ -140,12 +140,18 @@ def assessment_processor(cfg, *, progress=None):
             path = pathlib.Path(template)
             if path.is_file() and path.suffix in {".jinja", ".j2"}:
                 processor.chat_template = path.read_text(encoding="utf-8")
+                if getattr(cfg.dataset, "include_reasoning", False):
+                    # A replacement template cannot inherit a field mapping from the base template.
+                    # Reasoning validation resolves a recognized schema for this effective template.
+                    tokenizer.response_template = None
             else:
                 from transformers import AddedToken, AutoTokenizer
                 from trl.chat_template_utils import clone_chat_template
 
                 source = AutoTokenizer.from_pretrained(template)
                 processor.chat_template = source.get_chat_template()
+                if getattr(cfg.dataset, "include_reasoning", False):
+                    tokenizer.response_template = getattr(source, "response_template", None)
                 tokenizer.add_tokens([token for token in source.added_tokens_decoder.values()
                                       if token.content not in tokenizer.get_vocab()])
                 tokenizer.eos_token = source.eos_token
