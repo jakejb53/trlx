@@ -132,10 +132,25 @@ def _validate_row(row, messages, field, processor, template, args, number, *, re
         if max(start, answer_start) < min(end, answer_end):
             raise ValueError("reasoning boundary overlaps the final answer")
     # Offset mappings prove which tokens came from this field, even if its text also occurs in the question.
-    tokenizer_kwargs = dict(kwargs.pop("tokenizer_kwargs", None) or {})
-    tokenizer_kwargs["return_offsets_mapping"] = True
-    encoded = _tokenize(processor, messages, **kwargs, tokenizer_kwargs=tokenizer_kwargs,
-                        return_assistant_tokens_mask=args.assistant_only_loss)
+    if isinstance(processor, ProcessorMixin):
+        processor_kwargs = copy.deepcopy(kwargs.pop("processor_kwargs", None) or {})
+        processor_kwargs["return_offsets_mapping"] = True
+        # ProcessorMixin consumes offsets when constructing assistant_masks. Retrieve them
+        # separately through its supported API, then require identical tokens before combining.
+        encoded = _tokenize(processor, messages, **kwargs, processor_kwargs=copy.deepcopy(processor_kwargs),
+                            return_assistant_tokens_mask=False)
+        if args.assistant_only_loss:
+            masked = _tokenize(processor, messages, **kwargs, processor_kwargs=copy.deepcopy(processor_kwargs),
+                               return_assistant_tokens_mask=True)
+            if masked["input_ids"] != encoded["input_ids"]:
+                raise ValueError("processor produced different tokens for offsets and assistant masks; "
+                                 "cannot verify reasoning supervision")
+            encoded["assistant_masks"] = masked.get("assistant_masks")
+    else:
+        tokenizer_kwargs = dict(kwargs.pop("tokenizer_kwargs", None) or {})
+        tokenizer_kwargs["return_offsets_mapping"] = True
+        encoded = _tokenize(processor, messages, **kwargs, tokenizer_kwargs=tokenizer_kwargs,
+                            return_assistant_tokens_mask=args.assistant_only_loss)
     ids = encoded["input_ids"]
     offsets = encoded.get("offset_mapping")
     if offsets is None or len(offsets) != len(ids):
