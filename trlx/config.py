@@ -96,6 +96,7 @@ class DatasetSpec:
     synthetic_dataset_eval: bool = False
     shuffle_eval_data: bool = False
     include_reasoning: bool = False
+    reasoning_only_loss: bool = False
 
     # Synthetic rows are generated after model placement, but evaluation is enabled now.
     @property
@@ -397,6 +398,12 @@ def _method_document(path, method_name):
 
 # One override path serves fresh runs and resumes; absent CLI values change nothing.
 def _apply_overrides(doc, overrides, path):
+    # An explicit narrower objective enables reasoning even over an inherited
+    # disabled setting; an explicit CLI contradiction must never be hidden.
+    if overrides.get("dataset.reasoning_only_loss") is True:
+        if overrides.get("dataset.include_reasoning") is False:
+            raise TrlxError(f"{path}: --reasoning-only-loss conflicts with --no-include-reasoning")
+        overrides["dataset.include_reasoning"] = True
     source = overrides.pop("dataset.source", None)
     if source is not None and any(key in overrides for key in ("dataset.dataset", "dataset.dataset_train")):
         raise TrlxError(f"{path}: --dataset cannot be combined with another explicit training source")
@@ -708,10 +715,19 @@ def _dataset(path, table):
     if "train" in table:
         raise TrlxError(f"{path}: [dataset].train is no longer supported; use eval_fraction (for example 0.1)")
     _check_keys(path, block, table, ("split", "dataset", "eval_fraction", "dataset_train", "dataset_eval",
-                                    "synthetic_dataset_eval", "shuffle_eval_data", "include_reasoning"))
+                                    "synthetic_dataset_eval", "shuffle_eval_data", "include_reasoning",
+                                    "reasoning_only_loss"))
     split = _require(path, block, table, "split", bool)
+    reasoning_only_loss = (_require(path, block, table, "reasoning_only_loss", bool)
+                           if "reasoning_only_loss" in table else False)
     include_reasoning = (_require(path, block, table, "include_reasoning", bool)
                          if "include_reasoning" in table else False)
+    if reasoning_only_loss:
+        if "include_reasoning" in table and not include_reasoning:
+            raise TrlxError(f"{path}: reasoning_only_loss requires include_reasoning; "
+                            "cannot combine with include_reasoning = false")
+        # Persist the implication so workers and resume compare the same inputs.
+        table["include_reasoning"] = include_reasoning = True
     shuffle = _require(path, block, table, "shuffle_eval_data", bool) if "shuffle_eval_data" in table else False
     if shuffle and not split:
         raise TrlxError(f"{path}: shuffle_eval_data requires the percentage split (split = true)")
@@ -731,7 +747,8 @@ def _dataset(path, table):
         if "dataset" not in table:
             raise TrlxError(f"{path}: [dataset] requires 'dataset'; supply --dataset or save the source in the config")
         return DatasetSpec(True, dataset_ref(path, "[dataset].dataset", table["dataset"]), float(fraction), None,
-                           shuffle_eval_data=shuffle, include_reasoning=include_reasoning)
+                           shuffle_eval_data=shuffle, include_reasoning=include_reasoning,
+                           reasoning_only_loss=reasoning_only_loss)
     for wrong in ("dataset", "eval_fraction"):
         if wrong in table:
             raise TrlxError(f"{path}: [dataset] split = false uses 'dataset_train' and 'dataset_eval'; '{wrong}' is for split = true")
@@ -739,7 +756,8 @@ def _dataset(path, table):
         raise TrlxError(f"{path}: [dataset] requires 'dataset_train'; supply --dataset or --dataset-train")
     eval_ref = dataset_ref(path, "[dataset].dataset_eval", table["dataset_eval"]) if "dataset_eval" in table else None
     return DatasetSpec(False, dataset_ref(path, "[dataset].dataset_train", table["dataset_train"]),
-                       None, eval_ref, synthetic, include_reasoning=include_reasoning)
+                       None, eval_ref, synthetic, include_reasoning=include_reasoning,
+                       reasoning_only_loss=reasoning_only_loss)
 
 
 # PEFT validates field combinations after nullable CLI/config values are decoded.

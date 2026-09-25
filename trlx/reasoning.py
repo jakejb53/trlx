@@ -2,6 +2,7 @@
 
 import collections
 import copy
+import re
 
 from datasets import Dataset
 from transformers import ProcessorMixin
@@ -77,10 +78,8 @@ def _map_row(row, field):
     return messages
 
 
-# Probe the field's exact rendered location, then verify real tokens and the selected loss mask.
-def _validate_row(row, messages, field, processor, template, args, number):
-    kwargs = {"chat_template": template, **data_profile._template_kwargs(row)}
-    rendered = _render(processor, messages, kwargs)
+# A field probe locates the actual instance even when identical text also occurs in the prompt.
+def _field_span(messages, field, rendered, processor, kwargs):
     probe = copy.deepcopy(messages)
     marker = "TRLX_REASONING_FIELD_PROBE"
     while marker in rendered:
@@ -93,9 +92,45 @@ def _validate_row(row, messages, field, processor, template, args, number):
     end = len(rendered) - len(suffix) if suffix else len(rendered)
     start = len(prefix)
     if not rendered.startswith(prefix) or not rendered.endswith(suffix):
-        raise ValueError("chat template changes surrounding text with the reasoning; mapping is not verifiable")
-    if rendered[start:end].strip() != row["reasoning"].strip():
-        raise ValueError("chat template discards or rewrites the supplied reasoning")
+        raise ValueError(f"chat template changes surrounding text with assistant.{field}; mapping is not verifiable")
+    if rendered[start:end].strip() != messages[-1][field].strip():
+        raise ValueError(f"chat template discards or rewrites assistant.{field}")
+    return start, end
+
+
+# Native metadata owns delimiters. A terminating reasoning boundary must be learnable, not guessed.
+def _reasoning_bounds(rendered, start, end, definition):
+    opening = re.escape(definition["open"]) if isinstance(definition.get("open"), str) else definition.get("open_pattern")
+    closing = re.escape(definition["close"]) if isinstance(definition.get("close"), str) else definition.get("close_pattern")
+    if not isinstance(opening, str) or not isinstance(closing, str):
+        raise ValueError("reasoning-only loss requires explicit opening and closing boundaries in response_template")
+    try:
+        candidates = [match for match in re.finditer(opening, rendered)
+                      if match.end() <= start and not rendered[match.end():start].strip()]
+        suffix = rendered[end:]
+        whitespace = len(suffix) - len(suffix.lstrip())
+        close = re.match(closing, suffix[whitespace:])
+    except re.error as error:
+        raise ValueError(f"invalid reasoning boundary pattern: {error}") from error
+    if len(candidates) != 1 or close is None or not close.group().strip():
+        raise ValueError("reasoning boundaries are missing or ambiguous in the rendered assistant response")
+    if not candidates[0].group().strip():
+        # Parser lookaheads can rely on a separate start anchor; they do not identify opening tokens.
+        raise ValueError("reasoning-only loss requires a nonempty native opening boundary")
+    return candidates[0].start(), end + whitespace + close.end()
+
+
+# Probe the field's exact rendered location, then verify real tokens and the selected loss mask.
+def _validate_row(row, messages, field, processor, template, args, number, *, reasoning_only=False):
+    kwargs = {"chat_template": template, **data_profile._template_kwargs(row)}
+    rendered = _render(processor, messages, kwargs)
+    start, end = _field_span(messages, field, rendered, processor, kwargs)
+    if reasoning_only:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        start, end = _reasoning_bounds(rendered, start, end, tokenizer.response_template["fields"][field])
+        answer_start, answer_end = _field_span(messages, "content", rendered, processor, kwargs)
+        if max(start, answer_start) < min(end, answer_end):
+            raise ValueError("reasoning boundary overlaps the final answer")
     # Offset mappings prove which tokens came from this field, even if its text also occurs in the question.
     tokenizer_kwargs = dict(kwargs.pop("tokenizer_kwargs", None) or {})
     tokenizer_kwargs["return_offsets_mapping"] = True
@@ -109,13 +144,18 @@ def _validate_row(row, messages, field, processor, template, args, number):
     if mask is None or len(mask) != len(ids):
         raise ValueError("chat template does not supply the assistant loss mask")
     markers = [number if left < end and right > start else 0 for left, right in offsets]
+    if reasoning_only and any(flag and (left < start or right > end)
+                              for flag, (left, right) in zip(markers, offsets)):
+        # A token is indivisible: never supervise part of an answer or prompt to include a delimiter.
+        raise ValueError("a token crosses the reasoning-only loss boundary")
     covered = set()
     for flag, (left, right) in zip(markers, offsets):
         if flag:
             covered.update(range(max(start, left), min(end, right)))
     if not any(markers) or any(not rendered[i].isspace() and i not in covered for i in range(start, end)):
         raise ValueError("tokenization discards part of the reasoning")
-    labels = [token if active else -100 for token, active in zip(ids, mask)]
+    labels = [token if active and (not reasoning_only or flag) else -100
+              for token, active, flag in zip(ids, mask, markers)]
     if any(flag and (index == 0 or labels[index] == -100) for index, flag in enumerate(markers)):
         raise ValueError("loss mask excludes reasoning tokens")
     return {"input_ids": ids, "labels": labels, "_reasoning_rows": markers}
@@ -150,6 +190,7 @@ def _validate_retention(records, args, split):
 def prepare(cfg, processor, train_set, eval_set, *, progress=None):
     if not getattr(cfg.dataset, "include_reasoning", False):
         return train_set, eval_set
+    reasoning_only = getattr(cfg.dataset, "reasoning_only_loss", False)
     try:
         view, template, field = _resolve(cfg, processor, progress)
     except (ValueError, TypeError, KeyError, AttributeError, OSError) as error:
@@ -165,11 +206,17 @@ def prepare(cfg, processor, train_set, eval_set, *, progress=None):
             def convert(row, index):
                 try:
                     messages = _map_row(row, field)
-                    records.append(_validate_row(row, messages, field, view, template, cfg.args, index + 1))
+                    tokens = _validate_row(row, messages, field, view, template, cfg.args, index + 1,
+                                           reasoning_only=reasoning_only)
+                    records.append(tokens)
                 except (ValueError, TypeError, KeyError, AttributeError, NotImplementedError) as error:
                     raise TrlxError(f"--include-reasoning: {split} row {index + 1}: {error}") from error
                 activity.advance()
-                return {"messages": messages}
+                # Explicit labels are authoritative in TRL. It still owns truncation and packing.
+                result = {"messages": messages}
+                if reasoning_only:
+                    result.update(input_ids=tokens["input_ids"], labels=tokens["labels"])
+                return result
 
             converted = dataset.map(convert, with_indices=True, keep_in_memory=True, load_from_cache_file=False)
             try:

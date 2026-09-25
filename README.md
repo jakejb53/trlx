@@ -147,6 +147,15 @@ The option defaults off, persists as `[dataset].include_reasoning`, and can be o
 `--no-include-reasoning`. Use `--assistant-only-loss` independently to exclude user tokens from loss.
 Already embedded native reasoning continues through the normal template path without this option.
 
+Use `--reasoning-only-loss` to score only the reasoning and its native opening/closing boundaries.
+It implies `--include-reasoning`; user/system text, the final answer, and final-answer termination
+tokens are masked. The same mask applies to evaluation and replay, so loss and token accuracy now
+measure reasoning tokens. Explicit, nonempty boundaries must be verifiable from the template metadata;
+unsupported boundaries and tokens crossing into the answer are errors. The dataset format is unchanged;
+the final answer may be empty if the template supports it. The option defaults off and persists as
+`[dataset].reasoning_only_loss`; `--no-reasoning-only-loss` disables it. Explicitly disabling reasoning
+inclusion while enabling reasoning-only loss is an error. `--assistant-only-loss` can remain enabled.
+
 The normal command for SFT, DPO, KTO, or reward-model training is:
 
 ```sh

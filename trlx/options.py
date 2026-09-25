@@ -174,6 +174,12 @@ def add_training_options(parser, method_name):
         ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source; implies --no-split and conflicts with explicit --split; omit for training only."),
     ]
     if method_name == "sft":
+        wrapper.append(("--reasoning-only-loss", "dataset.reasoning_only_loss", bool,
+                        "Train and evaluate only reasoning and its validated native boundaries; "
+                        "exclude final answers and their termination tokens from loss and accuracy. "
+                        "Implies --include-reasoning; conflicts with --no-include-reasoning. "
+                        "Requires the same reasoning/messages rows for training, evaluation, and replay. "
+                        "Default: disabled."))
         wrapper.append(("--include-reasoning", "dataset.include_reasoning", bool,
                         "Include a nonempty separate reasoning column in raw messages rows with exactly "
                         "one assistant response. Map in memory to the validated template's native field "

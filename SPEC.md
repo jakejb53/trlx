@@ -129,6 +129,13 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
     Transformation is in memory and shared by startup, workers, and `check`; snapshots retain the flag.
     Default disabled; `--no-include-reasoning` disables a configured value. Loss mode remains separately
     controlled. Synthetic CPT evaluation and skipped preparation are incompatible.
+  - SFT `--reasoning-only-loss` / `reasoning_only_loss = true` implies reasoning inclusion and
+    supervises only reasoning text plus verified native opening/closing boundaries. User/system,
+    final-answer, and final-answer termination tokens are masked. Explicit labels apply equally to
+    training, evaluation, and replay; truncation/packing must retain all selected targets. Ambiguous,
+    empty, or missing boundary metadata and tokens crossing the selected span are errors. The answer
+    can be empty when supported by the template. Default disabled; `--no-reasoning-only-loss` disables
+    this objective. Explicitly disabling inclusion conflicts. Snapshots preserve the resolved settings.
   - CLI `--dataset` selects the primary source in either mode. Explicit `--dataset-train` or `--dataset-eval` implies `--no-split`, overriding the configured split default; explicit `--split` conflicts. `--no-split` removes fractional-split keys and inherited shuffle selection; without a separate or synthetic evaluation source, it also removes the configured evaluation schedule. Contradictory explicit evaluation options are rejected.
   - SFT CPT `text` rows only: `--synthetic-dataset-eval` / `synthetic_dataset_eval = true` replaces configured splitting and evaluation sources, trains on all primary rows, and retains the evaluation schedule. Explicit CLI `--split`, `--eval-fraction`, or `--dataset-eval` conflicts. The resolved snapshot uses `split = false`, `dataset_train`, and `synthetic_dataset_eval`.
     Generate one factual prose summary per primary row from the loaded model after distributed placement, before the step-zero evaluation or optimizer updates; replay rows are excluded. The positive `max_length` is also the generated-token limit. Full prompts must fit the model context; no silent truncation. Model response templates separate reasoning; unparsed tagged responses, empty summaries, and token-limit exhaustion without EOS are fatal.

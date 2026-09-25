@@ -54,6 +54,16 @@ def row(trace="XYZ"):
                          {"role": "assistant", "content": "answer"}], "reasoning": trace}
 
 
+# Explicit native delimiters exercise reasoning-only labeling without model-family assumptions.
+def bounded_tokenizer():
+    processor = tokenizer()
+    processor.add_special_tokens({"additional_special_tokens": ["<trace>", "</trace>", "<system>"]})
+    processor.chat_template = processor.chat_template.replace(
+        "{{ message['deliberation'] }}", "{{ '<trace>' + message['deliberation'] + '</trace>' }}")
+    processor.response_template["fields"]["deliberation"].update(open="<trace>", close_pattern="</trace>")
+    return processor
+
+
 class ReasoningTests(unittest.TestCase):
     # Disabled mapping must not inspect either rows or tokenizer metadata.
     def test_disabled_returns_original_datasets(self):
@@ -209,3 +219,110 @@ class ReasoningTests(unittest.TestCase):
             mapped, _ = reasoning.prepare(config(), original, Dataset.from_list([row()]), None)
         self.assertEqual(mapped[0]["messages"][-1]["deliberation"], "XYZ")
         self.assertIsNone(original.response_template)
+
+    # Real TRL packing and collation must retain exactly the selected native reasoning span.
+    def test_reasoning_only_actual_trainer_all_splits(self):
+        from trlx import data_profile
+
+        for packing in (False, True):
+            for assistant_only in (False, True):
+                with self.subTest(packing=packing, assistant_only=assistant_only):
+                    cfg = config(packing=packing, assistant_only_loss=assistant_only)
+                    cfg.dataset.reasoning_only_loss = True
+                    processor = bounded_tokenizer()
+                    primary = row("XYZ")
+                    primary["messages"].insert(0, {"role": "system", "content": "instructions"})
+                    replay = dict(row("UVW"), replay=True)
+                    train = Dataset.from_list([dict(primary, replay=False), replay])
+                    evaluation = Dataset.from_list([row("RST")])
+                    original = train.to_list()
+                    mapped, mapped_eval = reasoning.prepare(cfg, processor, train, evaluation)
+                    self.assertEqual(train.to_list(), original)
+                    self.assertEqual(mapped["replay"], [False, True])
+                    for dataset, name, traces in ((mapped, "train", ("XYZ", "UVW")),
+                                                   (mapped_eval, "eval", ("RST",))):
+                        for item in dataset:
+                            projected, mismatch = data_profile._sft_row(item, processor, cfg.args, None, False)
+                            self.assertFalse(mismatch)
+                            self.assertEqual(projected["labels"], item["labels"])
+                        context = SimpleNamespace(_tokenizer=processor, chat_template=None, completion_only_loss=False)
+                        prepared = SFTTrainer._prepare_dataset(context, dataset, processor, cfg.args,
+                                                              packing, None, name)
+                        batch = DataCollatorForLanguageModeling(
+                            processor.pad_token_id, padding_free=packing)(list(prepared))
+                        active = [token for token in batch["labels"][:, 1:].reshape(-1).tolist() if token != -100]
+                        expected = [token for trace in traces for token in processor.encode(
+                            "<trace>" + trace + "</trace>", add_special_tokens=False)]
+                        self.assertCountEqual(active, expected)
+
+    # Empty final answers remain masked and do not force the model to terminate its answer.
+    def test_reasoning_only_empty_answer_and_regex_open(self):
+        cfg = config()
+        cfg.dataset.reasoning_only_loss = True
+        processor = bounded_tokenizer()
+        processor.response_template["fields"]["deliberation"] = {
+            "content": "text", "open_pattern": "<trace>", "close": "</trace>"}
+        source = row()
+        source["messages"][-1]["content"] = ""
+        mapped, _ = reasoning.prepare(cfg, processor, Dataset.from_list([source]), None)
+        active = [token for token in mapped[0]["labels"] if token != -100]
+        self.assertEqual(active, processor.encode("<trace>XYZ</trace>", add_special_tokens=False))
+        self.assertNotIn(processor.convert_tokens_to_ids("<end>"), active)
+
+    # Metadata must identify adjacent, rendered boundaries rather than guessing delimiters.
+    def test_reasoning_only_invalid_boundaries(self):
+        cfg = config()
+        cfg.dataset.reasoning_only_loss = True
+        for change, message in (("missing", "explicit opening and closing"),
+                                ("regex", "invalid reasoning boundary"),
+                                ("closing", "missing or ambiguous"),
+                                ("ambiguous", "missing or ambiguous"),
+                                ("ignored", "does not render")):
+            with self.subTest(change=change):
+                processor = bounded_tokenizer()
+                definition = processor.response_template["fields"]["deliberation"]
+                if change == "missing":
+                    del definition["close_pattern"]
+                elif change == "regex":
+                    definition["close_pattern"] = "["
+                elif change == "closing":
+                    processor.chat_template = processor.chat_template.replace(" + '</trace>'", "")
+                elif change == "ambiguous":
+                    definition.pop("open")
+                    definition["open_pattern"] = "<trace>|(?=X)"
+                else:
+                    processor = tokenizer(ignore=True)
+                with self.assertRaisesRegex(TrlxError, message):
+                    reasoning.prepare(cfg, processor, Dataset.from_list([row()]), None)
+
+    # A parser lookahead does not identify native opening tokens to supervise.
+    def test_reasoning_only_rejects_zero_width_opening(self):
+        cfg = config()
+        cfg.dataset.reasoning_only_loss = True
+        processor = bounded_tokenizer()
+        definition = processor.response_template["fields"]["deliberation"]
+        definition.pop("open")
+        definition["open_pattern"] = "(?=XYZ)"
+        with self.assertRaisesRegex(TrlxError, "nonempty native opening"):
+            reasoning.prepare(cfg, processor, Dataset.from_list([row()]), None)
+
+    # A complete reasoning body is insufficient if truncation loses its learned closing delimiter.
+    def test_reasoning_only_truncated_closing_boundary(self):
+        cfg = config()
+        cfg.dataset.reasoning_only_loss = True
+        processor = bounded_tokenizer()
+        mapped, _ = reasoning.prepare(cfg, processor, Dataset.from_list([row()]), None)
+        cfg.args.max_length = mapped[0]["input_ids"].index(processor.convert_tokens_to_ids("</trace>"))
+        with self.assertRaisesRegex(TrlxError, "truncation or packing excludes"):
+            reasoning.prepare(cfg, processor, Dataset.from_list([row()]), None)
+
+    # An indivisible token spanning the closer and answer cannot receive a reasoning-only label.
+    def test_reasoning_only_token_crossing_answer_boundary(self):
+        cfg = config(assistant_only_loss=False)
+        cfg.dataset.reasoning_only_loss = True
+        processor = bounded_tokenizer()
+        processor.chat_template = processor.chat_template.replace("</trace>", "END")
+        processor.response_template["fields"]["deliberation"]["close_pattern"] = "END"
+        processor.add_tokens(["ENDa"])
+        with self.assertRaisesRegex(TrlxError, "token crosses"):
+            reasoning.prepare(cfg, processor, Dataset.from_list([row()]), None)

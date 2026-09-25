@@ -142,6 +142,67 @@ class Resolution(unittest.TestCase):
                     with self.assertRaisesRegex(TrlxError, "include_reasoning must be bool"):
                         self.load(extra=extra)
 
+    # The narrower objective persists its implied preparation flag without changing TRL's mask setting.
+    def test_reasoning_only_snapshot_and_assistant_loss(self):
+        self.assertFalse(self.load().dataset.reasoning_only_loss)
+        for split in ([], ["--no-split", "--dataset-eval", "eval.jsonl"]):
+            for assistant in ("--assistant-only-loss", "--no-assistant-only-loss"):
+                with self.subTest(split=split, assistant=assistant):
+                    cfg = self.load(extra=["--reasoning-only-loss", assistant, *split])
+                    self.assertTrue(cfg.dataset.reasoning_only_loss)
+                    self.assertTrue(cfg.dataset.include_reasoning)
+                    self.assertEqual(cfg.args.assistant_only_loss, assistant == "--assistant-only-loss")
+                    snapshot = self.snapshot(cfg)
+                    self.assertIs(snapshot["dataset"]["reasoning_only_loss"], True)
+                    self.assertIs(snapshot["dataset"]["include_reasoning"], True)
+                    with patch.object(config, "_read_toml", return_value=snapshot):
+                        worker = config.load("snapshot", "sft", resolved=True)
+                    self.assertEqual(worker.dataset, cfg.dataset)
+                    self.assertEqual(preflight.compare_snapshot(cfg.document, snapshot, "single"), [])
+                    changed = copy.deepcopy(cfg.document)
+                    changed["dataset"]["reasoning_only_loss"] = False
+                    self.assertTrue(preflight.compare_snapshot(changed, snapshot, "single"))
+
+    # CLI intent supersedes inherited flags, but contradictory explicit settings remain errors.
+    def test_reasoning_only_precedence_and_conflicts(self):
+        self.source["dataset"]["reasoning_only_loss"] = True
+        cfg = self.load()
+        self.assertTrue(cfg.document["dataset"]["include_reasoning"])
+        self.assertNotIn("include_reasoning", self.source["dataset"])
+        self.assertFalse(self.load(extra=["--no-reasoning-only-loss"]).dataset.reasoning_only_loss)
+        with self.assertRaisesRegex(TrlxError, "requires include_reasoning"):
+            self.load(extra=["--no-include-reasoning"])
+        self.source["dataset"]["include_reasoning"] = False
+        with self.assertRaisesRegex(TrlxError, "requires include_reasoning"):
+            self.load()
+        self.assertTrue(self.load(extra=["--reasoning-only-loss"]).dataset.include_reasoning)
+        self.assertTrue(self.load(extra=["--include-reasoning"]).dataset.reasoning_only_loss)
+        for extra in (["--reasoning-only-loss", "--no-include-reasoning"],
+                      ["--no-include-reasoning", "--reasoning-only-loss"]):
+            with self.subTest(extra=extra), self.assertRaisesRegex(TrlxError, "conflicts"):
+                self.load(extra=extra)
+        disabled = self.load(extra=["--no-reasoning-only-loss", "--no-include-reasoning"])
+        self.assertFalse(disabled.dataset.reasoning_only_loss)
+        self.assertFalse(disabled.dataset.include_reasoning)
+
+    # Reasoning-only preparation has the same data restrictions as reasoning inclusion.
+    def test_reasoning_only_restrictions_and_types(self):
+        for extra, message in (
+            (["--synthetic-dataset-eval"], "cannot be combined"),
+            (["--dataset-kwargs", '{skip_prepare_dataset = true}'], "raw messages"),
+        ):
+            with self.subTest(extra=extra), self.assertRaisesRegex(TrlxError, message):
+                self.load(extra=["--reasoning-only-loss", *extra])
+        self.source["dataset"]["reasoning_only_loss"] = True
+        with self.assertRaisesRegex(TrlxError, "supported only for sft"):
+            self.load("dpo")
+        for extra in ([], ["--no-split"]):
+            for value in ("yes", 1, None):
+                with self.subTest(extra=extra, value=value):
+                    self.source["dataset"]["reasoning_only_loss"] = value
+                    with self.assertRaisesRegex(TrlxError, "reasoning_only_loss must be bool"):
+                        self.load(extra=extra)
+
     # Exercise the actual assessment loading boundary, including data_seed=0 precedence.
     def test_assessment_passes_effective_split_seed(self):
         for extra, expected in ((["--seed", "17"], 17), (["--seed", "17", "--data-seed", "0"], 0)):
