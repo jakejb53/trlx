@@ -61,9 +61,11 @@ def _cmd_mix(args):
     try:
         fractions = [float(f) for f in args.fractions.split(",")]
     except ValueError:
-        raise DatasetError(f"--fractions must be comma-separated numbers, got '{args.fractions}'")
+        raise DatasetError(f"--fractions must be comma-separated numbers in 0..1, got '{args.fractions}'; "
+                           "use one fraction per input, e.g. --fractions 1,0.2 for two input files")
     if len(fractions) != len(args.input):
-        raise DatasetError(f"--fractions has {len(fractions)} values for {len(args.input)} inputs")
+        raise DatasetError(f"--fractions has {len(fractions)} values for {len(args.input)} inputs; "
+                           "supply exactly one fraction per input file, in input order; fractions need not sum to 1")
     sources = [(read_rows(p, progress=args.progress), f) for p, f in zip(args.input, fractions)]
     write_rows(args.out, rows.mix(sources, args.seed, progress=args.progress), args.input,
                force=args.force, no_staging=args.no_staging, progress=args.progress)
@@ -89,7 +91,8 @@ def _cmd_filter(args):
         try:
             max_lengths.append((column, int(limit)))
         except ValueError:
-            raise DatasetError(f"--max-length expects COLUMN=INT, got '{arg}'")
+            raise DatasetError(f"--max-length expects COLUMN=INT, got '{arg}'; "
+                               "use e.g. --max-length text=8000 (characters) or --max-length messages=10 (items)")
     data = read_rows(args.input, progress=args.progress)
     kept = rows.filter_rows(data, args.where, max_lengths, progress=args.progress)
     write_rows(args.out, kept, [args.input], force=args.force, no_staging=args.no_staging, progress=args.progress)
@@ -122,14 +125,16 @@ def _cmd_pairs(args):
                    force=args.force, no_staging=args.no_staging, progress=args.progress)
         return 0
     if len(args.input) != 2:
-        raise DatasetError("pairs takes one messages dataset or two (chosen then rejected)")
+        raise DatasetError("dataset pairs takes one or two input files; use one messages dataset for "
+                           "prompt/completion rows, or two files in chosen-then-rejected order for preference pairs")
     chosen = read_rows(args.input[0], progress=args.progress)
     rejected = read_rows(args.input[1], progress=args.progress)
     paired, unmatched = pairs.align(chosen, rejected, progress=args.progress)
     for u in unmatched:
         print(f"unmatched: {u}", file=sys.stderr)
     if unmatched and args.strict:
-        raise DatasetError(f"{len(unmatched)} unmatched rows with --strict")
+        raise DatasetError(f"{len(unmatched)} unmatched rows with --strict; no output was written. "
+                           "Align the user-turn contents in both inputs, or remove --strict to omit unmatched rows")
     write_rows(args.out, paired, args.input, force=args.force, no_staging=args.no_staging, progress=args.progress)
     print(f"{len(paired)} pairs, {len(unmatched)} unmatched")
     return 0
@@ -151,18 +156,26 @@ def _cmd_heal(args):
 # pass. Exactly one of the two answers flags is an error, never a partial copy.
 def _cmd_chat(args):
     if not 0 <= args.eval_n < args.n:
-        raise DatasetError("--eval-n must be >= 0 and smaller than --n")
+        raise DatasetError(f"--n {args.n} must be a positive question count per source chunk, "
+                           f"and --eval-n {args.eval_n} must satisfy 0 <= --eval-n < --n. "
+                           "Use --eval-n 0 without --eval-out for training output only, "
+                           "or reserve fewer questions than --n for evaluation.")
     if bool(args.eval_n) != bool(args.eval_out):
-        raise DatasetError("positive --eval-n and --eval-out must be supplied together")
+        raise DatasetError("positive --eval-n and --eval-out must be supplied together; "
+                           "to reserve evaluation rows, set --eval-n below --n and --eval-out eval.jsonl; "
+                           "for training output only, omit --eval-out and use --eval-n 0")
     # Check both paths, including aliases, before spending any endpoint requests.
     validate_rows_outputs([args.out, args.eval_out] if args.eval_out else [args.out], args.force)
     if (args.answers_endpoint is None) != (args.answers_model is None):
-        raise DatasetError("answers pass needs both --answers-endpoint and --answers-model, or neither")
+        raise DatasetError("answers pass needs both --answers-endpoint and --answers-model; "
+                           "supply the missing flag, or omit both to reuse --questions-endpoint and --questions-model")
     api_key = None
     if args.api_key:
         api_key = os.environ.get(args.api_key)
         if not api_key:
-            raise DatasetError(f"--api-key: environment variable {args.api_key} is not set")
+            raise DatasetError("--api-key names an environment variable, not the key itself; "
+                               "the selected variable is unset or empty. Export the key in that variable "
+                               "and pass its name, or omit --api-key if authentication is not required")
     q_url, q_model = args.questions_endpoint, args.questions_model
     a_url = args.answers_endpoint if args.answers_endpoint else q_url
     a_model = args.answers_model if args.answers_model else q_model
@@ -206,7 +219,9 @@ def _cmd_eval_build(args):
     if args.api_key:
         api_key = os.environ.get(args.api_key)
         if not api_key:
-            raise DatasetError(f"--api-key: environment variable {args.api_key} is not set")
+            raise DatasetError("--api-key names an environment variable, not the key itself; "
+                               "the selected variable is unset or empty. Export the key in that variable "
+                               "and pass its name, or omit --api-key if authentication is not required")
     endpoint = Endpoint(args.endpoint, args.model, api_key, args.timeout, args.retries)
     summary_prompt = load_prompt(args.summary_prompt, allowed=None)
     data = eval_build.build(
@@ -424,7 +439,7 @@ def build_parser():
                         "./prompts/chat-questions.prompt relative to the working directory; missing files fail; "
                         "run trlx init to create defaults or supply a file; no built-in fallback")
     questions.add_argument("--n", type=int, required=True, metavar="QUESTIONS",
-                           help="integer requested questions per source chunk; fewer may be returned")
+                           help="positive integer requested questions per source chunk; fewer may be returned")
     questions.add_argument("--eval-n", type=int, default=0, metavar="QUESTIONS",
                    help="reserve the last N retained questions per chunk for evaluation, after deduplication; "
                         "integer >= 0 and < --n; default: 0 (disabled); positive values require --eval-out; "

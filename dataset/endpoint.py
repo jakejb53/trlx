@@ -79,10 +79,12 @@ class Endpoint:
     # seconds; retries is the number of re-attempts after the first failure.
     def __init__(self, url, model, api_key, timeout, retries):
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
-            raise DatasetError("retries must be an integer 0 or more")
+            raise DatasetError("retries (--retries in dataset commands) must be an integer 0 or more; use 0 to disable retries "
+                               "or a positive count of additional attempts after the first request")
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                 or timeout <= 0 or (isinstance(timeout, float) and not math.isfinite(timeout))):
-            raise DatasetError("timeout must be finite positive seconds")
+            raise DatasetError("timeout (--timeout in dataset commands) must be finite positive seconds; use e.g. 120, "
+                               "not 0, a negative number, or infinity")
         if not isinstance(url, str):
             raise DatasetError("endpoint URL must be a string containing an HTTP(S) base URL")
         try:
@@ -250,7 +252,8 @@ class Endpoint:
     def complete_many_full(self, message_lists, concurrency, max_tokens=None, *, progress=None,
                            label="requests", require_stop=False, on_complete=None):
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
-            raise DatasetError("concurrency must be an integer at least 1")
+            raise DatasetError("concurrency (--concurrency in dataset commands) must be an integer at least 1; use 1 "
+                               "for sequential requests or a larger number for simultaneous requests")
         message_lists = list(message_lists)
         with stage(progress, f"{label} from {self.model} at {self.display_url}",
                    total=len(message_lists), unit="requests") as activity:

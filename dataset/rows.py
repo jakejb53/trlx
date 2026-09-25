@@ -22,13 +22,16 @@ def shuffle(rows, seed, *, progress=None):
 # Resolves --n or --fraction to a row count. Exactly one must be given.
 def _count(total, n, fraction):
     if (n is None) == (fraction is None):
-        raise DatasetError("give exactly one of --n and --fraction")
+        raise DatasetError("give exactly one of --n and --fraction: use --n for a row count or "
+                           "--fraction for a share of the input (e.g. --fraction 0.9); "
+                           "selected rows go to --out and the remainder to --rest")
     if n is not None:
         if n < 0 or n > total:
             raise DatasetError(f"--n {n} is outside 0..{total} (the input has {total} rows)")
         return n
     if not 0.0 <= fraction <= 1.0:
-        raise DatasetError(f"--fraction {fraction} is outside 0.0..1.0")
+        raise DatasetError(f"--fraction {fraction} is outside 0.0..1.0; "
+                           "use a proportion such as --fraction 0.9 for 90%, not a percentage")
     return round(total * fraction)
 
 
@@ -69,7 +72,8 @@ def split(rows, n=None, fraction=None, key=None, *, progress=None):
 def sample(rows, n, seed=None, head=False, *, progress=None):
     with stage(progress, "sampling rows"):
         if (seed is None) == (not head):
-            raise DatasetError("give exactly one of --seed and --head")
+            raise DatasetError("give exactly one of --seed and --head: use --seed 42 for a reproducible "
+                               "random sample, or --head to take the first --n rows in input order")
         if n < 0 or n > len(rows):
             raise DatasetError(f"--n {n} is outside 0..{len(rows)} (the input has {len(rows)} rows)")
         if head:
@@ -87,7 +91,8 @@ def mix(sources, seed, *, progress=None):
         out = []
         for i, (rows, fraction) in enumerate(sources):
             if not 0.0 <= fraction <= 1.0:
-                raise DatasetError(f"fraction {fraction} for input {i} is outside 0.0..1.0")
+                raise DatasetError(f"--fractions value {fraction} for input {i + 1} is outside 0.0..1.0; "
+                                   "use proportions (e.g. 0.2 for 20%), one per input in input order")
             count = round(len(rows) * fraction)
             chosen = sorted(rng.sample(range(len(rows)), count))
             out.extend(rows[j] for j in chosen)

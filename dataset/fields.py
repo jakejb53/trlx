@@ -21,7 +21,9 @@ def compile_expression(expr):
     try:
         return compile(expr, "<expression>", "eval")
     except SyntaxError as e:
-        raise DatasetError(f"expression `{expr}` is not valid Python: {e.msg} at column {e.offset}")
+        raise DatasetError(f"expression `{expr}` is not valid Python: {e.msg} at column {e.offset}; "
+                           "quote the complete --add or --where argument in the shell, "
+                           "e.g. --add 'size=len(text)' or --where 'len(text) > 0'")
 
 
 # Evaluates a compiled expression against one row. Columns are names; `row` is
@@ -38,10 +40,11 @@ def evaluate(code, expr, row, index):
 # Splits a NAME=VALUE flag argument at the first '=', naming the flag on error.
 def split_assignment(arg, flag):
     if "=" not in arg:
-        raise DatasetError(f"{flag} expects NAME=VALUE, got '{arg}'")
+        raise DatasetError(f"{flag} expects NAME=VALUE, got '{arg}'; include '=' between the "
+                           "column name and value, and quote the complete argument if it contains spaces")
     name, value = arg.split("=", 1)
     if not name:
-        raise DatasetError(f"{flag} expects NAME=VALUE, got '{arg}'")
+        raise DatasetError(f"{flag} expects NAME=VALUE, got '{arg}'; put a nonempty column name before '='")
     return name, value
 
 

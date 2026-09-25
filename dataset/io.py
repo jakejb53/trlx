@@ -36,22 +36,45 @@ def _heal_guidance(path):
     return f"inspect the syntax or try dataset heal {shlex.quote(str(source))} --out {shlex.quote(str(destination))}"
 
 
-# Reads a JSONL file. A line that is not a JSON object is an error naming the line.
-def _read_jsonl(path, *, activity=None):
+# Accept compact JSONL and multiline object streams; the JSON decoder owns record boundaries.
+# Decode against the complete text so syntax errors retain their actual file line and column.
+def _read_jsonl(path, *, activity=None, record_lines=None):
     rows = []
     with open(path, encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise DatasetError(f"{path}:{lineno}: invalid JSON: {e.msg} at column {e.colno}; {_heal_guidance(path)}") from e
-            if not isinstance(row, dict):
-                raise DatasetError(f"{path}:{lineno}: expected a JSON object, got {type(row).__name__}")
-            rows.append(row)
-            if activity is not None:
-                activity.advance()
+        text = f.read()
+    decoder = json.JSONDecoder()
+    position = 0
+    lineno = 1
+    while position < len(text):
+        # Only JSON whitespace separates records; whitespace inside strings belongs to the decoder.
+        while position < len(text) and text[position] in " \t\r\n":
+            lineno += text[position] == "\n"
+            position += 1
+        if position == len(text):
+            break
+        try:
+            row, end = decoder.raw_decode(text, position)
+        except json.JSONDecodeError as e:
+            raise DatasetError(
+                f"{path}:{e.lineno}: invalid JSON in record {len(rows) + 1}: {e.msg} at column {e.colno}. "
+                "Objects may span multiple lines, but their JSON syntax must be complete; "
+                f"{_heal_guidance(path)}"
+            ) from e
+        if not isinstance(row, dict):
+            column = position - text.rfind("\n", 0, position)
+            raise DatasetError(
+                f"{path}:{lineno}: record {len(rows) + 1} must be a JSON object, "
+                f"got {type(row).__name__} at column {column}. "
+                "Use a stream of objects in .jsonl, or a JSON array of objects in a .json file."
+            )
+        rows.append(row)
+        # Preserve locations from the same parse, without adding metadata to the user's rows.
+        if record_lines is not None:
+            record_lines.append(lineno)
+        lineno += text.count("\n", position, end)
+        position = end
+        if activity is not None:
+            activity.advance()
     return rows
 
 
@@ -161,8 +184,8 @@ def _format(path):
     return FORMATS[suffix]
 
 
-# Translate file/format failures where the input path and a recovery action are known.
-def read_rows(path, *, progress=None):
+# Translate file/format failures; optional JSONL source lines stay separate from dataset values.
+def read_rows(path, *, progress=None, record_lines=None):
     reader, _ = _format(path)
     try:
         if not pathlib.Path(path).exists():
@@ -170,7 +193,10 @@ def read_rows(path, *, progress=None):
         if not pathlib.Path(path).is_file():
             raise DatasetError(f"{path}: not a regular file; supply a dataset file, not a directory")
         with stage(progress, f"reading {path}", unit="rows") as activity:
-            rows = reader(path, activity=activity)
+            if reader is _read_jsonl and record_lines is not None:
+                rows = reader(path, activity=activity, record_lines=record_lines)
+            else:
+                rows = reader(path, activity=activity)
             activity.update(len(rows), total=len(rows))
             return rows
     except UnicodeError as e:

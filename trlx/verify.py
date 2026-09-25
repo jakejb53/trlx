@@ -131,7 +131,9 @@ def _base_spec(run_dir, base):
         raise TrlxError(f"{path}: snapshot has no [model] block")
     spec = config_mod.model_spec(path, "model", table)
     if spec.path != base:
-        raise TrlxError(f"--base {base} is not the run's [model].path {spec.path} ({path})")
+        raise TrlxError(f"--base {base} is not the run's [model].path {spec.path} ({path}); "
+                        "set --base to the saved model path exactly, or select a checkpoint "
+                        "trained from the requested base")
     return spec
 
 

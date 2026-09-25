@@ -48,12 +48,14 @@ def select_gpus(flag):
     try:
         indices = [int(x) for x in flag.split(",")]
     except ValueError:
-        raise TrlxError(f"--gpus '{flag}': expected comma-separated integers")
+        raise TrlxError(f"--gpus '{flag}': expected visible-device indices, for example --gpus 0 "
+                        "or --gpus 0,1; use --gpus all to select every visible device")
     bad = [i for i in indices if not 0 <= i < count]
     if bad:
-        raise TrlxError(f"--gpus {flag}: device {bad[0]} does not exist ({count} visible)")
+        raise TrlxError(f"--gpus {flag}: device {bad[0]} does not exist ({count} visible); "
+                        f"choose indices from 0 through {count - 1} in the CUDA_VISIBLE_DEVICES set")
     if len(set(indices)) != len(indices):
-        raise TrlxError(f"--gpus {flag}: repeated index")
+        raise TrlxError(f"--gpus {flag}: repeated index; list each visible device once")
     return indices, count
 
 
@@ -77,7 +79,8 @@ def physical_ids(gpus, count):
 def choose_strategy(override, cfg, physical):
     if len(physical) == 1:
         if override is not None:
-            raise TrlxError(f"--strategy {override}: one GPU selected; strategy applies to multi-GPU runs")
+            raise TrlxError(f"--strategy {override}: one GPU selected; use --strategy auto for "
+                            "single-GPU training, or select multiple visible GPUs with --gpus")
         return "single", "one GPU"
     weights, multiplier, copy = _estimate(cfg)
     need = weights * (multiplier + copy)

@@ -57,7 +57,10 @@ def parse_value(raw, hint):
             try:
                 return tomllib.loads("value = " + raw)["value"]
             except tomllib.TOMLDecodeError as error:
-                raise argparse.ArgumentTypeError(f"invalid quoted string: {error}") from error
+                raise argparse.ArgumentTypeError(
+                    f"invalid quoted string: {error}; pass plain text using shell quotes, "
+                    "for example 'text with spaces', without embedding unmatched double quotes"
+                ) from error
         return raw
     try:
         return tomllib.loads("value = " + raw)["value"]
@@ -66,7 +69,9 @@ def parse_value(raw, hint):
         if str in alternatives and not raw.startswith(('[', '{', '"', "'")):
             return raw
         raise argparse.ArgumentTypeError(
-            f"expected a {type_label(hint)} value; arrays/tables use quoted TOML syntax: {error}"
+            f"expected a {type_label(hint)} value: {error}; use TOML syntax and shell-quote "
+            "structured values, for example '[1, 2]' or '{name = \"value\"}'; "
+            "use lowercase true/false for booleans"
         ) from error
 
 
@@ -164,13 +169,13 @@ def add_training_options(parser, method_name):
         ("--dtype", "model.dtype", str, "Weight dtype: bfloat16, float16, or float32; training precision flags are separate."),
         ("--trust-remote-code", "model.trust_remote_code", bool, "Allow model-provided Python code."),
         ("--attn-implementation", "model.attn_implementation", str, "Attention backend, for example sdpa or eager."),
-        ("--dataset", "dataset.source", str, "Training source: .jsonl/.json/.csv/.parquet or org/name:split."),
-        ("--eval-fraction", "dataset.eval_fraction", float, "Evaluation share, strictly between 0 and 1; resolved at data load."),
+        ("--dataset", "dataset.source", str, "Source: .jsonl/.json/.csv/.parquet or org/name:split. To hold out evaluation rows, use --dataset PATH --split --eval-fraction 0.1."),
+        ("--eval-fraction", "dataset.eval_fraction", float, "Evaluation share, strictly between 0 and 1; use with --dataset PATH --split, not --dataset-train or --dataset-eval."),
         ("--shuffle-eval-data", "dataset.shuffle_eval_data", bool,
          "Randomly select the evaluation share instead of the final rows; requires --split. "
          "Uses data_seed when set, otherwise seed; preserves row order within each set. Default: disabled."),
         ("--split", "dataset.split", bool, "Split one source; --no-split uses separate files and removes eval_fraction."),
-        ("--dataset-train", "dataset.dataset_train", str, "Training source; implies --no-split and conflicts with explicit --split."),
+        ("--dataset-train", "dataset.dataset_train", str, "Already-separated training source; implies --no-split. To split this source instead, use --dataset PATH --split --eval-fraction 0.1."),
         ("--dataset-eval", "dataset.dataset_eval", str, "Evaluation source; implies --no-split and conflicts with explicit --split; omit for training only."),
     ]
     if method_name == "sft":
@@ -296,11 +301,15 @@ def overrides(args):
     result = {key.removeprefix("override:"): value for key, value in vars(args).items() if key.startswith("override:")}
     if getattr(args, "no_lora", False):
         if any(key.startswith("peft.") for key in result):
-            raise TrlxError("--no-lora cannot be combined with --lora-* settings")
+            raise TrlxError("--no-lora cannot be combined with --lora-* settings; "
+                            "remove --no-lora to use the adapter settings, or remove "
+                            "the --lora-* flags for full fine-tuning")
         result["peft"] = None
     if getattr(args, "no_replay", False):
         if any(key.startswith("replay.") for key in result):
-            raise TrlxError("--no-replay cannot be combined with --replay-* settings")
+            raise TrlxError("--no-replay cannot be combined with --replay-* settings; "
+                            "remove --no-replay to configure replay, or remove "
+                            "the --replay-* flags to disable it")
         result["replay"] = None
     if getattr(args, "reward", None):
         entries = []
@@ -308,7 +317,10 @@ def overrides(args):
             try:
                 entry = tomllib.loads("value = " + raw)["value"] if raw.lstrip().startswith("{") else raw
             except tomllib.TOMLDecodeError as error:
-                raise TrlxError(f"--reward: invalid TOML factory: {error}") from error
+                raise TrlxError(f"--reward: invalid TOML factory: {error}; "
+                                "shell-quote the complete table, for example "
+                                "--reward '{name=\"reference_match\",args={column=\"answer\",mode=\"equals\"}}'; "
+                                "for a reward without arguments, pass its name instead") from error
             entries.append(entry)
         result["rewards.funcs"] = entries
     return result

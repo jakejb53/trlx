@@ -59,11 +59,15 @@ def _check_flags(args):
     given = [f for f in ENDPOINT_FLAGS if getattr(args, f) is not None]
     if args.endpoint is None:
         if given:
-            raise TrlxError(f"--{given[0].replace('_', '-')} applies to --endpoint only")
+            raise TrlxError(f"--{given[0].replace('_', '-')} requires endpoint generation; "
+                            "add --endpoint URL for an OpenAI-compatible server, or remove "
+                            "endpoint-only flags for local generation")
         return
     missing = [f for f in ENDPOINT_REQUIRED if getattr(args, f) is None]
     if missing:
-        raise TrlxError(f"--endpoint requires --{missing[0]}")
+        raise TrlxError("--endpoint requires " + ", ".join("--" + field.replace("_", "-") for field in missing)
+                        + "; supply a positive --timeout in seconds, nonnegative --retries, "
+                        "and positive --concurrency")
 
 
 # A prompt as chat turns: a string is one user turn, a messages list is
@@ -92,7 +96,9 @@ def _from_endpoint(args, prompts, *, progress=None):
     if args.api_key:
         api_key = os.environ.get(args.api_key)
         if not api_key:
-            raise TrlxError(f"--api-key: environment variable {args.api_key} is not set")
+            raise TrlxError("--api-key names an unset or empty environment variable; "
+                            "set that variable to the credential, or pass the name of a populated "
+                            "variable; do not pass the credential itself")
     try:
         endpoint = Endpoint(args.endpoint, args.model, api_key, args.timeout, args.retries)
         print(f"sampling {len(prompts)} prompts from {args.model} at {endpoint.display_url}", flush=True)

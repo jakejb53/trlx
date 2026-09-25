@@ -102,7 +102,9 @@ def check_config(cfg, config_path, strategy, *, progress=None):
 # now than discovered after training.
 def _check_save_strategy(cfg):
     if cfg.args.save_strategy == "no":
-        raise TrlxError('save_strategy = "no" leaves no checkpoint to verify or merge')
+        raise TrlxError('save_strategy = "no" leaves no checkpoint to verify or merge; '
+                        'use --save-strategy steps --save-steps 0 for a final checkpoint only, '
+                        'or --save-strategy epoch to save each epoch')
 
 
 # The replay KL term needs logits on every batch and one flag per batch row;
@@ -114,7 +116,10 @@ def _check_replay(cfg):
         return
     for field in ("use_liger_kernel", "packing", "padding_free"):
         if getattr(cfg.args, field, False):
-            raise TrlxError(f"[replay].kl_coef > 0 is incompatible with {field} = true")
+            raise TrlxError(f"[replay].kl_coef > 0 is incompatible with {field} = true: "
+                            "replay KL needs separate examples and their logits; "
+                            f"use --no-{field.replace('_', '-')} to retain KL, "
+                            "or --replay-kl-coef 0 for replay mixing without KL")
 
 
 # Resume compares the effective inputs, including temporary CLI overrides;
@@ -128,16 +133,22 @@ def _check_resume(cfg, config_path, strategy):
         with open(snapshot_path, "rb") as f:
             snapshot = tomllib.load(f)
     except FileNotFoundError as e:
-        raise TrlxError(f"resume_from_checkpoint is set but {e.filename} does not exist")
+        raise TrlxError(f"--resume-from-checkpoint requires the run's saved config, but {e.filename} "
+                        "does not exist; select a checkpoint inside its original trlx run directory "
+                        "with config.toml, or restore the missing snapshot")
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as e:
         raise TrlxError(f"{snapshot_path}: cannot read snapshot: {e}")
     saved_method = snapshot.get("launch", {}).get("method")
     if saved_method != cfg.method.name:
-        raise TrlxError(f"resume refused: {snapshot_path} is for {saved_method}, not {cfg.method.name}")
+        raise TrlxError(f"resume refused: {snapshot_path} is for {saved_method}, not {cfg.method.name}; "
+                        "use the saved run's training subcommand, or select a checkpoint from "
+                        f"a {cfg.method.name} run")
     diffs = compare_snapshot(cfg.document, snapshot, strategy)
     if diffs:
         raise TrlxError(
             f"resume refused: the run config differs from {snapshot_path}:\n  " + "\n  ".join(diffs)
+            + "\nRemove conflicting CLI overrides to retain the saved settings; "
+            "to train with different settings, start a fresh run without --resume-from-checkpoint."
         )
 
 

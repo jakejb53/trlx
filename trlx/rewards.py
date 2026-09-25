@@ -117,7 +117,9 @@ def regex(where, args):
         raise TrlxError(f"{where}: invalid pattern: {e}")
     group, column = args.get("group"), args.get("column")
     if (group is None) != (column is None):
-        raise TrlxError(f"{where}: group and column go together")
+        raise TrlxError(f"{where}: group and column must be supplied together to compare a regex "
+                        "capture with a dataset column; add the missing argument, or omit both "
+                        "to reward any pattern match")
     if group is not None and (type(group) is not int or group < 0):
         raise TrlxError(f"{where}: group must be a nonnegative integer")
     if column is not None and not isinstance(column, str):
@@ -260,7 +262,9 @@ def llm_judge(where, args, *, progress=None, rubric_text=None):
     if args.get("api_key"):
         api_key = os.environ.get(args["api_key"])
         if not api_key:
-            raise TrlxError(f"{where}: api_key: environment variable {args['api_key']} is not set")
+            raise TrlxError(f"{where}: api_key names an unset or empty environment variable; "
+                            "set that variable to the credential, or supply the name of a populated "
+                            "variable; do not supply the credential itself")
     try:
         endpoint = Endpoint(args["url"], args["model"], api_key, args["timeout"], args["retries"])
     except DatasetError as e:

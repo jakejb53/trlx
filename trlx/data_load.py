@@ -14,7 +14,7 @@ import random
 from fractions import Fraction
 
 import datasets
-from pyarrow import ArrowInvalid, ArrowTypeError
+from pyarrow import ArrowInvalid, ArrowTypeError, array
 
 from dataset.io import DatasetError, read_rows
 from dataset.progress import stage
@@ -120,11 +120,62 @@ def mix_replay(train, spec, flag, *, progress=None):
         raise TrlxError(f"{spec.dataset.source}: [replay].dataset rows do not match the train set's shape: {e}")
 
 
+# Locate incompatible nested values only after Arrow rejects conversion; accepted datasets are unaffected.
+def _type_conflict(rows, record_lines=()):
+    seen = {}
+
+    # Use locations captured by the reader, not a second parse of a potentially changed file.
+    def location(number):
+        line = f" (starting at line {record_lines[number - 1]})" if number <= len(record_lines) else ""
+        return f"record {number}{line}"
+
+    # List positions share a schema, but the diagnostic retains the actual offending element index.
+    def visit(value, schema_path, display_path, number):
+        if value is None:
+            return None  # Arrow permits nulls alongside any otherwise compatible value type.
+        kind = ("object" if isinstance(value, dict) else "list" if isinstance(value, list) else
+                "string" if isinstance(value, (str, bytes)) else "boolean" if isinstance(value, bool) else
+                "number" if isinstance(value, (int, float)) else type(value).__name__)
+        previous = seen.setdefault(schema_path, {})
+        for earlier_kind, (earlier_value, earlier_number, earlier_path) in previous.items():
+            if earlier_kind == kind:
+                continue
+            try:
+                # Arrow remains authoritative: a Python-type difference may be a supported coercion.
+                array([earlier_value, value])
+            except (ArrowInvalid, ArrowTypeError):
+                return (f"{location(number)}: {display_path} is a {kind}, but {earlier_path} in "
+                        f"{location(earlier_number)} is a {earlier_kind}. "
+                        "Use consistent value types for this field across records; null values are allowed.")
+        previous.setdefault(kind, (value, number, display_path))
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{display_path}.{key}" if key.isidentifier() else f"{display_path}[{key!r}]"
+                issue = visit(child, (*schema_path, key), child_path, number)
+                if issue:
+                    return issue
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                issue = visit(child, (*schema_path, None), f"{display_path}[{index}]", number)
+                if issue:
+                    return issue
+        return None
+
+    # Dataset.from_list builds columns from the first row's keys. Inspect only those input columns.
+    for number, row in enumerate(rows, 1):
+        for key in rows[0]:
+            issue = visit(row.get(key), (key,), key if key.isidentifier() else f"[{key!r}]", number)
+            if issue:
+                return issue
+    return None
+
+
 # One config.DatasetRef to a Dataset.
 def load_ref(ref, *, progress=None):
     if ref.is_file:
+        record_lines = []
         try:
-            rows = read_rows(ref.source, progress=progress)
+            rows = read_rows(ref.source, progress=progress, record_lines=record_lines)
         except DatasetError as e:
             raise TrlxError(str(e))
         if not rows:
@@ -135,6 +186,9 @@ def load_ref(ref, *, progress=None):
                 activity.advance(len(rows))
                 return loaded
         except (ArrowInvalid, ArrowTypeError) as e:
+            detail = _type_conflict(rows, record_lines)
+            if detail:
+                raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {detail}") from e
             raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {e}; "
                             "use consistent value types within each column") from e
     with stage(progress, f"loading dataset {ref.source}", visible=True) as activity:
