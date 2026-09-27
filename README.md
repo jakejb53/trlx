@@ -511,6 +511,29 @@ No separate Accelerate configuration or launcher is needed.
 sharded runs receive preflight during training. If moving the config to different
 hardware, review precision settings or run `init --out NEW_CONFIG` on that host.
 
+### Recovering stuck GPU activity
+
+If a failed run has exited but a GPU still reports high utilization with no compute
+processes, [recover_gpu.py](recover_gpu.py) can restore idle operation by running a
+tiny CUDA kernel, synchronizing, and explicitly destroying its temporary context.
+It requires Python and an NVIDIA driver with an Ampere-or-newer GPU; it does not
+reset hardware or stop monitoring services.
+
+From the repository root, identify the affected GPU's PCI bus ID:
+
+```sh
+nvidia-smi --query-gpu=index,pci.bus_id,utilization.gpu,memory.used --format=csv
+nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv
+```
+
+Replace `PCI_BUS_ID` below with that address (for example, `0000:21:00.0`), then
+verify utilization returns to idle:
+
+```sh
+timeout --signal=TERM --kill-after=5s 45s python -u recover_gpu.py PCI_BUS_ID
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,pstate --format=csv
+```
+
 ## Tutorial: checkpoints, resume, and results
 
 The defaults evaluate and save at each epoch's end, retain two checkpoints, and log
