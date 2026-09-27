@@ -79,23 +79,58 @@ def _map_row(row, field):
 
 
 # A field probe locates the actual instance even when identical text also occurs in the prompt.
-def _field_span(messages, field, rendered, processor, kwargs):
+def _field_span(messages, field, rendered, processor, kwargs, *, message_index=-1):
     probe = copy.deepcopy(messages)
     marker = "TRLX_REASONING_FIELD_PROBE"
     while marker in rendered:
         marker += "_"
-    probe[-1][field] = marker
+    probe[message_index][field] = marker
+    location = f"messages[{message_index % len(messages)}].{field}"
     sample = _render(processor, probe, kwargs)
     if sample.count(marker) != 1:
-        raise ValueError(f"chat template does not render assistant.{field} exactly once")
+        raise ValueError(f"chat template does not render {location} exactly once")
     prefix, suffix = sample.split(marker)
     end = len(rendered) - len(suffix) if suffix else len(rendered)
     start = len(prefix)
     if not rendered.startswith(prefix) or not rendered.endswith(suffix):
-        raise ValueError(f"chat template changes surrounding text with assistant.{field}; mapping is not verifiable")
-    if rendered[start:end].strip() != messages[-1][field].strip():
-        raise ValueError(f"chat template discards or rewrites assistant.{field}")
+        raise ValueError(f"chat template changes surrounding text with {location}; mapping is not verifiable")
+    if rendered[start:end].strip() != messages[message_index][field].strip():
+        raise ValueError(f"chat template discards or rewrites {location}")
     return start, end
+
+
+# Fit the actual token sequence without re-rendering or guessing a characters-to-tokens ratio.
+# Keep native structure and a causal predecessor; remaining capacity belongs to reasoning first.
+def _fit_tokens(record, offsets, rendered, messages, body_span, processor, kwargs, maximum, reasoning_only):
+    if maximum is None or len(record["input_ids"]) <= maximum:
+        return record
+
+    # Tokens straddling a field boundary are indivisible and remain with the template structure.
+    def positions(span):
+        start, end = span
+        return {index for index, (left, right) in enumerate(offsets) if start <= left < right <= end}
+
+    reasoning = positions(body_span)
+    answer = positions(_field_span(messages, "content", rendered, processor, kwargs))
+    context = set()
+    for index in range(len(messages) - 1):
+        context.update(positions(_field_span(messages, "content", rendered, processor, kwargs,
+                                             message_index=index)))
+    retained = set(range(len(record["input_ids"]))) - reasoning - answer - context
+    retained.add(0)  # A first selected reasoning token must still have a preceding causal input.
+    if maximum <= len(retained):
+        raise ValueError(f"--max-length {maximum} cannot fit the required template structure and a reasoning token; "
+                         f"use at least {len(retained) + 1}")
+    budget = maximum - len(retained)
+    # Final-answer content has no training role in reasoning-only mode. For ordinary inclusion,
+    # it is the secondary target; user/system content receives only the remaining prefix budget.
+    groups = (reasoning, context) if reasoning_only else (reasoning, answer, context)
+    for group in groups:
+        selected = sorted(group - retained)[:budget]
+        retained.update(selected)
+        budget -= len(selected)
+    indices = sorted(retained)
+    return {key: [values[index] for index in indices] for key, values in record.items()}
 
 
 # Native metadata owns delimiters. A terminating reasoning boundary must be learnable, not guessed.
@@ -125,6 +160,7 @@ def _validate_row(row, messages, field, processor, template, args, number, *, re
     kwargs = {"chat_template": template, **data_profile._template_kwargs(row)}
     rendered = _render(processor, messages, kwargs)
     start, end = _field_span(messages, field, rendered, processor, kwargs)
+    body_span = (start, end)
     if reasoning_only:
         tokenizer = getattr(processor, "tokenizer", processor)
         start, end = _reasoning_bounds(rendered, start, end, tokenizer.response_template["fields"][field])
@@ -173,10 +209,13 @@ def _validate_row(row, messages, field, processor, template, args, number, *, re
               for token, active, flag in zip(ids, mask, markers)]
     if any(flag and (index == 0 or labels[index] == -100) for index, flag in enumerate(markers)):
         raise ValueError("loss mask excludes reasoning tokens")
-    return {"input_ids": ids, "labels": labels, "_reasoning_rows": markers}
+    record = {"input_ids": ids, "labels": labels, "_reasoning_rows": markers}
+    return _fit_tokens(record, offsets, rendered, messages, body_span, processor,
+                       {"chat_template": template, **data_profile._template_kwargs(row)},
+                       args.max_length, reasoning_only)
 
 
-# Mirror installed TRL packing/truncation with temporary provenance, never replacing trainer input tokens.
+# Verify that TRL packing/truncation preserves the targets selected by budget fitting.
 def _validate_retention(records, args, split):
     expected = collections.Counter(source for record in records for source in record["_reasoning_rows"] if source)
     packing = args.packing
@@ -227,11 +266,9 @@ def prepare(cfg, processor, train_set, eval_set, *, progress=None):
                 except (ValueError, TypeError, KeyError, AttributeError, NotImplementedError) as error:
                     raise TrlxError(f"--include-reasoning: {split} row {index + 1}: {error}") from error
                 activity.advance()
-                # Explicit labels are authoritative in TRL. It still owns truncation and packing.
-                result = {"messages": messages}
-                if reasoning_only:
-                    result.update(input_ids=tokens["input_ids"], labels=tokens["labels"])
-                return result
+                # Use the same fitted sequence in profiling and TRL; re-tokenizing messages would
+                # restore discarded context. The original source fields remain unchanged for provenance.
+                return {"messages": messages, "input_ids": tokens["input_ids"], "labels": tokens["labels"]}
 
             converted = dataset.map(convert, with_indices=True, keep_in_memory=True, load_from_cache_file=False)
             try:

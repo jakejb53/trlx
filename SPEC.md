@@ -124,15 +124,19 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
     string into the native reasoning field of its sole, final assistant message. Requires raw text
     `messages` rows in training, evaluation, and replay. Conflicting native reasoning is rejected.
     Tokenizer response metadata or TRL's recognized-template schema supplies the field; the effective
-    training template must render it and supervise all reasoning tokens after truncation/packing.
-    Unsupported mappings, ambiguous conversations, and discarded reasoning fail with row context.
+    training template must render it and supervise the selected reasoning tokens after packing.
+    Oversized rows preserve native structure and allocate tokens to reasoning first, then the answer,
+    then user/system prefixes. Reasoning exceeding the remaining budget is truncated at its end.
+    Fitting is automatic and silent; the limit must accommodate template structure and a reasoning token.
+    Unsupported mappings, ambiguous conversations, and masked selected reasoning fail with row context.
     Transformation is in memory and shared by startup, workers, and `check`; snapshots retain the flag.
     Default disabled; `--no-include-reasoning` disables a configured value. Loss mode remains separately
     controlled. Synthetic CPT evaluation and skipped preparation are incompatible.
   - SFT `--reasoning-only-loss` / `reasoning_only_loss = true` implies reasoning inclusion and
     supervises only reasoning text plus verified native opening/closing boundaries. User/system,
     final-answer, and final-answer termination tokens are masked. Explicit labels apply equally to
-    training, evaluation, and replay; truncation/packing must retain all selected targets. Ambiguous,
+    training, evaluation, and replay; fitting oversized rows omits masked final-answer content.
+    Packing must retain all selected targets. Ambiguous,
     empty, or missing boundary metadata and tokens crossing the selected span are errors. The answer
     can be empty when supported by the template. Default disabled; `--no-reasoning-only-loss` disables
     this objective. Explicitly disabling inclusion conflicts. Snapshots preserve the resolved settings.

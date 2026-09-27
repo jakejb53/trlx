@@ -141,8 +141,11 @@ Conversational columns contain lists of `{role, content}` messages. An SFT JSONL
 For SFT datasets with a separate `reasoning` column, add `--include-reasoning` to train on it.
 Each train/evaluation/replay row must contain nonempty reasoning and exactly one assistant response,
 at the end of its text conversation. The model's response metadata and chat template determine the
-native field; unsupported templates, conflicting fields, or reasoning lost to masks/truncation/packing
+native field; unsupported templates, conflicting fields, or selected reasoning lost to masks/packing
 are errors. Tokenizer offset mappings are required for validation. Source datasets are not rewritten.
+When a row exceeds `--max-length`, native template structure is preserved and reasoning gets the
+token budget first, followed by the final answer, then the beginning of user/system content.
+Reasoning that cannot fit is truncated at its end. This happens automatically without truncation notices.
 The option defaults off, persists as `[dataset].include_reasoning`, and can be overridden with
 `--no-include-reasoning`. Use `--assistant-only-loss` independently to exclude user tokens from loss.
 Already embedded native reasoning continues through the normal template path without this option.
@@ -150,7 +153,8 @@ Already embedded native reasoning continues through the normal template path wit
 Use `--reasoning-only-loss` to score only the reasoning and its native opening/closing boundaries.
 It implies `--include-reasoning`; user/system text, the final answer, and final-answer termination
 tokens are masked. The same mask applies to evaluation and replay, so loss and token accuracy now
-measure reasoning tokens. Explicit, nonempty boundaries must be verifiable from the template metadata;
+measure reasoning tokens. When fitting oversized rows, masked final-answer content is omitted.
+Explicit, nonempty boundaries must be verifiable from the template metadata;
 unsupported boundaries and tokens crossing into the answer are errors. The dataset format is unchanged;
 the final answer may be empty if the template supports it. The option defaults off and persists as
 `[dataset].reasoning_only_loss`; `--no-reasoning-only-loss` disables it. Explicitly disabling reasoning

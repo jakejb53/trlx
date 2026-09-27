@@ -11,6 +11,8 @@ Phase 8, startup settings review, settings assessment, and training output impro
 
 ### Session notes
 
+- GPU recovery (2026-09-25): after an OOM and NCCL timeout, GPU 0 remained at 100% utilization with no compute processes and only 2 MiB allocated. A tiny CUDA kernel followed by synchronization and explicit context destruction restored 0% utilization, P8, and 19.5 W without stopping monitoring services or resetting hardware. Saved as `recover_gpu.py` (Python standard library plus NVIDIA driver; Ampere or newer).
+  From `/home/goon/trl/trlx`, run `timeout --signal=TERM --kill-after=5s 45s python -u recover_gpu.py 0000:21:00.0` for this machine's affected GPU. For another GPU, use its PCI address from `nvidia-smi --query-gpu=index,pci.bus_id --format=csv`. Verify afterward with `nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,pstate --format=csv`. The recovery does not fix trlx's delayed failure propagation: this run waited 30 minutes for NCCL after a peer OOM; that code remains unchanged.
 - Invoke the venv's executables by absolute path; a relative path triggers a site.py prefix warning on every call.
 - Nothing is installed. Both tools run from the repo root as `python -m trlx.cli` and `python -m dataset.cli` (addendum, Packaging).
 - All `trlx` subcommands are implemented. The seven training methods are wired to `train.run`.
