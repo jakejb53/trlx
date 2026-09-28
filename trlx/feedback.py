@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from trlx import TrlxError, processes
+from trlx import TrlxError, processes, worker_control
 
 # Internal inherited descriptor, never a persisted setting or operator override.
 PIPE_ENV = "TRLX_FEEDBACK_FD"
@@ -139,6 +139,7 @@ class Collector:
         self.children = []
         self.streams = []
         self.error = None
+        self.worker_failure = None
 
     # The log file's enclosing context outlives every child pipe reader.
     def __enter__(self):
@@ -190,6 +191,31 @@ class Collector:
                     if process._trlx_source == source:
                         process._trlx_cancel_ready = True
                 display = False
+            # Fatal worker reports are control state, independent of display and log I/O.
+            # Keep the first cause; peer failures during shutdown must not replace it.
+            if event["kind"] == "worker_failure":
+                for process in self.children:
+                    if process._trlx_source == source and source.startswith("rank "):
+                        process._trlx_failure = event["message"]
+                        if self.worker_failure is None:
+                            self.worker_failure = (source, event["message"])
+                display = False
+            if event["kind"] == "worker_finished":
+                for process in self.children:
+                    if process._trlx_source == source:
+                        process._trlx_finished = True
+                display = False
+                # No worker enters normal destruction while a peer can still need a collective.
+                # Check cohort size too: the first worker can finish during the spawn loop.
+                workers = [p for p in self.children if getattr(p, "_trlx_control_fd", None) is not None]
+                if (workers and len(workers) == workers[0]._trlx_world_size
+                        and self.worker_failure is None
+                        and all(p._trlx_finished and not p._trlx_abort_requested for p in workers)):
+                    try:
+                        for process in workers:
+                            os.write(process._trlx_control_fd, worker_control.SHUTDOWN)
+                    except OSError as error:
+                        self.error = TrlxError(f"cannot authorize distributed shutdown: {error}")
             try:
                 identity = (f"{event['level']} {event['logger']}: "
                             if "logger" in event and "level" in event else "")
@@ -210,19 +236,34 @@ class Collector:
         # A private session prevents terminal Ctrl+C from interrupting worker cleanup twice.
         with processes.defer_interrupt():
             read_fd, write_fd = os.pipe()
+            control_read = control_write = None
             try:
                 child_env = dict(env, **{PIPE_ENV: str(write_fd), "PYTHONUNBUFFERED": "1"})
+                inherited = [write_fd]
+                if source.startswith("rank "):
+                    control_read, control_write = os.pipe()
+                    os.set_blocking(control_write, False)
+                    child_env[worker_control.PIPE_ENV] = str(control_read)
+                    inherited.append(control_read)
                 process = subprocess.Popen(command, env=child_env, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                           pass_fds=(write_fd,), start_new_session=True)
+                                           pass_fds=tuple(inherited), start_new_session=True)
                 processes.register(process, source)
+                process._trlx_control_fd = control_write
+                process._trlx_world_size = int(env.get("WORLD_SIZE", "1"))
                 self.children.append(process)
                 self.streams.extend((read_fd, process.stdout))
+                if control_write is not None:
+                    self.streams.append(control_write)
             except BaseException:
                 os.close(read_fd)
+                if control_write is not None:
+                    os.close(control_write)
                 raise
             finally:
                 os.close(write_fd)
+                if control_read is not None:
+                    os.close(control_read)
             stop = threading.Event()
             for fd, structured in ((read_fd, True), (process.stdout.fileno(), False)):
                 thread = threading.Thread(target=self._read, args=(fd, structured, source, stop), daemon=True)
@@ -314,6 +355,8 @@ class Collector:
                 thread.join()
         # Streams are registered before reader startup so a thread-start failure
         # cannot leak the second pipe or make us join a thread that never started.
+        for process in self.children:
+            process._trlx_control_fd = None
         for stream in self.streams:
             if isinstance(stream, int):
                 os.close(stream)

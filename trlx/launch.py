@@ -139,6 +139,12 @@ def spawn(method, config_path, strategy, physical, collector, *, force=False, no
     procs = []
     for rank, device in enumerate(physical):
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=device)
+        # The worker control thread owns communicator abort and observes NCCL errors.
+        # PyTorch's experimental abort API forbids competing watchdog cleanup.
+        env["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+        # PyTorch also sleeps four times this dump allowance after a timeout.
+        # Leave room for that 20s wait inside the supervisor's 30s abort window.
+        env["TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC"] = "5000"
         if world > 1:
             env.update(
                 RANK=str(rank),
@@ -167,6 +173,10 @@ def spawn(method, config_path, strategy, physical, collector, *, force=False, no
 def check(procs, *, feedback=None):
     for rank, proc in enumerate(procs):
         code = proc.poll()
+        if (code == 0 and getattr(proc, "_trlx_control_fd", None) is not None
+                and not proc._trlx_finished):
+            terminate(procs, feedback=feedback)
+            raise TrlxError(f"worker rank {rank} exited before completing distributed shutdown")
         if code is not None and code != 0:
             terminate(procs, feedback=feedback)
             return rank, code
@@ -217,6 +227,13 @@ class Job:
         if self._cancelled:
             return "cancelled", 130
         if self.feedback is not None:
+            # A worker can report failure while hung in distributed teardown. Raising
+            # enters the supervisor's bounded cleanup path and preserves the original
+            # diagnostic instead of substituting a termination signal's exit code.
+            if self.feedback.worker_failure is not None:
+                source, message = self.feedback.worker_failure
+                self.start_verify = None
+                raise TrlxError(f"{source} failed: {message}")
             self.feedback.check()
         if self.progress is not None:
             self.progress.check_error()

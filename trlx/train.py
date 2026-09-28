@@ -55,6 +55,7 @@ from trlx import (
     show,
     synthetic_eval,
     toml_write,
+    worker_control,
 )
 
 # Lines of log.txt shown after a worker failure in TUI mode, where the log was
@@ -448,28 +449,10 @@ def _final_checkpoint(run_dir):
 
 # Worker side. Everything printed here lands in log.txt.
 def _worker(args):
-    import torch.distributed as distributed
-
-    failure = None
-    try:
+    events = args.progress.events
+    with worker_control.Control(events) as control:
+        args.worker_control = control
         return _train_worker(args)
-    except BaseException as error:
-        failure = error
-        raise
-    finally:
-        # Every worker owns its process group, including failures during trainer
-        # construction. No extra barrier: another rank may already have failed.
-        if distributed.is_available() and distributed.is_initialized():
-            try:
-                distributed.destroy_process_group()
-            except Exception as error:
-                if failure is None:
-                    raise TrlxError(f"cannot shut down distributed training: {error}") from error
-                try:
-                    logging.getLogger("trl").error("distributed cleanup also failed: %s", error)
-                except Exception as reporting_error:
-                    # Even a broken diagnostic pipe cannot replace the training error.
-                    failure.add_note(f"distributed cleanup failed: {error}; reporting failed: {reporting_error}")
 
 
 # Load and train inside the process-group lifetime owned by _worker.
@@ -482,6 +465,7 @@ def _train_worker(args):
     with stage(progress, "loading resolved worker configuration"):
         cfg = config_mod.load(args.config, args.command, fsdp=fsdp,
                               overrides=getattr(args, "overrides", None), resolved=True)
+    args.worker_control.ready()
     settings = config_mod.require_assessment(cfg, args.config)
     run_dir = pathlib.Path(cfg.args.output_dir)
     _attach_logging(progress)
@@ -513,7 +497,7 @@ def _train_worker(args):
     # callback because the forward-pass check is a collective under FSDP.
     # Other ranks' reports are discarded.
     report = preflight.Report()
-    callbacks = [cancellation.callback_class()(),
+    callbacks = [worker_control.callback_class()(args.worker_control), cancellation.callback_class()(),
                  preflight.callback_class()(cfg, processor, train_set, report, run_dir, rank,
                                             no_staging=getattr(args, "no_staging", False), progress=progress)]
     if synthetic_callback is not None:

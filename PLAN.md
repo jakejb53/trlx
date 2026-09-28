@@ -6,13 +6,13 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, and SFT reasoning inclusion complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, and SFT reasoning inclusion complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
 
 - GPU recovery (2026-09-25): after an OOM and NCCL timeout, GPU 0 remained at 100% utilization with no compute processes and only 2 MiB allocated. A tiny CUDA kernel followed by synchronization and explicit context destruction restored 0% utilization, P8, and 19.5 W without stopping monitoring services or resetting hardware. Saved as `recover_gpu.py` (Python standard library plus NVIDIA driver; Ampere or newer).
-  From `/home/goon/trl/trlx`, run `timeout --signal=TERM --kill-after=5s 45s python -u recover_gpu.py 0000:21:00.0` for this machine's affected GPU. For another GPU, use its PCI address from `nvidia-smi --query-gpu=index,pci.bus_id --format=csv`. Verify afterward with `nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,pstate --format=csv`. The recovery does not fix trlx's delayed failure propagation: this run waited 30 minutes for NCCL after a peer OOM; that code remains unchanged.
+  From `/home/goon/trl/trlx`, run `timeout --signal=TERM --kill-after=5s 45s python -u recover_gpu.py 0000:21:00.0` for this machine's affected GPU. For another GPU, use its PCI address from `nvidia-smi --query-gpu=index,pci.bus_id --format=csv`. Verify afterward with `nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,pstate --format=csv`. This remains a manual recovery tool; distributed failure cleanup was subsequently fixed on 2026-09-27, as recorded below.
 - Invoke the venv's executables by absolute path; a relative path triggers a site.py prefix warning on every call.
 - Nothing is installed. Both tools run from the repo root as `python -m trlx.cli` and `python -m dataset.cli` (addendum, Packaging).
 - All `trlx` subcommands are implemented. The seven training methods are wired to `train.run`.
@@ -484,8 +484,8 @@ Completed: cooperative cancellation (2026-09-21)
   verification and exits 130. Failure, verifier, and leftover-helper cleanup remain bounded.
 - Launch registers the whole rank cohort before propagating interruption. Workers acknowledge handler
   readiness before receiving SIGINT; helper processes finish normally. A failed peer during cancellation
-  switches to bounded failure cleanup. NCCL watchdog settings are unchanged; no experimental abort API
-  or automatic GPU recovery probe is used.
+  switches to bounded failure cleanup. The 2026-09-27 distributed failure cleanup below supersedes
+  this implementation's unchanged NCCL settings and lack of an abort API; no automatic GPU recovery is used.
 - Added `trlx/cancellation.py`; updated CLI, training, processes, launch, feedback, preflight, quality,
   synthetic evaluation, `README.md`, and `SPEC.md`. Added cancellation/process tests and updated affected
   supervisor/CLI tests. Operational configuration and existing runs were unchanged.
@@ -504,6 +504,26 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   tests.test_cli tests.test_imports tests.test_preflight tests.test_quality \
   tests.test_quality_callback.SchedulingTest -q
 ```
+
+### Distributed failure cleanup (complete, 2026-09-27)
+
+- Fatal cleanup aborts NCCL communicators instead of waiting for unfinished collectives in normal
+  `destroy_process_group()`. Independent worker control threads receive supervisor commands and monitor
+  registered NCCL backends for errors/timeouts. Normal destruction requires all ranks to finish.
+- Added `trlx/worker_control.py`; updated `trlx/train.py`, `trlx/feedback.py`, `trlx/launch.py`,
+  `trlx/processes.py`, and `SPEC.md`. Original failure diagnostics are preserved; ordinary cancellation
+  remains cooperative. No operator configuration changes or automatic GPU recovery.
+- Worker environment: `TORCH_NCCL_ASYNC_ERROR_HANDLING=0` gives the control thread ownership of abort;
+  `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC=5000` allows 5 seconds for diagnostics and a 20-second PyTorch
+  watchdog wait. Supervisor cleanup announces a 30-second limit and elapsed/remaining time every
+  5 seconds. Only failed cleanup escalates to SIGTERM, then SIGKILL.
+- Validation: integrated two-GPU success, rank-local failure, cooperative cancellation, and NCCL
+  timeout checks passed without forced termination. The actual OOM reproduced in
+  `runs/sft/20260927-3--qwen-qwen3.8-27b--reasoning/log.txt`; both ranks completed communicator abort
+  and exited within approximately 10 seconds of failure. Both GPUs returned to 0% utilization and
+  P8 without recovery. Syntax checks and independent source review completed; no regression tests
+  were added or run. This implementation's FSDP failure path has not been exercised.
+- The batch-size-8, max-length-4096 OOM remains unresolved; this fixes cleanup, not memory demand.
 
 ### Synthetic CPT evaluation (complete, 2026-09-21)
 

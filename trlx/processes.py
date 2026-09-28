@@ -6,8 +6,11 @@ import signal
 import subprocess
 import time
 
+from trlx import worker_control
+
 # Failure and orphan cleanup is bounded; cooperative user cancellation is not.
 GRACE_SECONDS = 60.0
+ABORT_SECONDS = 30.0
 TERM_SECONDS = 5.0
 KILL_SECONDS = 5.0
 POLL_SECONDS = 0.1
@@ -51,6 +54,10 @@ def register(process, source):
     process._trlx_source = source
     process._trlx_shutdown_done = False
     process._trlx_cancel_ready = False
+    process._trlx_control_fd = None
+    process._trlx_abort_requested = False
+    process._trlx_finished = False
+    process._trlx_failure = None
 
 
 # Reaping a group leader does not prove that its dataloader children have exited.
@@ -101,15 +108,18 @@ def stop(children, report, *, cancelled=False):
 
     # Poll all ranks together so a slow rank does not multiply the grace period.
     def wait(seconds, *, interruptible=True):
-        deadline = time.monotonic() + seconds
-        next_notice = time.monotonic() + 10
+        started = time.monotonic()
+        deadline = started + seconds
+        next_notice = started + 5
         while pending:
             pending[:] = [process for process in pending if _group_alive(process)]
             if not pending or time.monotonic() >= deadline or interruptible and forced:
                 break
             if time.monotonic() >= next_notice:
-                notice("waiting for cleanup: " + ", ".join(process._trlx_source for process in pending))
-                next_notice = time.monotonic() + 10
+                elapsed = time.monotonic() - started
+                notice(f"waiting for cleanup ({elapsed:.0f}s elapsed; up to {max(0, seconds - elapsed):.0f}s remaining): "
+                       + ", ".join(process._trlx_source for process in pending))
+                next_notice = time.monotonic() + 5
             time.sleep(POLL_SECONDS)
 
     signal.signal(signal.SIGINT, force)
@@ -136,7 +146,8 @@ def stop(children, report, *, cancelled=False):
                     codes = [process.poll() for process in leaders]
                     # A failed peer cannot participate at the next boundary.
                     # Return to bounded failure cleanup instead of waiting forever.
-                    if any(code not in (None, 0, 130) for code in codes):
+                    if (any(code not in (None, 0, 130) for code in codes)
+                            or any(process._trlx_failure is not None for process in leaders)):
                         notice("worker failed during clean shutdown; switching to bounded failure cleanup")
                         break
                     if all(code is not None for code in codes):
@@ -160,16 +171,33 @@ def stop(children, report, *, cancelled=False):
                         next_notice = time.monotonic() + 10
                     time.sleep(POLL_SECONDS)
                 pending[:] = [process for process in pending if _group_alive(process)]
-            else:
+            elif not any(getattr(p, "_trlx_control_fd", None) is not None for p in pending):
                 notice("stopping " + ", ".join(f"{process._trlx_source} (PID {process.pid})" for process in pending)
                        + "; allowing up to 60s for cleanup. Press Ctrl+C again to force termination.")
+        # Fatal peers cannot cooperate at SIGINT boundaries. Ask each live worker's
+        # independent thread to abort its communicators before considering signals.
+        controlled = [p for p in pending if p.poll() is None
+                      and getattr(p, "_trlx_control_fd", None) is not None]
+        if controlled and not forced:
+            notice("Worker failed; aborting distributed operations. "
+                   f"Allowing up to {ABORT_SECONDS:.0f} seconds for diagnostics and cleanup.")
+            for process in controlled:
+                if process._trlx_abort_requested:
+                    continue
+                process._trlx_abort_requested = True
+                try:
+                    os.write(process._trlx_control_fd, worker_control.ABORT)
+                except OSError as error:
+                    errors.append(f"cannot request abort of {process._trlx_source}: {error}")
+            wait(ABORT_SECONDS)
         # Once leaders exit, any surviving helpers (or a standalone verifier)
         # receive bounded cleanup. A second interrupt skips directly to SIGKILL.
-        if pending and not forced:
+        if pending and not forced and not controlled:
             send(signal.SIGINT)
             wait(GRACE_SECONDS)
         if pending and not forced:
-            notice("cleanup grace period expired; sending SIGTERM to remaining process groups")
+            notice("distributed abort did not complete; sending SIGTERM to remaining process groups"
+                   if controlled else "cleanup grace period expired; sending SIGTERM to remaining process groups")
             send(signal.SIGTERM)
             wait(TERM_SECONDS)
         if pending:

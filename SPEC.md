@@ -240,14 +240,18 @@ includes elapsed time, with artifact locations displayed alongside the results.
 
 - All visible GPUs by default. `--gpus` takes device indices.
 - trlx starts its own worker processes. No `accelerate launch`, no accelerate config file.
-- A supervisor process starts one worker per selected GPU. The supervisor owns the run directory, `config.toml`, `log.txt`, and the display, and never loads a model. Rank 0 owns the metric callback, `metrics.jsonl`, and preflight. All ranks report attributed diagnostics and progress. Workers destroy initialized process groups on exit; cleanup failures must not replace an existing training failure. A worker exiting nonzero stops the others and the supervisor exits with that code. Verify runs as a further process after every worker has exited, with all selected GPUs visible, and its exit code is the job's.
+- A supervisor process starts one worker per selected GPU. The supervisor owns the run directory, `config.toml`, `log.txt`, and the display, and never loads a model. Rank 0 owns the metric callback, `metrics.jsonl`, and preflight. All ranks report attributed diagnostics and progress. Normal process-group destruction requires every worker to report completion. Fatal errors are reported before teardown; the supervisor requests communicator abort on surviving workers through dedicated control pipes. Independent worker threads own teardown and monitor all registered NCCL backends for errors/timeouts. Launched workers use `TORCH_NCCL_ASYNC_ERROR_HANDLING=0` because explicit abort owns cleanup. Cleanup failures must not replace the original training failure. A worker exiting nonzero stops the others and the supervisor exits with that code; a reported fatal error exits nonzero with its original diagnostic. Verify runs as a further process after every worker has exited, with all selected GPUs visible, and its exit code is the job's.
 - Workers and verification run in private process groups owned from creation. The first Ctrl+C
   requests cooperative worker cancellation: SIGINT records a request, ranks agree at matching safe
   boundaries, finish outstanding GPU work, and destroy their process groups normally. The supervisor
   waits for handler readiness before signalling leaders; helpers finish their work without that signal.
   Clean shutdown may take 60 seconds or longer, with no automatic timeout escalation. A second Ctrl+C
-  forces termination of owned process groups. Failure, verifier, and leftover-helper cleanup remain
-  bounded: SIGINT with 60 seconds, SIGTERM with 5 seconds, then SIGKILL. Final reaping and output
+  forces termination of owned process groups. Fatal worker cleanup allows 30 seconds for communicator
+  abort and exit, announces the limit immediately, and reports elapsed/remaining time every 5 seconds.
+  Workers use `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC=5000`: 5 seconds for timeout dumps and a 20-second
+  PyTorch watchdog wait. Incomplete cleanup reports failure and escalates to SIGTERM with 5 seconds, then SIGKILL.
+  Verifier and leftover-helper cleanup uses SIGINT with 60 seconds before escalation. No automatic
+  GPU recovery or hardware reset is performed. Final reaping and output
   draining are bounded. Shutdown reports progress and preserves the original failure. Cancelled runs
   skip completion-only work and verification, returning 130 without a cancellation traceback.
 - Strategy: trlx chooses data-parallel when the model at its dtype fits one selected GPU with headroom, sharded otherwise. A sharded run whose per-rank estimate, the training state divided by the rank count plus any unsharded original copy (2.9), still exceeds the smallest selected GPU is refused, forced or not. `--strategy` overrides. Choice printed at startup and recorded in the snapshot.
