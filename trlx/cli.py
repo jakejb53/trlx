@@ -315,6 +315,7 @@ def main(argv=None):
     if worker_rank is not None and worker_rank.isdecimal():
         label += f" rank {worker_rank}"
     from trlx import cancellation, feedback
+    from dataset import failures
 
     connection = feedback.connect()
     events = connection if connection is not None else (
@@ -353,11 +354,30 @@ def main(argv=None):
         # Worker cleanup and the progress context have already unwound. Preserve
         # conventional shell cancellation status without a misleading traceback.
         return 130
-    except TrlxError as e:
-        # A supervisor may have disabled a broken stderr; never redirect errors to metrics stdout.
-        if sys.stderr is not None:
-            print(f"trlx {command}: {e}", file=sys.stderr)
-        return 1
+    except Exception as error:
+        import os
+
+        context = {"command": label}
+        if connection is not None:
+            context.update(rank=worker_rank)
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible:
+                context["cuda_device_mapping"] = {f"local cuda:{index}": device
+                                                  for index, device in enumerate(visible.split(","))}
+        report = failures.capture(error, context=context)
+        if connection is not None:
+            # Refresh after teardown: notes from cleanup belong to the original report.
+            try:
+                connection({"kind": "failure_report", "message": failures.render(report, detailed=True), "report": report})
+            except Exception as reporting_error:
+                error.add_note(f"cannot deliver failure report: {reporting_error}")
+                if sys.stderr is not None:
+                    print(f"{label}: {failures.render(failures.capture(error), detailed=True)}", file=sys.stderr)
+        elif sys.stderr is not None:
+            # Unexpected startup/standalone failures have no run log to hold their traceback.
+            detailed = not report["expected"] and not report["context"].get("log")
+            print(f"{label}: {failures.render(report, detailed=detailed)}", file=sys.stderr)
+        return getattr(error, "exit_code", 1)
     finally:
         if connection is not None:
             connection.close()

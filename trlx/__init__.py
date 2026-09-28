@@ -1,12 +1,13 @@
 """trlx library.
 
-TrlxError is the one exception type that reaches cli.main(), which prints its
-message and exits 1. Every user-facing failure (bad config, bad input, missing
-file, mismatched adapter) is raised as TrlxError at the boundary where the
-message can name the key, path, or row involved. Anything else is a bug and
-surfaces as a traceback on purpose.
+TrlxError identifies expected user-facing failures. Both expected errors and
+unexpected exceptions retain their cause and operation evidence through the
+shared failure reporter; unexpected failures retain technical tracebacks.
 """
 
 
-class TrlxError(Exception):
+from dataset.failures import Error
+
+
+class TrlxError(Error):
     pass

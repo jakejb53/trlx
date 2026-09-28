@@ -9,6 +9,8 @@ import sys
 import threading
 import time
 
+from dataset.failures import annotate
+
 # Display constants, shared by both CLIs. Frequent counters are coalesced, while
 # stage changes, retries, and final outcomes are always printed immediately.
 WAIT_SECONDS = 10.0
@@ -51,6 +53,8 @@ class Progress:
 
     # Stop the watcher before command resources close; never hide an original error.
     def __exit__(self, exc_type, exc, traceback):
+        if isinstance(exc, Exception):
+            annotate(exc, context={"command": self.command})
         if not self._finished:
             self.finish("interrupted" if exc_type and issubclass(exc_type, KeyboardInterrupt)
                         else "failed" if exc_type else "completed")
@@ -174,6 +178,11 @@ class Stage:
 
     # A nested stage restores the enclosing operation, including on failure.
     def __exit__(self, exc_type, exc, traceback):
+        # Capture before popping the stage; silent library calls need the same
+        # operation evidence as visible commands. Inner annotations win.
+        if isinstance(exc, Exception):
+            annotate(exc, context={"operation": self.label, "completed": self.completed,
+                                   "total": self.total, "unit": self.unit})
         if self.reporter is not None:
             with self.reporter._lock:
                 outcome = "failed" if exc_type else "finished"
@@ -189,12 +198,18 @@ class Stage:
 
     # Increment only after the operation has actually completed its unit of work.
     def advance(self, count=1):
+        if self.reporter is None:
+            self.completed += count
         if self.reporter is not None:
             with self.reporter._lock:
                 self.update(self.completed + count)
 
     # Callers may provide authoritative absolute counts, such as TrainerState.global_step.
     def update(self, completed, total=None):
+        if self.reporter is None:
+            self.completed = completed
+            if total is not None:
+                self.total = total
         if self.reporter is not None:
             with self.reporter._lock:
                 if total is not None:

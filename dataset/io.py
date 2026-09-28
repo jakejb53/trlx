@@ -21,11 +21,12 @@ import pyarrow
 import pyarrow.parquet
 
 from dataset.progress import stage
+from dataset.failures import Error, context
 
 
 # Raised for any user-facing failure in this package. main() prints its message
 # and exits nonzero, so callers never see a traceback for bad input.
-class DatasetError(Exception):
+class DatasetError(Error):
     pass
 
 
@@ -58,14 +59,17 @@ def _read_jsonl(path, *, activity=None, record_lines=None):
             raise DatasetError(
                 f"{path}:{e.lineno}: invalid JSON in record {len(rows) + 1}: {e.msg} at column {e.colno}. "
                 "Objects may span multiple lines, but their JSON syntax must be complete; "
-                f"{_heal_guidance(path)}"
+                f"{_heal_guidance(path)}",
+                context={"source": str(path), "line": e.lineno, "column": e.colno, "record": len(rows) + 1},
             ) from e
         if not isinstance(row, dict):
             column = position - text.rfind("\n", 0, position)
             raise DatasetError(
                 f"{path}:{lineno}: record {len(rows) + 1} must be a JSON object, "
                 f"got {type(row).__name__} at column {column}. "
-                "Use a stream of objects in .jsonl, or a JSON array of objects in a .json file."
+                "Use a stream of objects in .jsonl, or a JSON array of objects in a .json file.",
+                context={"source": str(path), "line": lineno, "column": column, "record": len(rows) + 1},
+                evidence={"expected_type": "object", "observed_type": type(row).__name__},
             )
         rows.append(row)
         # Preserve locations from the same parse, without adding metadata to the user's rows.
@@ -94,12 +98,17 @@ def _read_json(path, *, activity=None):
         try:
             data = json.load(f)
         except json.JSONDecodeError as e:
-            raise DatasetError(f"{path}:{e.lineno}: invalid JSON: {e.msg} at column {e.colno}; {_heal_guidance(path)}") from e
+            raise DatasetError(f"{path}:{e.lineno}: invalid JSON: {e.msg} at column {e.colno}; {_heal_guidance(path)}",
+                               context={"source": str(path), "line": e.lineno, "column": e.colno}) from e
     if not isinstance(data, list):
-        raise DatasetError(f"{path}: expected a JSON array of objects, got {type(data).__name__}")
+        raise DatasetError(f"{path}: expected a JSON array of objects, got {type(data).__name__}",
+                           context={"source": str(path)},
+                           evidence={"expected_type": "array", "observed_type": type(data).__name__})
     for i, row in enumerate(data):
         if not isinstance(row, dict):
-            raise DatasetError(f"{path}: element {i} is {type(row).__name__}, expected an object")
+            raise DatasetError(f"{path}: element {i} is {type(row).__name__}, expected an object",
+                               context={"source": str(path), "record": i + 1},
+                               evidence={"expected_type": "object", "observed_type": type(row).__name__})
         if activity is not None:
             activity.advance()
     return data
@@ -186,25 +195,27 @@ def _format(path):
 
 # Translate file/format failures; optional JSONL source lines stay separate from dataset values.
 def read_rows(path, *, progress=None, record_lines=None):
-    reader, _ = _format(path)
-    try:
-        if not pathlib.Path(path).exists():
-            raise DatasetError(f"{path}: no such file; supply an existing dataset path")
-        if not pathlib.Path(path).is_file():
-            raise DatasetError(f"{path}: not a regular file; supply a dataset file, not a directory")
-        with stage(progress, f"reading {path}", unit="rows") as activity:
-            if reader is _read_jsonl and record_lines is not None:
-                rows = reader(path, activity=activity, record_lines=record_lines)
-            else:
-                rows = reader(path, activity=activity)
-            activity.update(len(rows), total=len(rows))
-            return rows
-    except UnicodeError as e:
-        raise DatasetError(f"{path}: cannot decode dataset: {e}; save text datasets as UTF-8") from e
-    except (csv.Error, pyarrow.ArrowInvalid, pyarrow.ArrowTypeError) as e:
-        raise DatasetError(f"{path}: cannot parse dataset: {e}; repair or export a valid {pathlib.Path(path).suffix} file") from e
-    except OSError as e:
-        raise DatasetError(f"{path}: cannot read: {e.strerror or e}; check the path and read permissions") from e
+    with context(source=str(path), io_operation="read"):
+        reader, _ = _format(path)
+        try:
+            if not pathlib.Path(path).exists():
+                raise DatasetError(f"{path}: no such file; supply an existing dataset path")
+            if not pathlib.Path(path).is_file():
+                raise DatasetError(f"{path}: not a regular file; supply a dataset file, not a directory")
+            with stage(progress, f"reading {path}", unit="rows") as activity:
+                if reader is _read_jsonl and record_lines is not None:
+                    rows = reader(path, activity=activity, record_lines=record_lines)
+                else:
+                    rows = reader(path, activity=activity)
+                activity.update(len(rows), total=len(rows))
+                return rows
+        except UnicodeError as e:
+            raise DatasetError(f"{path}: cannot decode dataset: {e}; save text datasets as UTF-8") from e
+        except (csv.Error, pyarrow.ArrowInvalid, pyarrow.ArrowTypeError) as e:
+            raise DatasetError(f"{path}: cannot parse dataset: {e}; repair or export a valid {pathlib.Path(path).suffix} file") from e
+        except OSError as e:
+            raise DatasetError(f"{path}: cannot read: {e.strerror or e}; check the path and read permissions",
+                               evidence={"errno": e.errno}) from e
 
 
 # Resolve parent aliases while preserving the final symlink as the replacement object.
@@ -350,7 +361,7 @@ def _publish_prepared(target, folder, force, directory):
 # Callers finish reading inputs before calling this function. Direct mode deliberately
 # gives up preservation on failure; force authorizes replacement, not silent link traversal.
 def publish_output(path, writer, *, force=False, no_staging=False, directory=False, follow_symlinks=False, progress=None):
-    with stage(progress, f"writing {path}") as activity:
+    with context(destination=str(path), io_operation="write", staged=not no_staging), stage(progress, f"writing {path}") as activity:
         target = validate_output(path, force, follow_symlinks=follow_symlinks, directory=directory)
         folder = None
         try:
@@ -392,7 +403,9 @@ def publish_output(path, writer, *, force=False, no_staging=False, directory=Fal
                 except OSError as e:
                     detail = f"{failure}; " if failure is not None else f"{path}: output published; "
                     message = f"{detail}cannot clean staging directory {folder}: {e}; remove it after checking the output"
-                    if failure is not None and not isinstance(failure, (OSError, DatasetError)):
+                    # Cleanup is secondary even when the primary error is an
+                    # expected file failure; never replace its cause or identity.
+                    if failure is not None:
                         failure.add_note(message)
                     else:
                         raise DatasetError(message) from failure
@@ -513,19 +526,20 @@ def _write_many(outputs, *, force=False, no_staging=False, progress=None):
             targets = _validate_outputs(outputs, force, validate_output)
             if not no_staging:
                 for target, (path, writer) in zip(targets, outputs):
-                    with stage(activity, f"preparing output {path}"):
+                    with context(destination=str(path), io_operation="write"), stage(activity, f"preparing output {path}"):
                         prepared.append(_prepare_output(target, writer, False))
             for i, (target, (path, writer)) in enumerate(zip(targets, outputs)):
                 if no_staging:
                     publish_output(target, writer,
                                    force=force, no_staging=True, progress=activity)
                 else:
-                    with stage(activity, f"publishing {path}"):
+                    with context(destination=str(path), io_operation="publish"), stage(activity, f"publishing {path}"):
                         _publish_prepared(target, prepared[i], force, False)
                 changed.append(str(path))
         except (OSError, UnicodeError, DatasetError) as e:
             status = "completed destinations: " + ", ".join(changed) if changed else "no destination completed"
-            raise DatasetError(f"cannot write outputs: {e}; {status}. Check the named destinations before retrying") from e
+            raise DatasetError(f"cannot write outputs: {e}; {status}. Check the named destinations before retrying",
+                               evidence={"completed_destinations": changed}) from e
         finally:
             failure = sys.exception()
             cleanup_errors = []
@@ -541,7 +555,7 @@ def _write_many(outputs, *, force=False, no_staging=False, progress=None):
                 detail = f"{failure}; " if failure is not None else ""
                 message = (f"{detail}cannot clean staging directories: {'; '.join(cleanup_errors)}; {status}; "
                            "inspect the destinations before removing retained staging files")
-                if failure is not None and not isinstance(failure, (OSError, DatasetError)):
+                if failure is not None:
                     failure.add_note(message)
                 else:
                     raise DatasetError(message) from failure

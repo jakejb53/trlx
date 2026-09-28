@@ -602,6 +602,19 @@ No separate Accelerate configuration or launcher is needed.
 sharded runs receive preflight during training. If moving the config to different
 hardware, review precision settings or run `init --out NEW_CONFIG` on that host.
 
+### Understanding failures
+
+Failures report the original cause, the operation in progress, and relevant evidence. Training errors
+identify the rank and visible GPU; batch failures include available shapes and token counts. OOM
+reports add parameter dtypes, allocator memory, and measured padding overhead. Allocator counters
+collected after an exception are labelled separately from the original allocation-failure figures.
+Unavailable measurements are identified rather than estimated.
+
+Training `log.txt` retains the complete exception chain and traceback. The terminal shows the primary
+failure and cleanup outcome; secondary errors do not replace the cause. Startup and standalone
+commands report on stderr, including a traceback for unexpected errors. Reports exclude tensor
+contents and frame locals and retain credential redaction.
+
 ### Recovering stuck GPU activity
 
 If a failed run has exited but a GPU still reports high utilization with no compute

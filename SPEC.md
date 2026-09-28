@@ -71,6 +71,18 @@ remain authoritative in `metrics.jsonl`. Publication success follows publication
 and cleanup. Endpoint batches report completions as observed while preserving
 input order in their returned results.
 
+Both CLIs preserve failure causes, innermost operation context, evidence, and cleanup notes in a
+common report. Workers notify failure before transmitting detail; the supervisor renders the primary
+report after cleanup and retains other failures separately. Training `log.txt` includes exception
+chains and tracebacks; unexpected standalone/startup failures include their traceback on stderr.
+No separate diagnostic artifact is created. Credential redaction applies to all report fields.
+Reports never collect frame locals or dataset contents. Diagnostic failures are secondary notes.
+Training/evaluation reports capture batch shapes, CPU token/mask counts when available, and failing
+module input metadata. OOM reports add parameter dtypes and allocator counters labelled by collection
+time; the original allocation error remains authoritative for failure-time figures. Diagnostics do not
+initialize or synchronize CUDA. Dispatched/split batches retain shape evidence but omit unavailable CPU
+counts instead of changing Accelerate's batch protocol. Checkpoint failures identify the destination.
+
 ## 2. trlx
 
 ### 2.1 Commands

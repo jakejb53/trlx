@@ -233,7 +233,9 @@ class Job:
             if self.feedback.worker_failure is not None:
                 source, message = self.feedback.worker_failure
                 self.start_verify = None
-                raise TrlxError(f"{source} failed: {message}")
+                error = TrlxError(f"{source} failed: {message}", context={"source": source})
+                error._worker_failure_source = source
+                raise error
             self.feedback.check()
         if self.progress is not None:
             self.progress.check_error()
@@ -241,6 +243,8 @@ class Job:
         if failure is not None:
             self._failure = (f"worker rank {failure[0]}", failure[1])
             self.start_verify = None
+            if self.feedback is not None:
+                raise self.feedback.exit_failure(f"rank {failure[0]}", failure[1])
             return self._failure
         if self.verify is None and self.start_verify is not None and not running(self.workers):
             # Worker exit alone does not prove descendant processes released CUDA.
@@ -252,6 +256,8 @@ class Job:
             code = self.verify.poll()
             if code is not None and code != 0:
                 self._failure = ("verify", code)
+                if self.feedback is not None:
+                    raise self.feedback.exit_failure("verify", code)
                 return self._failure
         return None
 

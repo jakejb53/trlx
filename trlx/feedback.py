@@ -12,6 +12,7 @@ import threading
 import time
 
 from trlx import TrlxError, processes, worker_control
+from dataset import failures
 
 # Internal inherited descriptor, never a persisted setting or operator override.
 PIPE_ENV = "TRLX_FEEDBACK_FD"
@@ -140,6 +141,8 @@ class Collector:
         self.streams = []
         self.error = None
         self.worker_failure = None
+        self.failure_reports = {}
+        self.last_operations = {}
 
     # The log file's enclosing context outlives every child pipe reader.
     def __enter__(self):
@@ -147,7 +150,7 @@ class Collector:
 
     # Own partial launches too; normal exit also collects any surviving descendants.
     def __exit__(self, exc_type, exc, traceback):
-        failures = self.stop(terminal=True, cancelled=isinstance(exc, KeyboardInterrupt))
+        cleanup_errors = self.stop(terminal=True, cancelled=isinstance(exc, KeyboardInterrupt))
         try:
             self.finish()
         except Exception as error:
@@ -157,11 +160,61 @@ class Collector:
                 self.shutdown_notice(f"shutdown error: {error}", terminal=True)
             else:
                 raise
-        if failures:
+        if cleanup_errors:
             if exc is not None:
-                exc.add_note("; ".join(failures))
+                exc.add_note("; ".join(cleanup_errors))
             elif not any(process.returncode not in (None, 0) for process in self.children):
-                raise TrlxError("shutdown incomplete: " + "; ".join(failures))
+                error = TrlxError("shutdown incomplete: " + "; ".join(cleanup_errors))
+                self.final_failure(error)
+                raise error
+        if isinstance(exc, Exception):
+            self.final_failure(exc)
+
+    # Refresh the primary report after readers drain, so later cleanup notes reach log and CLI.
+    def final_failure(self, error):
+        source = getattr(error, "_worker_failure_source", None)
+        if source in self.failure_reports:
+            failures.attach(error, self.failure_reports[source])
+        cleanup = {process._trlx_source: {"exit_code": process.returncode,
+                                         "process_group_gone": process._trlx_shutdown_done,
+                                         "abort_requested": process._trlx_abort_requested,
+                                         "signals_sent": process._trlx_shutdown_signals}
+                   for process in self.children}
+        report = failures.capture(error, context={"log": str(self.log_path)}, evidence={"cleanup": cleanup})
+        for peer, detail in self.failure_reports.items():
+            if peer != source:
+                note = f"Additional failure from {peer}: {detail['summary']}"
+                if note not in report["notes"]:
+                    report["notes"].append(note)
+        failures.attach(error, report)
+        self.accept("supervisor", {"kind": "failure_report", "report": report,
+                                   "message": failures.render(report, detailed=True)}, display=False)
+        if self.error is not None:
+            # The final write happens after the last reader check. Surface its
+            # failure on stderr without replacing the computation failure.
+            report["notes"].append(f"Could not persist complete diagnostics: {self.error}")
+            report["context"].pop("log", None)
+            report["context"]["incomplete_log"] = str(self.log_path)
+            failures.attach(error, report)
+
+    # An exited process may have no Python exception; preserve its observed status and last operation.
+    def exit_failure(self, source, code):
+        error = TrlxError(f"{source} exited with code {code}", context={
+            "source": source, "exit_code": code, "last_operation": self.last_operations.get(source),
+        })
+        error._worker_failure_source = source
+        error.exit_code = code
+        if code < 0:
+            import signal
+
+            failures.annotate(error, context={"signal": signal.Signals(-code).name})
+        # No Python exception was observed in the child. Do not present the
+        # supervisor's eventual raise site as the worker's failure location.
+        report = failures.capture(error)
+        report["causes"] = []
+        report["traceback"] = ""
+        failures.attach(error, report)
+        return error
 
     # Diagnostics must not replace an existing failure, even if stderr is broken.
     def shutdown_notice(self, message, *, terminal=None):
@@ -184,6 +237,13 @@ class Collector:
     # Collection and log writes share a lock, preserving complete source-labelled lines.
     def accept(self, source, event, *, display=True):
         with self.lock:
+            if event["kind"] in ("start", "count") and event.get("label"):
+                self.last_operations[source] = event["label"]
+            if event["kind"] == "failure_report":
+                self.failure_reports[source] = event["report"]
+                display = False  # One terminal report is rendered after cleanup, by the outer CLI.
+                if self.worker_failure is not None and self.worker_failure[0] == source:
+                    self.worker_failure = (source, event["report"]["summary"])
             # This acknowledgement is control state, not display output. Record it
             # before logging so an unrelated log failure cannot lose readiness.
             if event["kind"] == "cancellation_ready":
@@ -197,7 +257,7 @@ class Collector:
                 for process in self.children:
                     if process._trlx_source == source and source.startswith("rank "):
                         process._trlx_failure = event["message"]
-                        if self.worker_failure is None:
+                        if self.worker_failure is None and not event.get("cascading", False):
                             self.worker_failure = (source, event["message"])
                 display = False
             if event["kind"] == "worker_finished":

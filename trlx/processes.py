@@ -58,6 +58,7 @@ def register(process, source):
     process._trlx_abort_requested = False
     process._trlx_finished = False
     process._trlx_failure = None
+    process._trlx_shutdown_signals = []
 
 
 # Reaping a group leader does not prove that its dataloader children have exited.
@@ -101,6 +102,7 @@ def stop(children, report, *, cancelled=False):
         for process in pending:
             try:
                 os.killpg(process._trlx_group, sig)
+                process._trlx_shutdown_signals.append(sig.name)
             except ProcessLookupError:
                 pass
             except OSError as error:

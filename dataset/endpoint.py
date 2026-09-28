@@ -20,6 +20,7 @@ import urllib.request
 
 from dataset.io import DatasetError
 from dataset.progress import stage
+from dataset import failures
 
 # A reply's two parts. `reasoning` is the endpoint's own reasoning field and is
 # "" when the endpoint returns none: either the model is not a reasoning model,
@@ -73,6 +74,32 @@ class _BatchRequests:
             return "; ".join(parts)
 
 
+# One URL/credential policy serves ordinary messages and complete failure reports.
+def diagnostic_redactor(url, api_key=None):
+    parsed = urllib.parse.urlsplit(url)
+    display = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
+    values = {value for value in (
+        api_key, parsed.username, parsed.password,
+        *(value for _, value in urllib.parse.parse_qsl(parsed.query)),
+        *(part.partition("=")[2] for part in parsed.query.split("&")),
+        parsed.fragment,
+    ) if value}
+    # Servers may echo encoded, decoded, or form-encoded credentials separately from the URL.
+    values.update(urllib.parse.unquote(value) for value in tuple(values))
+    values.update(urllib.parse.quote(value, safe="") for value in tuple(values))
+    values.update(urllib.parse.quote_plus(value, safe="") for value in tuple(values))
+    secrets = sorted(values, key=len, reverse=True)
+
+    # This closure stays local; failure transport contains only its sanitized output.
+    def sanitize(value):
+        text = str(value).replace(url, display)
+        for secret in secrets:
+            text = text.replace(secret, "[redacted]")
+        return text
+
+    return sanitize
+
+
 class Endpoint:
     # url is the API base, e.g. http://host:8000/v1; /chat/completions is appended.
     # api_key None sends no Authorization header. timeout is per request in
@@ -91,7 +118,8 @@ class Endpoint:
             parsed = urllib.parse.urlsplit(url)
             _ = parsed.port  # Access validates a supplied numeric port and its range.
         except ValueError:
-            raise DatasetError("endpoint URL is invalid; supply an HTTP(S) base URL with a valid host and port")
+            # Malformed URLs cannot reliably be decomposed for credential redaction.
+            raise DatasetError("endpoint URL is invalid; supply an HTTP(S) base URL with a valid host and port") from None
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
                 or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)):
             raise DatasetError("endpoint URL is invalid; supply an HTTP(S) base URL without whitespace")
@@ -105,20 +133,7 @@ class Endpoint:
         self.display_url = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path.rstrip("/") + "/chat/completions", "", "")
         )
-        self._base_url = url
-        self._base_display_url = urllib.parse.urlunsplit(
-            (parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", "")
-        )
-        values = {value for value in (
-            api_key, parsed.username, parsed.password,
-            *(value for _, value in urllib.parse.parse_qsl(parsed.query)),
-            *(part.partition("=")[2] for part in parsed.query.split("&")),
-        ) if value}
-        # Servers may echo either URL-encoded or decoded credentials in error bodies.
-        values.update(urllib.parse.unquote(value) for value in tuple(values))
-        values.update(urllib.parse.quote(value, safe="") for value in tuple(values))
-        values.update(urllib.parse.quote_plus(value, safe="") for value in tuple(values))
-        self._secrets = sorted(values, key=len, reverse=True)
+        self._redact = diagnostic_redactor(url, api_key)
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
@@ -126,10 +141,7 @@ class Endpoint:
 
     # External error text may echo credentials; redact before truncating a response body.
     def _diagnostic(self, value):
-        text = str(value).replace(self.url, self.display_url).replace(self._base_url, self._base_display_url)
-        for secret in self._secrets:
-            text = text.replace(secret, "[redacted]")
-        return text
+        return self._redact(value)
 
     # One chat completion. Returns the assistant text; callers that need the
     # reasoning field call complete_full.
@@ -142,6 +154,18 @@ class Endpoint:
     # require explicit completion metadata; legacy callers retain their behavior.
     def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False,
                       _status=None):
+        try:
+            return self._complete_full(messages, max_tokens, progress=progress, request=request,
+                                       require_stop=require_stop, _status=_status)
+        except Exception as error:
+            # Preserve causes and traceback, applying the boundary's redaction to the whole report.
+            failures.redact(error, self._diagnostic)
+            failures.annotate(error, context={"endpoint": self.display_url, "operation": "endpoint request"})
+            raise
+
+    # Execute the existing retry policy beneath the single diagnostic-redaction boundary.
+    def _complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False,
+                       _status=None):
         body = {"model": self.model, "messages": messages}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
@@ -150,6 +174,8 @@ class Endpoint:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         last = None
+        # The final attempt remains the cause; the outer boundary redacts its full chain.
+        last_error = None
         for attempt in range(self.retries + 1):
             if attempt:
                 delay = _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
@@ -168,13 +194,16 @@ class Endpoint:
                     try:
                         raw = json.loads(resp.read().decode("utf-8"))
                         reply = self._extract(raw)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as error:
+                        last_error = error
                         last = "reply is not JSON; check the endpoint's chat-completions response"
                         continue
-                    except UnicodeDecodeError:
+                    except UnicodeDecodeError as error:
+                        last_error = error
                         last = "reply has invalid UTF-8 encoding; check the endpoint response"
                         continue
                     except DatasetError as error:
+                        last_error = error
                         last = self._diagnostic(error)
                         continue
                     if require_stop:
@@ -188,6 +217,7 @@ class Endpoint:
                             )
                     return reply
             except urllib.error.HTTPError as e:
+                last_error = e
                 last = f"HTTP {e.code}"
                 if e.code not in _RETRY_STATUSES:
                     # Reading an error body may itself fail; the HTTP status stays final.
@@ -200,13 +230,16 @@ class Endpoint:
                         ) from read_error
                     raise DatasetError(f"{self.display_url}: {last}: {detail}")
             except urllib.error.URLError as e:
+                last_error = e
                 last = f"connection error: {self._diagnostic(e.reason)}"
-            except TimeoutError:
+            except TimeoutError as error:
+                last_error = error
                 last = f"timed out after {self.timeout}s"
             # A connection that drops after the status line surfaces as an
             # http.client exception or a bare OSError, not a URLError. Both are
             # transient and retried like a refused connection.
             except (http.client.HTTPException, OSError) as e:
+                last_error = e
                 last = f"connection dropped: {type(e).__name__}: {self._diagnostic(e)}"
             except UnicodeError:
                 raise DatasetError(f"{self.display_url}: request or reply has invalid text encoding; check the endpoint and credentials")
@@ -214,8 +247,9 @@ class Endpoint:
                 raise DatasetError(f"{self.display_url}: invalid request; check the endpoint URL and credential environment variable")
         raise DatasetError(
             f"{self.display_url}: gave up after {self.retries + 1} attempts; last error: {last}; "
-            "check endpoint availability and the timeout/retries settings"
-        )
+            "check endpoint availability and the timeout/retries settings",
+            context={"attempts": self.retries + 1},
+        ) from last_error
 
     # Splits a chat completions reply into content and reasoning. `reasoning`
     # and `reasoning_content` are the two spellings servers use for the same

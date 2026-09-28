@@ -177,7 +177,7 @@ def load_ref(ref, *, progress=None):
         try:
             rows = read_rows(ref.source, progress=progress, record_lines=record_lines)
         except DatasetError as e:
-            raise TrlxError(str(e))
+            raise TrlxError(str(e), context={"source": str(ref.source)}) from e
         if not rows:
             raise TrlxError(f"{ref.source}: dataset is empty")
         try:
@@ -188,7 +188,8 @@ def load_ref(ref, *, progress=None):
         except (ArrowInvalid, ArrowTypeError) as e:
             detail = _type_conflict(rows, record_lines)
             if detail:
-                raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {detail}") from e
+                raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {detail}",
+                                context={"source": str(ref.source)}, evidence={"field_conflict": detail}) from e
             raise TrlxError(f"{ref.source}: cannot convert rows to a dataset: {e}; "
                             "use consistent value types within each column") from e
     with stage(progress, f"loading dataset {ref.source}", visible=True) as activity:

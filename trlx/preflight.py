@@ -36,6 +36,8 @@ import torch
 
 from dataset.io import DatasetError, write_text
 from dataset.progress import stage
+from dataset import failures
+from dataset.endpoint import diagnostic_redactor
 from trlx import TrlxError, cancellation, run_dirs, show
 
 # Seconds allowed for the vLLM server health probe. A connection that takes
@@ -209,6 +211,20 @@ def _check_vllm(cfg, *, progress=None):
     if cfg.rewards is None:
         return
     base = cfg.args.vllm_server_base_url or f"http://{cfg.args.vllm_server_host}:{cfg.args.vllm_server_port}"
+    try:
+        sanitize = diagnostic_redactor(base)
+    except ValueError:
+        # Preserve the safe validation explanation without raw malformed URL text.
+        raise TrlxError("vllm_server_base_url: invalid URL; supply the TRL vLLM server's HTTP(S) address") from None
+    try:
+        return _probe_vllm(base, progress=progress)
+    except Exception as error:
+        failures.redact(error, sanitize)
+        raise
+
+
+# Probe failures retain their underlying network cause under the caller's URL redactor.
+def _probe_vllm(base, *, progress=None):
     url = base.rstrip("/") + VLLM_PROBE_PATH
     try:
         parsed = urllib.parse.urlsplit(base)

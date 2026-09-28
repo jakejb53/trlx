@@ -1,9 +1,8 @@
 """argparse tree and dispatch for the dataset executable.
 
 Every handler reads inputs through dataset.io, calls one module function,
-and writes through dataset.io. DatasetError is the one exception type that
-reaches main(), which prints its message and exits 1; anything else is a bug
-and surfaces as a traceback on purpose.
+and writes through dataset.io. Failures share structured context; unexpected
+exceptions also print their traceback because this CLI has no persistent log.
 
 This package imports nothing from trl or trlx; tests/test_imports.py enforces it.
 """
@@ -14,6 +13,7 @@ import sys
 
 from dataset import chat, convert, cpt, env, eval_build, fields, heal, pairs, rows, stats
 from dataset.endpoint import Endpoint
+from dataset.failures import capture, render
 from dataset.io import DatasetError, read_rows, validate_rows_output, validate_rows_outputs, write_many_rows, write_rows
 from dataset.progress import Progress, stage
 from dataset.prompts import load as load_prompt
@@ -556,8 +556,9 @@ def main(argv=None):
             result = args.func(args)
             progress.finish("completed" if result == 0 else "failed")
             return result
-    except DatasetError as e:
-        print(f"dataset {args.command}: {e}", file=sys.stderr)
+    except Exception as e:
+        report = capture(e, context={"command": f"dataset {args.command}"})
+        print(f"dataset {args.command}: {render(report, detailed=not report['expected'])}", file=sys.stderr)
         return 1
 
 

@@ -18,7 +18,9 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 
 from dataset.progress import stage
+from dataset import failures
 from trlx import TrlxError
+from trlx import diagnostics
 
 SEQUENCE_CLASSIFICATION = "sequence_classification"
 CAUSAL = "causal"
@@ -37,7 +39,7 @@ def _pretrained_kwargs(spec):
 # first, so this is where that error is made readable.
 def load_config(spec, *, progress=None):
     try:
-        with stage(progress, f"loading model configuration {spec.path}"):
+        with failures.context(model=spec.path, operation="loading model configuration"), stage(progress, f"loading model configuration {spec.path}"):
             return AutoConfig.from_pretrained(spec.path, **_pretrained_kwargs(spec))
     except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load model config: {e}")
@@ -101,9 +103,10 @@ def load_model(spec, kind, device_map=None, *, progress=None):
         # A reward model outputs one scalar; TRL's RewardTrainer requires it.
         kwargs["num_labels"] = 1
     try:
-        with stage(progress, f"loading model weights {spec.path}", visible=True):
+        with failures.context(model=spec.path, weight_dtype=spec.dtype, operation="loading model weights"), stage(progress, f"loading model weights {spec.path}", visible=True):
             return cls.from_pretrained(spec.path, **kwargs)
     except torch.cuda.OutOfMemoryError as e:
+        diagnostics.capture_resources(e)
         raise TrlxError(f"[model].path '{spec.path}': CUDA memory exhausted while loading weights; "
                         "free GPU memory or select a smaller model") from e
     except (OSError, ValueError, ImportError) as e:
@@ -114,7 +117,7 @@ def load_model(spec, kind, device_map=None, *, progress=None):
 # for text-only checkpoints, so one call covers both.
 def load_processor(spec, *, progress=None):
     try:
-        with stage(progress, f"loading processor {spec.path}", visible=True):
+        with failures.context(model=spec.path, operation="loading tokenizer/processor"), stage(progress, f"loading processor {spec.path}", visible=True):
             return AutoProcessor.from_pretrained(spec.path, **_pretrained_kwargs(spec))
     except (OSError, ValueError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load tokenizer or processor: {e}")

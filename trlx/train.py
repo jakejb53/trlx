@@ -34,6 +34,7 @@ import sys
 
 from dataset.progress import Progress, stage
 from dataset.io import DatasetError, write_many_text
+from dataset import failures
 from trlx import (
     TrlxError,
     assessment,
@@ -41,6 +42,7 @@ from trlx import (
     config as config_mod,
     data_load,
     data_profile,
+    diagnostics,
     feedback,
     launch,
     metrics,
@@ -540,8 +542,7 @@ def _train_worker(args):
             finally:
                 activity_callback.close(sys.exc_info())
     except torch.cuda.OutOfMemoryError as e:
-        raise TrlxError("CUDA memory exhausted during training; reduce batch size or sequence length, "
-                        "or use more GPU memory") from e
+        raise TrlxError("CUDA memory exhausted during the training run") from e
     except OSError as e:
         raise TrlxError(f"{e.filename or run_dir}: training I/O failed: {e}; "
                         "check available space and permissions") from e
@@ -595,11 +596,12 @@ def check(args):
         trainer = build_trainer(cfg, model, processor, train_set, eval_set, [], progress=progress)
         preflight.check_trainer(cfg, trainer, train_set, report, progress=progress, profile=assessment_report["profile"])
         preflight.check_offpolicy(cfg, trainer.model, processor, train_set, report, progress=progress)
-    except torch.cuda.OutOfMemoryError:
+    except torch.cuda.OutOfMemoryError as error:
+        diagnostics.capture_resources(error)
         raise TrlxError(
-            f"[model].path '{cfg.model.path}' does not fit GPU {physical[0]} for a standalone check; "
-            "the same preflight runs inside the training run under its strategy"
-        )
+            f"CUDA memory exhausted during standalone preflight for '{cfg.model.path}' on GPU {physical[0]}",
+            context={"model": cfg.model.path, "physical_gpu": physical[0]},
+        ) from error
     finally:
         report.flush()
         if not existed and run_dir.is_dir() and not any(run_dir.iterdir()):
@@ -636,6 +638,7 @@ def build_trainer(cfg, model, processor, train_set, eval_set, callbacks, *, prog
             extra["reference_model"] = model_mod.load_model(cfg.model, cfg.method.model_kind, progress=progress)
     from peft.utils.error import NoMatchingPeftModuleError
 
+    trainer_cls = diagnostics.trainer_class(trainer_cls)
     try:
         with stage(progress, "constructing trainer and preparing datasets", visible=True), synthetic_eval.deferred_evaluation(
             cfg.args, cfg.dataset.synthetic_dataset_eval and eval_set is None,

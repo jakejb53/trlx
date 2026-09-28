@@ -46,8 +46,12 @@ class Control:
     def _fail(self, error):
         if self.error is None:
             self.error = error
+            cascading = self.aborting.is_set()
+            # Detailed reports are sent by the CLI after abort; this path also runs on
+            # the control thread and must not delay its communicator cleanup.
+            self.aborting.set()
             try:
-                self.events({"kind": "worker_failure", "message": str(error) or type(error).__name__})
+                self.events({"kind": "worker_failure", "message": f"{type(error).__name__}: worker failed", "cascading": cascading})
             except Exception as reporting_error:
                 error.add_note(f"cannot report worker failure: {reporting_error}")
         self.aborting.set()

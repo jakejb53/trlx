@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, and SFT reasoning inclusion complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, and SFT reasoning inclusion complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -524,6 +524,29 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   P8 without recovery. Syntax checks and independent source review completed; no regression tests
   were added or run. This implementation's FSDP failure path has not been exercised.
 - The batch-size-8, max-length-4096 OOM remains unresolved; this fixes cleanup, not memory demand.
+
+### Common failure reporting (complete, 2026-09-28)
+
+- `dataset/failures.py` owns shared cause, context, evidence, traceback, and cleanup reporting for both
+  CLIs without importing PyTorch or trlx. Stages retain the innermost operation; wrappers and worker
+  transport preserve the report. The terminal presents the primary failure after cleanup; training
+  `log.txt` retains technical detail and additional failures. Startup failures need no new artifact.
+- `trlx/diagnostics.py` captures batch metadata, failing module inputs, parameter dtypes, and OOM
+  allocator evidence without retaining tensors or synchronizing CUDA. Failure-time figures from the
+  original exception are distinguished from later counters. Data/I/O errors retain locations and
+  affected paths; diagnostic collection and persistence failures remain secondary.
+- Endpoint and vLLM redaction covers causes, notes, and tracebacks, including encoded credentials.
+  Retry exhaustion preserves the last cause. Malformed URL parser details are suppressed when they
+  cannot be safely redacted. Report schema keys remain intact.
+- Validation: the original OOM produced the built-in report in
+  `runs/sft/20260927-6--qwen-qwen3.8-27b--reasoning/log.txt`; both GPUs returned to idle without forced
+  termination or recovery. Controlled checks covered malformed JSON, model loading, training/evaluation,
+  checkpoint I/O, unexpected worker exit, diagnostic-provider/log-write failures, redaction, and retry
+  exhaustion. Tiny real SFT training/evaluation, syntax checks, dataset import independence, and
+  independent source review passed. No regression-test files or operator configuration changes.
+- Dispatched/split batches report shapes and explicitly unavailable CPU counts. Full trainer coverage
+  beyond SFT and this implementation's FSDP path remain unverified. The training OOM itself remains
+  unresolved; diagnostics now expose its padded-batch and FP32 LoRA activation costs.
 
 ### Synthetic CPT evaluation (complete, 2026-09-21)
 
