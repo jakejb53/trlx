@@ -242,6 +242,11 @@ Change columns are named `Change`; no repeated legend sentence accompanies the h
 Line displays always include `training_loss` and the latest measured `eval_loss`, with `eval_step`
 identifying that measurement. Evaluation values remain blank until measured and are retained across
 subsequent training rows, resume, and `show`. Other metrics continue to follow `[ranges]`.
+Streaming line tables add `Baseline Δ` after each loss's `Change`: the signed three-decimal difference
+from its first finite logged value (normally step zero for evaluation, first training log for training).
+Baselines are reconstructed from retained history on resume and `show`. Missing/non-finite losses have
+no baseline difference; the baseline measurement itself shows zero. Each loss and both changes stay
+together when columns wrap.
 
 Preflight example text and trained-token text remain in `preflight.json`; terminal
 output retains token counts, mask information, and warnings. Checkpoint completion identifies the verified

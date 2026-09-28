@@ -5,6 +5,7 @@ metrics. The fixed-layout helpers remain available to existing callers.
 """
 
 import dataclasses
+import math
 
 from trlx.ranges import Cell
 
@@ -15,6 +16,7 @@ EPOCH_WIDTH = 11
 PERCENT_WIDTH = 4
 EVAL_WIDTH = 4
 CHANGE_WIDTH = 9
+BASELINE_LABEL = "Baseline Δ"
 # Minimum metric column: "-1234.567!" plus a space.
 MIN_METRIC_WIDTH = 10
 
@@ -85,7 +87,7 @@ def render(rows, ranges):
 
 
 class Stream:
-    # Delta history belongs to ranges.evaluate; this object owns presentation only.
+    # Loss history comes from observed records, including retained records on resume.
     def __init__(self, range_table, emit, width=120):
         self.ranges = range_table
         self.emit = emit
@@ -94,6 +96,7 @@ class Stream:
         self._rows = 0
         self._widths = {}
         self._losses = {}
+        self._loss_baselines = {}
 
     # Cache only measured losses. Resume seeds this state from retained records
     # without printing history; carried evaluation values keep their original step.
@@ -105,6 +108,9 @@ class Stream:
             if raw is None:
                 continue
             value = float(raw)
+            # The first finite measurement stays the baseline across carried values and resume.
+            if math.isfinite(value):
+                self._loss_baselines.setdefault(name, value)
             previous = self._losses.get(name)
             bounds = self.ranges.get(name)
             cell = Cell(value, value - previous[0].value if previous else None,
@@ -162,6 +168,9 @@ class Stream:
                 self._widths.get((name, "value"), 0), 5, len(_metric_label(name)), len(format_value(cell)))
             self._widths[(name, "change")] = max(
                 self._widths.get((name, "change"), 0), 6, len(format_change(cell)))
+            if name in ("loss", "eval_loss"):
+                self._widths[(name, "baseline")] = max(
+                    self._widths.get((name, "baseline"), 0), len(BASELINE_LABEL), len(self._baseline_change(name, cell)))
 
         groups = self._groups(names, labels)
         widths = tuple(self._widths.items())
@@ -180,19 +189,28 @@ class Stream:
         self._layout = layout
         self._rows += 1
 
-    # Keep each metric beside its change; unusually long names/values stay intact.
+    # Keep each metric beside all its changes; unusually long names/values stay intact.
     def _groups(self, names, labels):
         prefix = sum(self._widths[name] for name in labels) + 2 * (len(labels) - 1)
         groups = [[]]
         length = prefix
         for name in names:
             size = self._widths[(name, "value")] + self._widths[(name, "change")] + 4
+            if name in ("loss", "eval_loss"):
+                size += self._widths[(name, "baseline")] + 2
             if groups[-1] and length + size > self.width:
                 groups.append([])
                 length = prefix
             groups[-1].append(name)
             length += size
         return groups
+
+    # Missing/non-finite losses cannot supply a meaningful baseline difference.
+    def _baseline_change(self, name, cell):
+        baseline = self._loss_baselines.get(name)
+        if baseline is None or cell.value is None or not math.isfinite(cell.value):
+            return ""
+        return f"{cell.value - baseline:+.3f}"
 
     # The same width calculation formats headings and data, including wide values.
     def _columns(self, progress, names, row=None):
@@ -203,4 +221,7 @@ class Stream:
             change = "Change" if row is None else format_change(row.cells[name])
             parts.extend([value.rjust(self._widths[(name, "value")]),
                           change.rjust(self._widths[(name, "change")])])
+            if name in ("loss", "eval_loss"):
+                baseline = BASELINE_LABEL if row is None else self._baseline_change(name, row.cells[name])
+                parts.append(baseline.rjust(self._widths[(name, "baseline")]))
         return "  ".join(parts).rstrip()

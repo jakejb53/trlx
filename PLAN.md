@@ -655,6 +655,13 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   were fixed and re-reviewed with no remaining runtime blockers. No live training was run;
   operator configurations and existing runs were unchanged.
 
+- Baseline loss changes added (2026-09-28): streaming tables show `Baseline Δ` after each loss's
+  existing `Change`, using the first finite logged training/evaluation loss. Retained history restores
+  baselines on resume and `show`; narrow layouts keep each loss and both changes together.
+  Updated `trlx/render_lines.py` and `SPEC.md`. Arithmetic, previous-value changes, resume, missing/
+  non-finite values, summary exclusion, wrapping, and syntax checks passed. Stored metrics and
+  configuration are unchanged; no regression-test files were added.
+
 ### SFT reasoning inclusion (complete, 2026-09-23)
 
 - `--include-reasoning` / `[dataset].include_reasoning` maps a nonempty separate `reasoning`
