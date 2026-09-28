@@ -1,7 +1,49 @@
 # trlx
 
-TRL training without bespoke Python or a setup worksheet. `trlx` handles configuration,
-GPU launch, live metrics, and verification; `dataset` prepares the training data.
+**TRL training through an intuitive CLI, without bespoke Python training scripts.**
+`trlx` brings seven TRL trainers together with reusable configuration, LoRA and full
+fine-tuning, multi-GPU execution, evaluation, and live metrics. Its companion
+`dataset` CLI creates and manages the training and evaluation data those trainers need.
+
+## Why trlx exists
+
+Using TRL directly gives you Python trainer APIs; you assemble the surrounding workflow
+for loading models and datasets, configuring trainers, launching distributed jobs,
+recording results, and checking saved artifacts. trlx makes that workflow available
+through commands and a TOML configuration, so experiments do not each need a custom script.
+
+TRL supplies the trainers. trlx exposes their method-specific settings as CLI options
+and combines them with the tools needed before, during, and after training:
+
+| Need | What trlx provides |
+| --- | --- |
+| Choose a training objective | SFT, DPO, KTO, reward modeling, GRPO, RLOO, and distillation, with trainer settings and per-run overrides. |
+| Prepare suitable data | Format conversion, text chunking, endpoint-generated Q&A and evaluation summaries, preference pairs, filtering, splitting, mixing, sampling, repair, and statistics. |
+| Check a setup before committing to training | Full dataset inspection, a review of effective tuning settings, and preflight checks for model, adapter, dataset, and trainer compatibility. |
+| Use available GPUs | Hardware-aware initialization, automatic data-parallel or sharded launch, and explicit device/strategy overrides without a separate launcher configuration. |
+| See what training is doing | Live metric tables or a full-screen TUI, loss charts, measured progress, complete diagnostic logs, and saved metrics that can be viewed later. |
+| Measure results | Step-zero evaluation, held-out or synthetic evaluation data, and optional independent quality benchmarks with per-example evidence. |
+| Train on reasoning or preserve earlier behavior | Native reasoning inclusion, reasoning-only loss, and SFT replay with optional KL regularization. |
+| Continue and export work | Run-owned configuration and prompt snapshots, checkpoint resume, artifact verification, and LoRA merging. |
+| Handle failures and replacement safely | Contextual errors, coordinated cancellation and distributed failure cleanup, explicit replacement permission, and staged output publication. |
+
+You can keep shared defaults, specialize them by method, and change individual runs
+from the command line. The supported scope is the seven trainers below; some settings
+are managed by trlx or restricted when features conflict. Model classes come from
+model metadata, rather than a hardcoded model family. `dataset` also works independently
+of TRL, so its preparation tools are useful outside a trlx training run.
+
+## Guide
+
+- [Start here](#start-here) and [installing updates](#installing-updates)
+- [Prepare datasets](#dataset-cheat-sheet) and [generate data through endpoints](#tutorial-endpoint-generation-and-credentials)
+- [Choose a trainer](#training-cheat-sheet) and [configure runs](#tutorial-temporary-and-persistent-settings)
+- [Train on reasoning](#sft-reasoning-supervision), [use rewards](#tutorial-rewards), and [mix replay data](#tutorial-sft-replay)
+- [Configure LoRA and GPUs](#tutorial-lora-memory-and-gpus)
+- [Choose evaluation data](#tutorial-evaluation-and-data-sources) and [run quality checks](#settings-assessment-and-independent-quality-checks)
+- [Validate a setup](#validation-before-and-after-training) and [monitor or stop training](#monitoring-cancellation-and-failures)
+- [Resume, inspect, and merge results](#tutorial-checkpoints-resume-and-results)
+- [Customize prompt files](#prompt-files) and [control output replacement](#output-replacement-and-staging)
 
 ## Start here
 
@@ -52,19 +94,6 @@ dataset --help
 Help lists commands, options, defaults, constraints, and examples; it needs no
 config, model, dataset, or GPU. The sections below are reference and optional tuning.
 
-Both tools report their current operation, completed counts when available, retries,
-and final outcome to stderr. After ten seconds without feedback, a waiting notice
-shows elapsed time and the last measured progress; it does not claim work is advancing.
-Training records feedback in `log.txt`, visible in the TUI's log pane. While workers train,
-waiting notices stay in the log so they do not interrupt metrics tables; other training-command
-phases use a 30-second terminal waiting interval. Preflight example text stays in `preflight.json`.
-
-The first Ctrl+C requests clean shutdown at a shared worker boundary. Workers finish their current
-coordinated work before releasing GPU resources; this may take 60 seconds or longer, with no automatic
-timeout escalation. Press Ctrl+C again to force termination of workers and their descendants.
-Shutdown reports progress, prevents verification from starting, and exits with status 130.
-Worker failures and leftover helper processes retain bounded cleanup.
-
 ## Installing updates
 
 Editing or updating the checkout does not update an installed copy of the tools.
@@ -79,44 +108,63 @@ This keeps installed runtime dependencies and `run.toml` unchanged. If the depen
 requirements in `pyproject.toml` changed, run the normal installation command first
 to update them.
 
-## Prompt files
+## Dataset cheat sheet
 
-`trlx init` copies these editable UTF-8 files into `prompts/` beside `--out`.
-Training paths in `[prompts]` are relative to the config directory; dataset CLI
-paths are relative to the working directory. Absolute paths are accepted.
+`dataset` works independently of TRL. Files may be JSONL (one object per line), JSON
+(an array of objects), CSV, or Parquet. The output extension selects the file format.
+CSV cells are strings; use JSONL or Parquet for nested messages. Replacing an existing
+output or input requires `--force`. All writers support `--no-staging` for direct writes.
 
-| File | Training config key / dataset option | Required placeholders |
-| --- | --- | --- |
-| `chat-questions.prompt` | `--questions-prompt` | `{chunk}`, `{n}` |
-| `chat-answers.prompt` | `--answers-prompt` | `{chunk}`, `{question}` |
-| `eval-build-summary.prompt` | `--summary-prompt` | None |
-| `synthetic-eval-summary.prompt` | `synthetic_eval_summary` | `{text}` |
-| `quality-qa.prompt` | `quality_qa` | None |
-| `quality-classification.prompt` | `quality_classification` | `{labels}` |
-| `quality-multiple-choice.prompt` | `quality_multiple_choice` | `{choices}` |
-| `quality-json.prompt` | `quality_json` | `{required_fields}` |
-| `quality-instruction-following-judge.prompt` | `quality_instruction_following_judge` | None |
-| `quality-writing-judge.prompt` | `quality_writing_judge` | None |
+```sh
+# Convert the file format, or reshape prompt/completion rows into messages.
+dataset convert data.json --out data.jsonl
+dataset convert prompts.jsonl --to messages --out chat.jsonl
+dataset convert chat.jsonl --to prompt-completion --out prompts.jsonl
 
-For example, `[prompts]` contains
-`quality_qa = "prompts/quality-qa.prompt"`. Only enabled features require their
-files. Missing, unreadable, empty, invalid UTF-8, or invalid templates fail before
-requests or model loading. Installed templates are used only by `init`; runtime
-never falls back to them. The additional `llm-judge.prompt.example` is guidance,
-not an active prompt.
+# Reorder, divide, combine, or sample rows.
+dataset shuffle data.jsonl --seed 42 --out shuffled.jsonl
+dataset split shuffled.jsonl --fraction 0.9 --out train.jsonl --rest eval.jsonl
+dataset mix a.jsonl b.jsonl --fractions 1,0.25 --seed 42 --out mixed.jsonl
+dataset sample data.jsonl --n 20 --seed 42 --out sample.jsonl
+dataset sample data.jsonl --n 10 --head --out preview.jsonl
 
-Substitution is one pass: inserted source text is never interpreted as a template.
-`{labels}` is a JSON list; `{choices}` is one `label: text` line per choice.
-The JSON preset uses `[[ The JSON object must contain these top-level keys: {required_fields}.]]`:
-the optional block is omitted when the row has no required fields, otherwise the
-placeholder receives their JSON list. Keep each template's required placeholders.
+# Edit columns or select rows.
+dataset fields data.jsonl --add 'length=len(text)' --out sized.jsonl
+dataset fields data.jsonl --add 'source="manual"' --out tagged.jsonl
+dataset fields data.jsonl --remove unused --rename answer=completion --out edited.jsonl
+dataset fields pairs.jsonl --swap chosen=rejected --out swapped.jsonl
+dataset filter data.jsonl --where 'label == True' --out positive.jsonl
+dataset filter data.jsonl --max-length text=4000 --out short.jsonl
 
-For an existing configuration, create a fresh scratch directory and run
-`trlx init --out SCRATCH/run.toml`, where `SCRATCH` already exists and contains
-neither that config nor generated prompt files. Copy the needed prompt files and
-`[prompts]` entries into your existing setup; author a separate judge rubric if
-using `llm_judge`. Existing runs need their required prompt files and saved paths
-before they can resume.
+# Chunk plain text, build preference pairs, or extract prompt/completion rows.
+dataset cpt source.txt --max-tokens 1024 --out chunks.jsonl
+dataset pairs chosen.jsonl rejected.jsonl --strict --out pairs.jsonl
+dataset pairs messages.jsonl --out prompts.jsonl
+
+# Repair syntax, inspect lengths, or score responses with a model.
+dataset heal broken.jsonl --out repaired.jsonl
+dataset stats data.jsonl
+dataset stats pairs.jsonl --columns chosen,rejected --model MODEL
+
+# Generate question/answer data from text: complete example in the endpoint tutorial.
+dataset chat --help
+dataset fields --help
+```
+
+- `split` takes either `--n` or `--fraction`; `--key COLUMN` keeps groups together
+  and may exceed the requested count. It preserves input order.
+- `mix` fractions select a share of each input, not a share of the output.
+  Sources are concatenated; shuffle afterward to interleave.
+- `fields` and `filter` expressions use column names or `row["column-name"]`;
+  `len`, `str`, `int`, and `float` are available. Field operations run in the order
+  add, remove, rename, swap. Flags may repeat; all filter conditions must pass.
+- Length limits count characters or list items. `cpt`, `chat`, and plain `stats`
+  estimate tokens as characters / 3.5; `stats --model` loads weights for exact
+  token counts and response log-probabilities.
+- `pairs` requires `messages` ending in an assistant turn. Two inputs align by
+  user-turn content; unmatched rows are omitted unless `--strict` makes them fatal.
+- `heal` reports every repair, may drop a truncated final JSONL row, and writes
+  output even when errors remain; remaining errors produce a nonzero exit.
 
 ## Training cheat sheet
 
@@ -137,28 +185,6 @@ Conversational columns contain lists of `{role, content}` messages. An SFT JSONL
 ```json
 {"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4"}]}
 ```
-
-For SFT datasets with a separate `reasoning` column, add `--include-reasoning` to train on it.
-Each train/evaluation/replay row must contain nonempty reasoning and exactly one assistant response,
-at the end of its text conversation. The model's response metadata and chat template determine the
-native field; unsupported templates, conflicting fields, or selected reasoning lost to masks/packing
-are errors. Tokenizer offset mappings are required for validation. Source datasets are not rewritten.
-When a row exceeds `--max-length`, native template structure is preserved and reasoning gets the
-token budget first, followed by the final answer, then the beginning of user/system content.
-Reasoning that cannot fit is truncated at its end. This happens automatically without truncation notices.
-The option defaults off, persists as `[dataset].include_reasoning`, and can be overridden with
-`--no-include-reasoning`. Use `--assistant-only-loss` independently to exclude user tokens from loss.
-Already embedded native reasoning continues through the normal template path without this option.
-
-Use `--reasoning-only-loss` to score only the reasoning and its native opening/closing boundaries.
-It implies `--include-reasoning`; user/system text, the final answer, and final-answer termination
-tokens are masked. The same mask applies to evaluation and replay, so loss and token accuracy now
-measure reasoning tokens. When fitting oversized rows, masked final-answer content is omitted.
-Explicit, nonempty boundaries must be verifiable from the template metadata;
-unsupported boundaries and tokens crossing into the answer are errors. The dataset format is unchanged;
-the final answer may be empty if the template supports it. The option defaults off and persists as
-`[dataset].reasoning_only_loss`; `--no-reasoning-only-loss` disables it. Explicitly disabling reasoning
-inclusion while enabling reasoning-only loss is an error. `--assistant-only-loss` can remain enabled.
 
 The normal command for SFT, DPO, KTO, or reward-model training is:
 
@@ -192,6 +218,54 @@ trlx replay-build --model MODEL --prompts prompts.jsonl --out replay.jsonl --max
 trlx check dpo --help
 trlx replay-build --help
 ```
+
+## SFT reasoning supervision
+
+Reasoning datasets can retain a model's explanation separately from its final answer.
+trlx maps that explanation into the model's native chat format and validates which
+tokens contribute to loss. Choose whether to train on the answer as well:
+
+```sh
+# Include reasoning and the answer; exclude user/system tokens from loss.
+trlx sft --model MODEL --dataset reasoning.jsonl --include-reasoning --assistant-only-loss
+
+# Train only on reasoning and its native boundaries.
+trlx sft --model MODEL --dataset reasoning.jsonl --reasoning-only-loss
+```
+
+`reasoning.jsonl` must contain raw text `messages` rows with a separate nonempty
+`reasoning` string. For example, with a model whose template supports reasoning:
+
+```json
+{"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4"}],"reasoning":"Adding two to two gives four."}
+```
+
+For SFT datasets with a separate `reasoning` column, add `--include-reasoning` to train on it.
+Each train/evaluation/replay row must contain nonempty reasoning and exactly one assistant response,
+at the end of its text conversation. The model's response metadata and chat template determine the
+native field; unsupported templates, conflicting fields, or selected reasoning lost to masks/packing
+are errors. Tokenizer offset mappings are required for validation. Source datasets are not rewritten.
+When a row exceeds `--max-length`, native template structure is preserved and reasoning gets the
+token budget first, followed by the final answer, then the beginning of user/system content.
+Reasoning that cannot fit is truncated at its end. This happens automatically without truncation notices.
+The option defaults off, persists as `[dataset].include_reasoning`, and can be overridden with
+`--no-include-reasoning`. Use `--assistant-only-loss` independently to exclude user tokens from loss.
+Already embedded native reasoning continues through the normal template path without this option.
+
+Use `--reasoning-only-loss` to score only the reasoning and its native opening/closing boundaries.
+It implies `--include-reasoning`; user/system text, the final answer, and final-answer termination
+tokens are masked. The same mask applies to evaluation and replay, so loss and token accuracy now
+measure reasoning tokens. When fitting oversized rows, masked final-answer content is omitted.
+Explicit, nonempty boundaries must be verifiable from the template metadata;
+unsupported boundaries and tokens crossing into the answer are errors. The dataset format is unchanged;
+the final answer may be empty if the template supports it. The option defaults off and persists as
+`[dataset].reasoning_only_loss`; `--no-reasoning-only-loss` disables it. Explicitly disabling reasoning
+inclusion while enabling reasoning-only loss is an error. `--assistant-only-loss` can remain enabled.
+
+Reasoning inclusion is incompatible with synthetic CPT evaluation and skipped dataset
+preparation. The length limit must fit the native template structure and a reasoning token.
+
+## Output replacement and staging
 
 Uppercase names are placeholders; replace them with your own inputs. Paths are
 relative to the working directory. Every command accepts `--force`. Without it,
@@ -228,11 +302,86 @@ trlx merge --base BASE --adapter ADAPTER --out MERGED --force --no-staging
 trlx merge --base BASE --adapter ADAPTER --out BASE --force
 ```
 
+## Validation before and after training
+
+Validation happens at several stages, with different inputs and costs:
+
+| Stage | What it checks | When it runs |
+| --- | --- | --- |
+| Startup inspection and review | Configuration, model metadata/tokenizers, and all effective train/evaluation/replay rows; tuning findings include measured evidence and preparation projections. | Before weight loading and run allocation or resume rewind; synthetic evaluation rows are generated later. |
+| Preflight | Loaded model and prepared data, resolved LoRA targets, trainable parameters, label masks, truncation, and method-specific compatibility. | Before training, or by running `trlx check METHOD`. |
+| Checkpoint verification | Model loading, adapter integrity, and chat-template consistency with the base. | After successful training unless disabled, or by running `trlx verify`. |
+
+```sh
+# Load and check a setup without training or prompting for review.
+trlx check sft --model MODEL --dataset DATA
+
+# Inspect a saved checkpoint; --force is needed only to replace an existing report.
+trlx verify CHECKPOINT --base BASE
+```
+
+Preflight reports resolved LoRA targets and the trainable parameter count. It warns
+about response truncation, an empty trained-token mask in the first prepared example,
+missing/EOS padding tokens, and gradient checkpointing combined with caching.
+DPO and KTO also score starting-model response log-probabilities on the configured
+preflight sample to flag potentially off-policy data. GRPO and RLOO check for the
+TRL vLLM server needed for weight synchronization.
+
+Fatal checks stop the job with a contextual error; advisory warnings remain visible
+and allow training to continue. `preflight.json` retains the findings, example text,
+and trained-token information. Standalone `check` uses one GPU and requires the model
+to fit there; larger sharded models receive preflight inside their training run.
+
+Verification runs in a separate process after the training workers exit. For adapters,
+it compares the count and maximum magnitude of saved `lora_B` tensors with the loaded
+adapter. Full checkpoints must load successfully, and the saved chat template must
+match the base. Results go to `verify.json`; a failed verification makes the command
+exit nonzero. Generation quality is measured by evaluation and quality checks below.
+
+## Monitoring, cancellation, and failures
+
+Line mode displays training and evaluation tables with step/epoch progress, metric
+values, and changes from prior measurements. Headings repeat after interruptions;
+narrow terminals use column groups so values remain visible. `[ranges]` selects
+additional metrics and marks values outside configured intervals.
+
+Use `--tui` for a full-screen view of progress, recent metrics, checkpoints, diagnostics,
+and validation results. Inspect saved results with `trlx show RUN_DIR` or add `--tui`.
+`metrics.jsonl` is the authoritative metric history; `log.txt` retains full diagnostics
+with their sources. Display failure stops presentation while supervision continues.
+
+Both tools report current operations, measured counts when available, retries, and
+final outcome with elapsed time. Opaque operations have no inferred percentage.
+After ten seconds without feedback, ordinary command waiting notices show elapsed
+time and the last measured progress. Training's supervisor uses 30-second terminal
+notices outside training; while workers train, waiting notices remain in the log.
+Repeated warnings and rank progress are consolidated in terminal output.
+
+The first Ctrl+C requests clean shutdown at a shared worker boundary. Workers finish
+their current coordinated GPU work before releasing resources; this may take 60 seconds
+or longer without automatic timeout escalation. A second Ctrl+C forces termination
+of owned process groups. Cancellation skips completion-only work and verification,
+reports shutdown progress, and exits with status 130.
+
+A fatal worker failure stops the other workers and requests NCCL communicator abort.
+Cleanup preserves the original error, reports a 30-second abort/exit limit, and escalates
+to termination signals if cleanup cannot complete. GPU recovery is a separate manual
+operation, described [below](#recovering-stuck-gpu-activity).
+
 ## Settings assessment and independent quality checks
+
+Choose the measurement that answers your question:
+
+| Measurement | Data | What it tells you |
+| --- | --- | --- |
+| Ordinary evaluation | A held-out split or a separate evaluation dataset | The trainer's loss and available method-specific metrics, including a step-zero baseline. |
+| Synthetic CPT evaluation | One generated summary per primary `text` row | Ordinary evaluation on summaries while all original rows train; these summaries derive from training material. |
+| Independent quality checks | A separate benchmark dataset and a built-in preset | Task scores such as QA accuracy, JSON validity, or judged writing quality, with individual evidence. |
+| Checkpoint verification | Saved checkpoint and base model | Whether the artifacts load and pass integrity/template checks. |
 
 All seven trainers provide a full pre-run scan. Startup findings distinguish
 measurements, preparation projections, and heuristics, and include their evidence. They never change
-training settings, stop a run, or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
+training settings or select a checkpoint. Complete pre-run evidence is in `assessment.json`;
 training metrics remain in `metrics.jsonl`. Startup shows only problems, including disabled evaluation.
 Every evaluation and completion shows factual metric comparisons and training/evaluation loss charts,
 without assessment prose or tuning advice. The two charts occupy 100 columns with 13 plot rows;
@@ -247,7 +396,7 @@ They show `training_loss`, the latest measured `eval_loss`, and its `eval_step` 
 resume and in `trlx show`. Blank evaluation fields mean no evaluation has been recorded yet.
 
 When ordinary evaluation is enabled, fresh runs measure the starting model at step zero using the
-same held-out data as later evaluations. This adds one evaluation pass; resume keeps the original
+same evaluation data as later evaluations. This adds one evaluation pass; resume keeps the original
 baseline. No extra flag or quality benchmark is needed. Final evaluation comparisons use that baseline;
 missing baselines and measurements before the final step are identified by their recorded steps.
 
@@ -309,64 +458,6 @@ Judging presets additionally require `[assessment.judge]` with explicit `url`, `
 environment variable; use `"None"` for an unauthenticated endpoint. Timeout must be positive, retries
 nonnegative, and the response token budget positive. Judge ratings are model judgments, not ground truth.
 Quality checks add inference/scoring work; `--no-quality-checks` disables them for one run.
-
-## Dataset cheat sheet
-
-`dataset` works independently of TRL. Files may be JSONL (one object per line), JSON
-(an array of objects), CSV, or Parquet. The output extension selects the file format.
-CSV cells are strings; use JSONL or Parquet for nested messages. Replacing an existing
-output or input requires `--force`. All writers support `--no-staging` for direct writes.
-
-```sh
-# Convert the file format, or reshape prompt/completion rows into messages.
-dataset convert data.json --out data.jsonl
-dataset convert prompts.jsonl --to messages --out chat.jsonl
-dataset convert chat.jsonl --to prompt-completion --out prompts.jsonl
-
-# Reorder, divide, combine, or sample rows.
-dataset shuffle data.jsonl --seed 42 --out shuffled.jsonl
-dataset split shuffled.jsonl --fraction 0.9 --out train.jsonl --rest eval.jsonl
-dataset mix a.jsonl b.jsonl --fractions 1,0.25 --seed 42 --out mixed.jsonl
-dataset sample data.jsonl --n 20 --seed 42 --out sample.jsonl
-dataset sample data.jsonl --n 10 --head --out preview.jsonl
-
-# Edit columns or select rows.
-dataset fields data.jsonl --add 'length=len(text)' --out sized.jsonl
-dataset fields data.jsonl --add 'source="manual"' --out tagged.jsonl
-dataset fields data.jsonl --remove unused --rename answer=completion --out edited.jsonl
-dataset fields pairs.jsonl --swap chosen=rejected --out swapped.jsonl
-dataset filter data.jsonl --where 'label == True' --out positive.jsonl
-dataset filter data.jsonl --max-length text=4000 --out short.jsonl
-
-# Chunk plain text, build preference pairs, or extract prompt/completion rows.
-dataset cpt source.txt --max-tokens 1024 --out chunks.jsonl
-dataset pairs chosen.jsonl rejected.jsonl --strict --out pairs.jsonl
-dataset pairs messages.jsonl --out prompts.jsonl
-
-# Repair syntax, inspect lengths, or score responses with a model.
-dataset heal broken.jsonl --out repaired.jsonl
-dataset stats data.jsonl
-dataset stats pairs.jsonl --columns chosen,rejected --model MODEL
-
-# Generate question/answer data from text: complete example in the endpoint tutorial.
-dataset chat --help
-dataset fields --help
-```
-
-- `split` takes either `--n` or `--fraction`; `--key COLUMN` keeps groups together
-  and may exceed the requested count. It preserves input order.
-- `mix` fractions select a share of each input, not a share of the output.
-  Sources are concatenated; shuffle afterward to interleave.
-- `fields` and `filter` expressions use column names or `row["column-name"]`;
-  `len`, `str`, `int`, and `float` are available. Field operations run in the order
-  add, remove, rename, swap. Flags may repeat; all filter conditions must pass.
-- Length limits count characters or list items. `cpt`, `chat`, and plain `stats`
-  estimate tokens as characters / 3.5; `stats --model` loads weights for exact
-  token counts and response log-probabilities.
-- `pairs` requires `messages` ending in an assistant turn. Two inputs align by
-  user-turn content; unmatched rows are omitted unless `--strict` makes them fatal.
-- `heal` reports every repair, may drop a truncated final JSONL row, and writes
-  output even when errors remain; remaining errors produce a nonzero exit.
 
 ## Tutorial: temporary and persistent settings
 
@@ -537,9 +628,12 @@ nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,pstate --for
 ## Tutorial: checkpoints, resume, and results
 
 The defaults evaluate and save at each epoch's end, retain two checkpoints, and log
-every optimizer update. Use `--eval-strategy steps --eval-steps N` and
-`--save-strategy steps --save-steps N` for intermediate evaluation/checkpoints.
-`save_strategy = "no"` is rejected.
+every optimizer update. Generated configs omit explicit save strategy/interval settings:
+saving follows the evaluation schedule, or saves only at completion when evaluation
+is disabled. Set `--eval-strategy steps --eval-steps N` for evaluation and checkpoints
+every N optimizer steps, where N is a positive integer. Explicit `--save-strategy` and
+`--save-steps` settings override this coupling, including settings retained in an older
+config. `save_strategy = "no"` is rejected.
 
 Every fresh run uses `output_dir/YYYYMMDD-N--model--dataset/`. The number advances across
 all models and datasets under that parent for the local date, starting above existing numbers.
@@ -550,7 +644,7 @@ Dataset files use their filename stem. `run_name` changes only the display label
 # RUN_DIR is the generated directory printed at startup; select an existing checkpoint.
 trlx sft --resume-from-checkpoint RUN_DIR/checkpoint-100
 
-# Compare a trained checkpoint with the base, or merge its LoRA adapter.
+# Verify saved artifacts against the base, or merge the LoRA adapter.
 trlx verify RUN_DIR/checkpoint-100 --base MODEL
 trlx merge --base MODEL --adapter RUN_DIR/checkpoint-100 --out merged-model
 ```
@@ -559,20 +653,38 @@ Resume loads the run's saved `config.toml`, not today's `run.toml`; model and da
 arguments need not be repeated. Explicit CLI overrides still apply. Only the current
 snapshot schema is supported. Training settings must match; GPU selection and display
 controls may change, but switching between sharded and unsharded training is rejected.
+Assessment settings may also change; independent quality baselines are reused only
+when their data, tokenizer, scorer, prompts, and evaluation conditions match.
 Active prompts are copied into the run's `prompts/` directory and referenced by its
 saved config. Workers and resume use those copies. Missing required copies fail before
 resume cleanup; changes to quality prompt contents invalidate baseline reuse.
 
 Resume continues in the original directory. After validation it automatically removes
-metrics and checkpoints beyond the selected saved step and clears stale preflight/verify
-reports. No `--force` is needed. Earlier metrics remain; logs append a resume marker and
-new output. The live line display prints the continuation; `trlx show RUN_DIR` includes
+metrics, checkpoints, and quality rounds beyond the selected saved step and clears stale
+assessment, preflight, and verification reports. No `--force` is needed. Earlier metrics
+remain; logs append a resume marker and new output. The live line display prints the
+continuation; `trlx show RUN_DIR` includes
 the retained history. `trlx check` validates resume inputs without performing cleanup.
 
-Run artifacts include `config.toml` (resolved settings), `metrics.jsonl`, `log.txt`,
-`preflight.json`, `checkpoint-N` directories, and `verify.json` when verification runs.
-Verification checks loading, changed outputs/scores, and chat-template consistency.
-A verification failure returns nonzero even if training completed.
+Each run retains the inputs and evidence needed to inspect its results:
+
+| Artifact | Contents |
+| --- | --- |
+| `config.toml` | Resolved method, trainer settings, selected GPUs, and launch strategy. |
+| `prompts/` | Copies of active prompt files referenced by the snapshot. |
+| `metrics.jsonl` | Authoritative training/evaluation history and aggregate quality metrics. |
+| `log.txt` | Complete operational and library diagnostics with source attribution. |
+| `assessment.json` | Pre-run data inspection and tuning findings with evidence. |
+| `preflight.json` | Model/data checks, resolved LoRA targets, warnings, and prepared-example details. |
+| `quality.jsonl` | Individual quality-check results and partial failure evidence when enabled. |
+| `synthetic-eval.jsonl` | Generated CPT summaries when enabled; retained for evaluation and resume. |
+| `checkpoint-N/` | Trainer checkpoint at the recorded optimizer step. |
+| `verify.json` | Artifact loading, adapter-integrity, and chat-template checks when verification runs. |
+
+`trlx merge` loads the base using its model metadata, checks the loaded adapter, and
+writes a merged model to `--out`. An existing destination requires `--force`; replacing
+the base or adapter requires staging. Keep the original run to retain its metrics and
+diagnostics alongside the exported model.
 
 `--tui` enables the full-screen display; `--no-tui` prints lines. Press `q` to close
 the display while training continues; Ctrl-C cancels. Display failures are recorded
@@ -736,6 +848,45 @@ Prompts need `prompt` or `messages`. Here `--max-tokens` limits the completion.
 Endpoint mode requires `--timeout` (seconds per request), `--retries` (after the first
 attempt), and `--concurrency` (simultaneous requests). Without `--endpoint`, generation
 is local and endpoint-only options are rejected.
+
+## Prompt files
+
+`trlx init` copies these editable UTF-8 files into `prompts/` beside `--out`.
+Training paths in `[prompts]` are relative to the config directory; dataset CLI
+paths are relative to the working directory. Absolute paths are accepted.
+
+| File | Training config key / dataset option | Required placeholders |
+| --- | --- | --- |
+| `chat-questions.prompt` | `--questions-prompt` | `{chunk}`, `{n}` |
+| `chat-answers.prompt` | `--answers-prompt` | `{chunk}`, `{question}` |
+| `eval-build-summary.prompt` | `--summary-prompt` | None |
+| `synthetic-eval-summary.prompt` | `synthetic_eval_summary` | `{text}` |
+| `quality-qa.prompt` | `quality_qa` | None |
+| `quality-classification.prompt` | `quality_classification` | `{labels}` |
+| `quality-multiple-choice.prompt` | `quality_multiple_choice` | `{choices}` |
+| `quality-json.prompt` | `quality_json` | `{required_fields}` |
+| `quality-instruction-following-judge.prompt` | `quality_instruction_following_judge` | None |
+| `quality-writing-judge.prompt` | `quality_writing_judge` | None |
+
+For example, `[prompts]` contains
+`quality_qa = "prompts/quality-qa.prompt"`. Only enabled features require their
+files. Missing, unreadable, empty, invalid UTF-8, or invalid templates fail before
+requests or model loading. Installed templates are used only by `init`; runtime
+never falls back to them. The additional `llm-judge.prompt.example` is guidance,
+not an active prompt.
+
+Substitution is one pass: inserted source text is never interpreted as a template.
+`{labels}` is a JSON list; `{choices}` is one `label: text` line per choice.
+The JSON preset uses `[[ The JSON object must contain these top-level keys: {required_fields}.]]`:
+the optional block is omitted when the row has no required fields, otherwise the
+placeholder receives their JSON list. Keep each template's required placeholders.
+
+For an existing configuration, create a fresh scratch directory and run
+`trlx init --out SCRATCH/run.toml`, where `SCRATCH` already exists and contains
+neither that config nor generated prompt files. Copy the needed prompt files and
+`[prompts]` entries into your existing setup; author a separate judge rubric if
+using `llm_judge`. Existing runs need their required prompt files and saved paths
+before they can resume.
 
 ## Further reference
 
