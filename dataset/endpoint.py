@@ -9,6 +9,7 @@ Other HTTP statuses and explicit incomplete-generation results are final errors.
 
 import collections
 import concurrent.futures
+from contextlib import nullcontext
 import http.client
 import json
 import math
@@ -19,7 +20,7 @@ import urllib.parse
 import urllib.request
 
 from dataset.io import DatasetError
-from dataset.progress import stage
+from dataset.progress import Progress, stage
 from dataset import failures
 
 # A reply's two parts. `reasoning` is the endpoint's own reasoning field and is
@@ -155,8 +156,13 @@ class Endpoint:
     def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False,
                       _status=None, sampling=None):
         try:
-            return self._complete_full(messages, max_tokens, progress=progress, request=request,
-                                       require_stop=require_stop, _status=_status, sampling=sampling)
+            # Direct callers may supply a reporter; retry notices belong to a stage.
+            # Reuse caller-owned stages so batch waiting details remain authoritative.
+            activity = (stage(progress, f"request to {self.display_url}")
+                        if isinstance(progress, Progress) else nullcontext(progress))
+            with activity as request_progress:
+                return self._complete_full(messages, max_tokens, progress=request_progress, request=request,
+                                           require_stop=require_stop, _status=_status, sampling=sampling)
         except Exception as error:
             # Preserve causes and traceback, applying the boundary's redaction to the whole report.
             failures.redact(error, self._diagnostic)

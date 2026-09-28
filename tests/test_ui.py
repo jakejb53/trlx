@@ -1,6 +1,7 @@
 """Authoring API, non-destructive saves, and browser dataset/request contracts."""
 
 import concurrent.futures
+import contextlib
 import io
 import json
 import pathlib
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -75,6 +77,34 @@ class AuthoringAPI(unittest.TestCase):
                 self.assertEqual(response.status_code, 422)
                 self.assertNotIn("private-key", response.text)
                 generate.assert_not_called()
+
+    # The real UI passes a Progress reporter. Retry logging must not replace a
+    # transport/schema failure with AttributeError, on recovery or exhaustion.
+    def test_retry_progress_recovers_or_preserves_endpoint_failure(self):
+        payload = json.dumps({"choices": [{"message": {"content": "recovered", "reasoning": "thought"}}]}).encode()
+        for kind in ("transport", "malformed"):
+            for recover in (True, False):
+                with self.subTest(kind=kind, recover=recover):
+                    failures = ([urllib.error.URLError("connection refused private-key") for _ in range(2)]
+                                if kind == "transport" else [io.BytesIO(b"{}"), io.BytesIO(b"{}")])
+                    attempts = [failures[0], io.BytesIO(payload) if recover else failures[1]]
+                    output = io.StringIO()
+                    with patch("dataset.endpoint.urllib.request.urlopen", side_effect=attempts) as call, \
+                         patch("dataset.endpoint.time.sleep") as sleep, contextlib.redirect_stderr(output):
+                        response = self.client.post("/api/generate", json={**self.body, "retries": 1})
+                    self.assertEqual(call.call_count, 2)
+                    sleep.assert_called_once_with(1.0)
+                    self.assertIn("retry attempt 2/2", output.getvalue())
+                    self.assertNotIn("private-key", output.getvalue() + response.text)
+                    self.assertNotIn("has no attribute", response.text)
+                    if recover:
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.json(), {"answer": "recovered", "reasoning": "thought"})
+                    else:
+                        self.assertEqual(response.status_code, 400, response.text)
+                        self.assertIn("gave up after 2 attempts", response.json()["error"])
+                        self.assertIn("connection refused" if kind == "transport" else "message.content",
+                                      response.json()["error"])
 
     # Cards are separate requests: an error does not establish state that poisons another.
     def test_failed_output_does_not_poison_next_output(self):
