@@ -14,6 +14,8 @@ dependencies = [
     "peft==0.21.0",
     "accelerate==1.15.0",
     "datasets==5.0.1",
+    "fastapi==0.136.3",
+    "uvicorn==0.53.0",
 ]
 
 # Generated wrappers, not copies of repo files: pip writes each one to import
@@ -27,3 +29,4 @@ packages = ["trlx", "dataset"]
 
 [tool.setuptools.package-data]
 trlx = ["prompt_defaults/*.prompt", "prompt_defaults/*.prompt.example"]
+dataset = ["ui/*.html", "ui/*.js", "ui/*.css"]

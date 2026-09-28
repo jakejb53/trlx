@@ -4,6 +4,9 @@
 `trlx` brings seven TRL trainers together with reusable configuration, LoRA and full
 fine-tuning, multi-GPU execution, evaluation, and live metrics. Its companion
 `dataset` CLI creates and manages the training and evaluation data those trainers need.
+Its [interactive web UI](#interactive-dataset-authoring) lets you compare responses
+from different endpoints, edit answers and reasoning, and save selected examples
+to a training dataset.
 
 ## Why trlx exists
 
@@ -770,10 +773,41 @@ A positive `kl_coef` additionally penalizes drift from the original model. It re
 omitting `loss_type` and disabling `use_liger_kernel`, `packing`, and `padding_free`.
 Add `replay_kl` to `[methods.sft.ranges]` to display that metric.
 
+## Interactive dataset authoring
+
+From the repository root, start the FastAPI interface:
+
+```sh
+python -m dataset.cli ui --host 127.0.0.1 --port 8000
+```
+
+Both arguments are required; `--port` accepts 1..65535. Open the chosen address
+in your browser. Deployment and access controls are the operator's responsibility.
+
+Enter a user prompt and optional system prompt, then configure at least two
+output cards with their own endpoint URL, model, and optional API key. Enable
+only the sampling overrides you want sent. Each card has editable timeout and
+retry settings, initially 120 seconds and 2 retries. Generate compares independent
+responses; reasoning and answers can both be edited. Prompts remain populated,
+with separate clear buttons for user, system, or both.
+
+Choose reasoning, answer, or both and use each card's **Add to dataset** button.
+Any number of candidates can be added. The user is always saved; the system
+prompt is excluded. Excluding reasoning omits its field; excluding the answer
+leaves an empty assistant message. Each response retains its original user prompt.
+
+The pending collection, prompts, edited responses, endpoint settings, and API keys
+persist in this browser's localStorage for the same origin. **Save dataset** appends
+unique examples to the selected `.jsonl` path on the server. Relative paths use the
+server's working directory; the parent must exist. Existing contents are preserved
+through staged publication. Exact duplicates include reasoning presence and text.
+Successful saves clear submitted examples; failures retain them for retry. Use one
+UI process for a destination and avoid concurrent writes from other applications.
+
 ## Tutorial: endpoint generation and credentials
 
 `ENDPOINT` is an OpenAI-compatible API base URL, including `/v1` when required;
-`MODEL` is the served model name. Both tools load optional `KEY=value` entries from
+`MODEL` is the served model name. CLI commands other than `dataset ui` load optional `KEY=value` entries from
 `.env` in the working directory. Exported environment values take precedence.
 `--api-key API_KEY` names the variable holding the key; it never takes the secret value.
 Reward factories use `api_key = "API_KEY"`. Omit the option for unauthenticated servers.

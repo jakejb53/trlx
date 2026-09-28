@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dataset Studio</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script type="module" src="assets/app.js"></script>
+</head>
+<body>
+  <main>
+    <header class="masthead"><div><p class="eyebrow">DATASET / AUTHORING</p><h1>Dataset Studio</h1>
+      <p class="subtitle">Compare responses. Refine the details. Keep what works.</p></div>
+      <a href="#collection" class="collection-link">Pending <span id="pending-count">0</span></a>
+    </header>
+    <p id="storage-error" class="error" role="alert" hidden></p>
+    <section class="panel" aria-labelledby="prompt-heading">
+      <div class="section-heading"><h2 id="prompt-heading">01 / Prompt</h2><button id="clear-both" class="quiet">Clear both</button></div>
+      <div class="prompts">
+        <div><div class="field-heading"><label for="user">User prompt</label><button id="clear-user" class="quiet">Clear user</button></div>
+          <textarea id="user" rows="6" placeholder="What would you like the models to answer?"></textarea></div>
+        <div><div class="field-heading"><label for="system">System prompt <span class="muted">optional</span></label><button id="clear-system" class="quiet">Clear system</button></div>
+          <textarea id="system" rows="6" placeholder="Instructions for generation. Not included in saved examples."></textarea></div>
+      </div>
+      <div class="toolbar"><label class="inline">Outputs <input id="output-count" type="number" min="2" step="1" value="2"></label>
+        <button id="generate" class="primary">Generate responses</button><span id="generation-status" role="status"></span></div>
+    </section>
+    <section aria-labelledby="response-heading"><div class="section-heading"><h2 id="response-heading">02 / Responses</h2><span class="muted">Configure each output independently</span></div>
+      <div id="outputs" class="outputs"></div>
+    </section>
+    <section id="collection" class="panel" aria-labelledby="collection-heading">
+      <div class="section-heading"><h2 id="collection-heading">03 / Pending dataset</h2><span id="collection-count" class="muted"></span></div>
+      <p class="muted">Examples stay in this browser until you save. Exact duplicates are skipped.</p>
+      <div id="pending"></div>
+      <div class="save-row"><label>Dataset path on server<input id="destination" placeholder="training.jsonl" spellcheck="false"></label>
+        <button id="save" class="primary">Save dataset</button></div>
+      <p id="save-status" role="status"></p>
+    </section>
+  </main>
+  <template id="output-template">
+    <article class="panel output">
+      <div class="section-heading"><h3></h3><span class="card-status" role="status">Ready</span></div>
+      <details class="settings" open><summary>Endpoint &amp; generation settings</summary>
+        <label>Endpoint URL<input data-setting="endpoint" placeholder="https://your-endpoint/v1" spellcheck="false"></label>
+        <div class="pair"><label>Model<input data-setting="model" placeholder="Served model name" spellcheck="false"></label>
+          <label>API key<input data-setting="api_key" type="password" autocomplete="off" placeholder="Optional"></label></div>
+        <div class="sampling"></div>
+        <div class="pair"><label>Request timeout (seconds)<input data-setting="timeout" type="number" min="0.01" step="any"></label>
+          <label>Retries<input data-setting="retries" type="number" min="0" step="1"></label></div>
+      </details>
+      <div class="field-heading"><label class="inline"><input type="checkbox" data-include="reasoning">Include reasoning</label></div>
+      <textarea data-response="reasoning" rows="7" placeholder="Reasoning appears here; edit before adding." disabled></textarea>
+      <div class="field-heading"><label class="inline"><input type="checkbox" data-include="answer">Include assistant answer</label></div>
+      <textarea data-response="answer" rows="9" placeholder="The assistant answer appears here; edit before adding." disabled></textarea>
+      <p class="card-message" role="status"></p>
+      <button class="add" disabled>Add to dataset</button>
+    </article>
+  </template>
+</body>
+</html>

@@ -216,12 +216,12 @@ class DatasetOutputs(unittest.TestCase):
             example = next(line for line in command.epilog.replace("\\\n", " ").splitlines()
                            if line.strip().startswith("dataset "))
             argv = shlex.split(example)[1:] + ["--force"]
-            if name != "stats":
+            if name not in ("stats", "ui"):
                 argv.append("--no-staging")
             with self.subTest(command=name):
                 args = parser.parse_args(argv)
                 self.assertTrue(args.force)
-                self.assertEqual(getattr(args, "no_staging", False), name != "stats")
+                self.assertEqual(getattr(args, "no_staging", False), name not in ("stats", "ui"))
 
     # Invalid UTF-8 plain text becomes a concise path-specific command failure.
     def test_cpt_invalid_utf8(self):
@@ -270,7 +270,8 @@ class DatasetOutputs(unittest.TestCase):
                             "--timeout", "1", "--retries", "0"], "source row summaries from model"),
             "stats": ([self.source], "counting tokens in text"),
         }
-        self.assertEqual(set(cases), set(_commands(cli.build_parser())))
+        # The persistent UI owns progress per API request, not per CLI lifetime.
+        self.assertEqual(set(cases), set(_commands(cli.build_parser())) - {"ui"})
         original_open = builtins.open
         for name, (arguments, processing) in cases.items():
             with self.subTest(command=name):

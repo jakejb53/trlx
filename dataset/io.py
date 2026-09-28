@@ -16,12 +16,16 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 
 import pyarrow
 import pyarrow.parquet
 
 from dataset.progress import stage
 from dataset.failures import Error, context
+
+# One UI process serializes duplicate inspection and publication as one operation.
+_APPEND_LOCK = threading.Lock()
 
 
 # Raised for any user-facing failure in this package. main() prints its message
@@ -453,6 +457,65 @@ def write_rows(path, rows, inputs=(), *, force=False, no_staging=False, progress
     validate_rows_output(path, force)
     publish_output(path, _rows_writer(path, rows, progress=progress),
                    force=force, no_staging=no_staging, progress=progress)
+
+
+# Identity excludes unrelated metadata, but distinguishes absent and empty reasoning.
+def example_identity(row):
+    messages = row.get("messages") if isinstance(row, dict) else None
+    if not isinstance(messages, list) or len(messages) != 2:
+        raise DatasetError("example must contain exactly one user and one assistant message")
+    for message, role in zip(messages, ("user", "assistant")):
+        if not isinstance(message, dict) or message.get("role") != role or not isinstance(message.get("content"), str):
+            raise DatasetError(f"example requires a {role} message with string content")
+    if "reasoning" in row and not isinstance(row["reasoning"], str):
+        raise DatasetError("example reasoning must be a string when present")
+    return messages[0]["content"], messages[1]["content"], "reasoning" in row, row.get("reasoning")
+
+
+# Save preserves original bytes and publishes a complete extension. This lock protects
+# concurrent requests in this application, not unrelated external dataset writers.
+def append_examples(path, examples, *, progress=None):
+    with _APPEND_LOCK:
+        target = pathlib.Path(path)
+        if target.suffix.lower() != ".jsonl":
+            raise DatasetError("dataset destination must have a .jsonl extension")
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise DatasetError(f"{path}: choose a regular JSONL file, not a symlink or directory")
+        validate_rows_output(target, force=True)
+        keys = [example_identity(row) for row in examples]
+        try:
+            existing = read_rows(target, progress=progress) if target.exists() else []
+            original = target.read_bytes() if target.exists() else b""
+            seen = set()
+            for row in existing:
+                try:
+                    seen.add(example_identity(row))
+                except DatasetError:
+                    # Other valid dataset row shapes are preserved, never coerced or dropped.
+                    continue
+            added = []
+            for row, key in zip(examples, keys):
+                if key not in seen:
+                    seen.add(key)
+                    added.append(row)
+            if added:
+                suffix = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in added).encode("utf-8")
+                separator = b"\n" if original and not original.endswith(b"\n") else b""
+
+                # Flush the prepared file before publication; success is reported only
+                # after publish_output completes its replacement and cleanup contract.
+                def write(prepared):
+                    with prepared.open("wb") as stream:
+                        stream.write(original)
+                        stream.write(separator)
+                        stream.write(suffix)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+
+                publish_output(target, write, force=target.exists(), progress=progress)
+            return {"added": len(added), "duplicates": len(examples) - len(added)}
+        except (OSError, UnicodeError) as error:
+            raise DatasetError(f"{path}: cannot save examples: {error}") from error
 
 
 # Distinct output entries are required even with force: two results cannot occupy one path.

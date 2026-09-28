@@ -241,6 +241,13 @@ def _cmd_stats(args):
     return 0
 
 
+# Import web dependencies only when starting the UI, never for other commands or help.
+def _cmd_ui(args):
+    from dataset.ui import run
+
+    return run(args.host, args.port)
+
+
 # Builds the full parser. Kept separate from main so tests can inspect the tree
 # without invoking anything.
 def build_parser():
@@ -537,6 +544,16 @@ def build_parser():
     p.add_argument("--model", metavar="MODEL",
                    help="local model path or Hub ID for exact counts and response scoring; default: estimates only")
 
+    p = sub.add_parser("ui", help="author datasets interactively in a web browser",
+        description="Compare editable endpoint responses and save selected examples to JSONL.\n"
+                    "Prompts, endpoint settings, credentials, and pending examples persist in browser localStorage.\n"
+                    "Save appends unique examples to a path on the server; existing rows are preserved.",
+        epilog="Examples:\n  dataset ui --host 127.0.0.1 --port 8000",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--host", required=True, help="listen address chosen by the operator; no default")
+    p.add_argument("--port", required=True, type=int, help="listen port, integer 1..65535; no default")
+    p.add_argument("--force", action="store_true", help="accepted for consistency; UI saves preserve existing rows")
+    p.set_defaults(func=_cmd_ui)
     return parser
 
 
@@ -545,6 +562,10 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        # A long-lived UI is idle between browser requests. Each API operation owns
+        # its feedback; CLI environment credentials do not configure this workspace.
+        if args.command == "ui":
+            return args.func(args)
         with Progress(f"dataset {args.command}") as progress:
             args.progress = progress
             # Before any handler runs, so an --api-key variable can come from .env.

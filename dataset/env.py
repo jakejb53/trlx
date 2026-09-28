@@ -3,8 +3,9 @@
 Shared by both CLIs, like io.py and endpoint.py, so the two tools resolve a
 key the same way. The file holds secrets only: operational settings belong in
 the run config, where the operator can see them and they can be snapshotted
-with a run. An api_key setting anywhere in trlx or dataset names a variable,
-never holds its value, and this is one place that variable can come from.
+with a run. CLI/config api_key settings name variables rather than values.
+The web UI instead receives credentials from its browser workspace and does
+not call this loader.
 """
 
 import os

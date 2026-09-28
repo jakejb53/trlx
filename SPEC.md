@@ -18,10 +18,10 @@ trlx/              repo root
   tests/           unittest
 ```
 
-- Dependencies: trl, transformers, peft, accelerate, datasets. Pinned to exact versions (trl 1.13.0 at time of writing).
-- No other dependencies. CLI: argparse. TUI: curses. Config read: tomllib. Config write: own emitter. HTTP: urllib.
+- Dependencies: trl, transformers, peft, accelerate, datasets, FastAPI, Uvicorn. Pinned to exact versions (trl 1.13.0 at time of writing).
+- Prohibit unnecessary additional dependencies. CLI: argparse. TUI: curses. Config read: tomllib. Config write: own emitter. Endpoint HTTP: urllib. Web UI: FastAPI and Uvicorn, per `SPEC-webui.md`.
 - `trlx` and `dataset` are console entry points declared in `pyproject.toml`, installed onto PATH by `pip install`. Until the project is installed, both run from the repo root as `python -m trlx.cli` and `python -m dataset.cli`.
-- Secrets: every `api_key` setting names an environment variable and never holds a key. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings.
+- CLI/config secrets: `api_key` settings name environment variables, never keys. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings. `dataset ui` instead accepts credentials in the browser and persists them in localStorage per `SPEC-webui.md`; it does not load `.env`.
 
 ### 1.1 Destructive operations and --force
 

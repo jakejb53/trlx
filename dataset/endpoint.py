@@ -153,10 +153,10 @@ class Endpoint:
     # failure when retries are exhausted. Strict callers
     # require explicit completion metadata; legacy callers retain their behavior.
     def complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False,
-                      _status=None):
+                      _status=None, sampling=None):
         try:
             return self._complete_full(messages, max_tokens, progress=progress, request=request,
-                                       require_stop=require_stop, _status=_status)
+                                       require_stop=require_stop, _status=_status, sampling=sampling)
         except Exception as error:
             # Preserve causes and traceback, applying the boundary's redaction to the whole report.
             failures.redact(error, self._diagnostic)
@@ -165,8 +165,18 @@ class Endpoint:
 
     # Execute the existing retry policy beneath the single diagnostic-redaction boundary.
     def _complete_full(self, messages, max_tokens=None, *, progress=None, request="request", require_stop=False,
-                       _status=None):
+                       _status=None, sampling=None):
         body = {"model": self.model, "messages": messages}
+        # Only explicit overrides travel to the server; connection and message fields
+        # cannot be replaced through sampling. Provider-specific support stays explicit.
+        if sampling is not None:
+            allowed = {"temperature", "top_p", "top_k", "presence_penalty", "repetition_penalty"}
+            if not isinstance(sampling, dict) or set(sampling) - allowed:
+                raise DatasetError("sampling contains unsupported parameter names")
+            for name, value in sampling.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise DatasetError(f"sampling {name} must be a finite number")
+            body.update(sampling)
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         data = json.dumps(body).encode("utf-8")

@@ -12,7 +12,7 @@ configured OpenAI-compatible endpoints. The interface does not run training.
 - Expose `--host` and `--port` launch arguments. Deployment and access controls
   are the operator's responsibility.
 - Necessary additional dependencies are permitted; unnecessary dependencies
-  are prohibited. This supersedes SPEC.md's blanket prohibition for this feature.
+  are prohibited.
 
 ## Prompts and generation
 
@@ -76,9 +76,22 @@ Do not normalize text when comparing examples.
   `localStorage`; environment-variable references are not required.
 - Backend persistence for the pending collection is not required.
 
-## Implementation decisions still pending
+## Runtime contract
 
-The command name, browser asset organization, API routes, dependency versions,
-generation transport and progress presentation, and file publication mechanism
-remain subject to implementation-plan approval. Staged rewriting to implement
-append semantics was proposed but has not been approved.
+- Launch with `dataset ui --host HOST --port PORT`; both arguments are required.
+  Port is an integer in 1..65535. From an uninstalled checkout, use
+  `python -m dataset.cli ui --host HOST --port PORT`.
+- FastAPI serves the page and API through Uvicorn. Each output uses an independent
+  non-streaming request; completed responses appear without waiting for other outputs.
+  Failures retain the previous response, when present, and identify it as retained.
+- Each response retains its submitted user prompt for subsequent dataset additions.
+- Per-output timeout and retries start at 120 seconds and 2 additional attempts,
+  respectively, matching the dataset endpoint defaults. Both are editable and persisted.
+- Saved paths refer to the server filesystem, relative to its working directory
+  unless absolute. The parent must exist; destinations must be regular JSONL files
+  or new paths, not directories or final symlinks.
+- Save stages existing bytes plus unique appended rows before publication.
+  Requests within one UI process serialize duplicate checking and publication.
+  Unrelated processes must not concurrently write the destination.
+- Browser storage also retains edited responses and the destination path. Storage
+  errors are visible and never trigger a silent reset of saved browser state.

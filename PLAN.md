@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, and SFT reasoning inclusion complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below).
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, SFT reasoning inclusion, and interactive dataset authoring UI complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below). Web UI browser/live-endpoint validation and two additional stale test assertions are recorded in its section below.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session notes
@@ -680,6 +680,39 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   exercised actual TRL preparation and loss masks. Independent review findings were fixed and
   re-reviewed with no remaining blockers. No live training was run; source datasets, operator
   configurations, and existing runs were unchanged.
+
+### Interactive dataset authoring UI (complete, 2026-09-28)
+
+- Contract: `SPEC-webui.md`. Launch from the repository root with
+  `python -m dataset.cli ui --host 127.0.0.1 --port 8000`; both arguments are
+  required, and port must be in 1..65535. FastAPI and Uvicorn serve the UI.
+- Shared user/system prompts feed independently configured output cards with
+  endpoint, credentials, model, and checkbox-enabled sampling overrides. Reasoning
+  and answers are editable and independently selectable; any number of outputs
+  can enter the pending collection. Saved examples retain their submitted user
+  prompt and exclude the system prompt.
+- Browser localStorage retains workspace settings, credentials, edited responses,
+  and pending examples. Explicit Save appends unique examples to server-side JSONL
+  through staged publication. Duplicate identity includes reasoning presence/text.
+  Failed saves retain pending work; storage quota failure does not prevent Save.
+  Saves serialize within one UI process; unrelated writers must not share its destination.
+- Added `dataset/ui.py`, `dataset/ui/{index.html,app.js,style.css}`, and
+  `tests/test_ui.py`; updated CLI integration, endpoint sampling, dataset I/O,
+  credential comments, and CLI tests. `pyproject.toml` pins FastAPI 0.136.3 and
+  Uvicorn 0.53.0 and includes browser assets. `SPEC.md` now prohibits unnecessary
+  dependencies; `README.md` includes launch/workflow documentation and an opening summary link.
+- Validation: 82 distinct tests passed: 15 UI checks and 67 existing endpoint,
+  I/O, and CLI checks. API tests used mocked endpoints and repository-local scratch;
+  browser logic/event tests used Node with simulated DOM/storage. FastAPI TestClient
+  checks passed outside the sandbox after its event-loop wakeup stalled inside it.
+  Independent review findings were fixed and re-reviewed without remaining blockers.
+- Real-browser rendering and live endpoint generation remain unverified. Two
+  pre-existing stale assertion methods remain unresolved and were excluded from
+  the 67-test passing run:
+  `tests.test_endpoint.EndpointErrors.test_retries_and_concurrency_require_integers`
+  expects old error wording;
+  `tests.test_io.OutputPublication.test_split_cleanup_preserves_primary_failure_and_completed_paths`
+  expects cleanup notes in the exception message rather than its notes.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 
