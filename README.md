@@ -610,8 +610,9 @@ reports add parameter dtypes, allocator memory, and measured padding overhead. A
 collected after an exception are labelled separately from the original allocation-failure figures.
 Unavailable measurements are identified rather than estimated.
 
-Training `log.txt` retains the complete exception chain and traceback. The terminal shows the primary
-failure and cleanup outcome; secondary errors do not replace the cause. Startup and standalone
+Training `log.txt` retains the complete evidence, exception chain, and traceback. Terminal reports
+lead with the failure, explain relevant facts, and summarize successful cleanup in one line. Internal
+field trees and routine peer-abort messages stay in the log; cleanup problems remain visible. Startup and standalone
 commands report on stderr, including a traceback for unexpected errors. Reports exclude tensor
 contents and frame locals and retain credential redaction.
 

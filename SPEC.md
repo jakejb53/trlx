@@ -73,8 +73,10 @@ input order in their returned results.
 
 Both CLIs preserve failure causes, innermost operation context, evidence, and cleanup notes in a
 common report. Workers notify failure before transmitting detail; the supervisor renders the primary
-report after cleanup and retains other failures separately. Training `log.txt` includes exception
-chains and tracebacks; unexpected standalone/startup failures include their traceback on stderr.
+report after cleanup and retains other failures separately. Terminal reports explain the failure and
+relevant evidence without dumping internal fields. Successful cleanup is one line; cleanup problems
+remain visible. Training `log.txt` includes all evidence, exception chains, and tracebacks; unexpected
+standalone/startup failures include their traceback on stderr without the internal evidence tree.
 No separate diagnostic artifact is created. Credential redaction applies to all report fields.
 Reports never collect frame locals or dataset contents. Diagnostic failures are secondary notes.
 Training/evaluation reports capture batch shapes, CPU token/mask counts when available, and failing

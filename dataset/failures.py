@@ -5,7 +5,9 @@ Exception identity and the deepest operation survive wrapping and transport.
 """
 
 import contextlib
+import errno
 import math
+import textwrap
 import traceback
 import uuid
 
@@ -194,10 +196,216 @@ def _facts(value, indent=2):
     return [prefix + str(value)]
 
 
-# The terminal and full run log share evidence; only technical detail differs.
-def render(report, *, detailed=False):
-    """Render the same facts for terminal and log; the log adds technical detail."""
+# Describe storage sizes for people; the full evidence retains exact byte counts.
+def _size(value):
+    divisor, unit = (1024 ** 3, "GiB") if value >= 1024 ** 3 else (1024 ** 2, "MiB")
+    return f"{value / divisor:.3f} {unit}"
+
+
+# Resolve worker-local device numbers only when the report establishes their mapping.
+def _device(context, evidence):
+    mapping = context.get("cuda_device_mapping", {})
+    # After-exception allocator counters can describe a different current device.
+    local = evidence.get("allocation_failure", {}).get("local_cuda_device")
+    if local is not None and f"local cuda:{local}" in mapping:
+        return f"GPU {mapping[f'local cuda:{local}']}"
+    if len(mapping) == 1:
+        return f"GPU {next(iter(mapping.values()))}"
+    return None
+
+
+# Explain measured memory pressure without mixing later counters with failure-time figures.
+def _memory_lines(report):
+    context, evidence = report.get("context", {}), report.get("evidence", {})
+    native = evidence.get("allocation_failure", {})
+    device = _device(context, evidence)
+    title = f"Out of memory on {device}" if device else ("Out of GPU memory" if "CUDA" in report["summary"] or native else "Out of memory")
+    operation = context.get("phase") or context.get("operation")
+    if operation and operation != "trainer running":
+        title += f" during {operation}"
+    lines = [title + "."]
+    for key in ("model", "destination"):
+        if context.get(key):
+            lines.append(f"{key.capitalize()}: {context[key]}")
+    requested, free = native.get("requested_allocation"), native.get("free_device_memory")
+    if requested:
+        lines.extend(("", f"The failed allocation needed {requested}" + (f"; {free} was free." if free else ".")))
+    if native.get("process_memory") and native.get("device_capacity"):
+        lines.append(f"The process was using {native['process_memory']} of the device's {native['device_capacity']}.")
+        if native.get("reserved_but_unused"):
+            lines.append(f"That includes {native['reserved_but_unused']} reserved by PyTorch but unused.")
+    if not requested:
+        # Older/other allocators need no parser support to retain their actual explanation.
+        causes = report.get("causes", [])
+        message = causes[-1]["message"] if causes else report["summary"]
+        lines.extend(("", message))
+
+    padded = False
+    multiple = False
+    for name, counts in evidence.get("batch", {}).items():
+        if not name.endswith("attention_mask_counts"):
+            continue
+        lengths = counts.get("sequence_lengths", [])
+        slots = counts.get("padded_token_positions")
+        actual = counts.get("actual_token_positions")
+        if not lengths or slots is None or actual is None:
+            continue
+        multiple |= len(lengths) > 1
+        padded |= slots > actual
+        width = slots // len(lengths)
+        label = name.removesuffix("attention_mask_counts").strip("_").replace("_", " ")
+        if label:
+            lines.extend(("", f"{label.capitalize()} batch:"))
+        else:
+            lines.append("")
+        if slots > actual and lengths.count(width) == 1:
+            lines.append(f"One {width:,}-token example expanded this entire {len(lengths)}-example batch.")
+        else:
+            lines.append(f"Batch: {len(lengths)} examples, {width:,} token positions each.")
+        percentage = 100 * (slots - actual) / slots if slots else 0
+        lines.extend((f"  Actual tokens: {actual:,}", f"  Padded positions: {slots:,} ({percentage:.0f}% padding)"))
+
+    module = evidence.get("failing_module", {})
+    if module.get("class"):
+        description = module["class"]
+        if ".lora_" in module.get("name", ""):
+            description = "LoRA " + description.lower()
+        lines.extend(("", f"The failure occurred in {description}."))
+        tensors = module.get("input_tensors", [])
+        if tensors:
+            tensor = tensors[0]
+            dtype = {"torch.float32": "FP32", "torch.bfloat16": "BF16", "torch.float16": "FP16"}.get(tensor.get("dtype"), tensor.get("dtype"))
+            if dtype and isinstance(tensor.get("bytes"), int):
+                lines.append(f"Its {dtype} input occupies {_size(tensor['bytes'])}.")
+    inventory = evidence.get("parameter_inventory_after_construction", {})
+    if "frozen torch.bfloat16" in inventory and "trainable torch.float32" in inventory:
+        lines.append("The model has BF16 frozen weights and FP32 trainable weights.")
+    if multiple:
+        lines.extend(("", "A smaller per-device batch would reduce activation sizes."))
+    if padded:
+        lines.append("Padding-free execution could avoid the padding cost if supported by the model and attention implementation.")
+    return lines
+
+
+# Expected error messages already explain many failures; add missing context without duplicating them.
+def _general_lines(report):
+    context, evidence = report.get("context", {}), report.get("evidence", {})
+    causes = report.get("causes", [])
+    lines = [report["summary"] or (causes[0]["type"] if causes else "Operation failed.")]
+    if context.get("signal") and context.get("source") and report["summary"].startswith(f"{context['source']} exited with code"):
+        lines = [f"{context['source'].capitalize()} was terminated by {context['signal']}."]
+    operation = context.get("phase") or context.get("operation") or context.get("last_operation")
+    if operation and operation not in ("trainer running", "running " + context.get("command", "")) and operation.lower() not in lines[0].lower():
+        lines.append(f"While {operation}.")
+    for key, label in (("model", "Model"), ("endpoint", "Endpoint"), ("destination", "Destination"), ("source", "Source")):
+        value = context.get(key)
+        if key == "source" and isinstance(value, str) and value.startswith("rank ") and value.lower() in lines[0].lower():
+            continue
+        if value is not None and str(value) not in "\n".join(lines):
+            lines.append(f"{label}: {value}")
+    location = []
+    for key in ("record", "line", "column", "field"):
+        value = context.get(key)
+        if value is not None and f"{key} {value}" not in report["summary"].lower():
+            location.append(f"{key} {value}")
+    if location:
+        lines.append("Location: " + ", ".join(location) + ".")
+    if context.get("signal") and context["signal"] not in lines[0]:
+        lines.append(f"The process was terminated by {context['signal']}.")
+    device = _device(context, evidence)
+    if device:
+        lines.append(f"Device: {device}.")
+
+    # Retain the deepest useful cause, not every wrapper repeating it.
+    if len(causes) > 1:
+        cause = causes[-1]
+        message = cause.get("message", "")
+        if message and message not in "\n".join(lines):
+            lines.append(f"Cause: {message}")
+    expected, observed = evidence.get("expected_type"), evidence.get("observed_type")
+    if expected and observed and not (expected in report["summary"] and observed in report["summary"]):
+        lines.append(f"Expected {expected}; received {observed}.")
+    changed = evidence.get("completed_destinations", [])
+    if changed and not all(str(path) in report["summary"] for path in changed):
+        lines.append("Already written: " + ", ".join(map(str, changed)))
+    module = evidence.get("failing_module", {})
+    if module.get("class"):
+        lines.append(f"Failing operation: {module['class']}.")
+        shapes = [" × ".join(map(str, tensor["shape"])) for tensor in module.get("input_tensors", []) if tensor.get("shape")]
+        if shapes:
+            lines.append("Input shapes: " + "; ".join(shapes) + ".")
+    os_error = evidence.get("os_error", {})
+    path = context.get("destination") or os_error.get("path")
+    if path and str(path) not in "\n".join(lines):
+        lines.append(f"Path: {path}")
+    remedies = {errno.ENOSPC: "Free space on the destination filesystem.",
+                errno.EDQUOT: "Free space within the account's quota or increase that quota.",
+                errno.EACCES: "Check access permissions for this path.",
+                errno.EROFS: "Choose a destination on a writable filesystem."}
+    if os_error.get("errno") in remedies:
+        remedy = remedies[os_error["errno"]]
+        if remedy.lower().rstrip(".") not in report["summary"].lower():
+            lines.append(remedy)
+    if context.get("attempts", 0) > 1 and "attempt" not in report["summary"].lower():
+        lines.append(f"The operation failed after {context['attempts']} attempts.")
+    return lines
+
+
+# Report collection failures explicitly without exposing the surrounding evidence tree.
+def _diagnostic_notes(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("diagnostic_error", "diagnostic_limitation") and isinstance(item, str):
+                yield item
+            elif isinstance(item, (dict, list)):
+                yield from _diagnostic_notes(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _diagnostic_notes(item)
+
+
+# Cleanup outcomes and incomplete diagnostics remain visible without printing per-process bookkeeping.
+def _terminal(report):
+    causes = report.get("causes", [])
+    oom = any(cause.get("type") == "OutOfMemoryError" for cause in causes) or bool(report.get("evidence", {}).get("allocation_failure"))
+    lines = _memory_lines(report) if oom else _general_lines(report)
+    cleanup = report.get("evidence", {}).get("cleanup", {})
+    if cleanup:
+        remaining = [name for name, state in cleanup.items() if not state.get("process_group_gone")]
+        forced = [f"{name}: {', '.join(signal for signal in state.get('signals_sent', []) if signal in ('SIGTERM', 'SIGKILL'))}"
+                  for name, state in cleanup.items() if any(signal in ("SIGTERM", "SIGKILL") for signal in state.get("signals_sent", []))]
+        lines.append("")
+        if remaining:
+            lines.append(f"Cleanup could not confirm that these process groups exited: {', '.join(remaining)}.")
+        elif forced:
+            lines.append(f"Cleanup completed using forced termination ({'; '.join(forced)}).")
+        else:
+            lines.append("Worker cleanup completed." if all(name.startswith("rank ") for name in cleanup)
+                         else "Process cleanup completed.")
+    for note in [*_diagnostic_notes(report.get("evidence", {})), *report.get("notes", [])]:
+        # Peer aborts are an expected consequence of the primary failure, not another diagnosis.
+        if note.startswith("Additional failure from ") and note.endswith("distributed training aborted after a worker failure"):
+            continue
+        if note not in "\n".join(lines):
+            lines.append(note)
+    context = report.get("context", {})
+    if context.get("incomplete_log"):
+        lines.extend(("", f"Incomplete diagnostics log: {context['incomplete_log']}"))
+    elif context.get("log"):
+        lines.extend(("", f"Full diagnostics: {context['log']}"))
+    return "\n".join(textwrap.fill(line, width=100, break_long_words=False, break_on_hyphens=False,
+                                  subsequent_indent="  " if line.startswith("  ") else "") if line else "" for line in lines)
+
+
+# Terminal presentation is selective; detailed logs retain the complete original evidence and traceback.
+def render(report, *, detailed=False, include_traceback=False):
+    """Render an explanation for people, or complete evidence for the durable log."""
     try:
+        if not detailed:
+            text = _terminal(report)
+            if include_traceback and report.get("traceback"):
+                text += "\n\n" + report["traceback"].rstrip()
+            return text
         lines = [report["summary"]]
         for section in ("context", "evidence"):
             lines.extend(_facts(report.get(section, {})))
@@ -207,13 +415,13 @@ def render(report, *, detailed=False):
         if causes and causes[-1].get("location"):
             lines.append(f"  Failure location: {causes[-1]['location']}")
         lines.extend(f"  {note}" for note in report.get("notes", []))
-        if detailed and report.get("traceback"):
+        if report.get("traceback"):
             lines.extend(("", report["traceback"].rstrip()))
         return "\n".join(lines)
     except Exception:
         summary = report.get("summary") if isinstance(report, dict) else None
         lines = [summary if isinstance(summary, str) else "Failure details unavailable",
                  "  Additional diagnostic rendering failed; original summary preserved."]
-        if detailed and isinstance(report, dict) and isinstance(report.get("traceback"), str):
+        if (detailed or include_traceback) and isinstance(report, dict) and isinstance(report.get("traceback"), str):
             lines.append(report["traceback"])
         return "\n".join(lines)

@@ -558,7 +558,7 @@ def main(argv=None):
             return result
     except Exception as e:
         report = capture(e, context={"command": f"dataset {args.command}"})
-        print(f"dataset {args.command}: {render(report, detailed=not report['expected'])}", file=sys.stderr)
+        print(f"dataset {args.command}: {render(report, include_traceback=not report['expected'])}", file=sys.stderr)
         return 1
 
 

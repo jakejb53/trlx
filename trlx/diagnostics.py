@@ -114,10 +114,12 @@ def capture_resources(error):
                     "reserved_but_unused": quantity + r" is reserved by PyTorch but unallocated"}
         native = {name: match.group(1) for name, pattern in patterns.items()
                   if (match := re.search(pattern, str(error)))}
+        device = re.search(r"GPU (\d+) has a total capacity", str(error))
         if native:
             native["measurement"] = "allocation-failure figures reported by PyTorch (rounded)"
+            if device:
+                native["local_cuda_device"] = int(device.group(1))
             failures.annotate(error, evidence={"allocation_failure": native})
-        device = re.search(r"GPU (\d+) has a total capacity", str(error))
         failures.annotate(error, evidence={"allocator_after_exception": allocator_snapshot(int(device.group(1)) if device else None)})
     except Exception as diagnostic_error:
         error.add_note(f"Allocator diagnostics unavailable: {type(diagnostic_error).__name__}: {diagnostic_error}")

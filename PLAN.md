@@ -544,6 +544,14 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   checkpoint I/O, unexpected worker exit, diagnostic-provider/log-write failures, redaction, and retry
   exhaustion. Tiny real SFT training/evaluation, syntax checks, dataset import independence, and
   independent source review passed. No regression-test files or operator configuration changes.
+- Terminal presentation corrected (2026-09-28): both CLIs use concise explanations, relevant facts,
+  and supported guidance instead of internal field trees. Successful cleanup is one line; cleanup
+  and diagnostic-collection failures remain visible. Full evidence stays in the log; unexpected
+  startup/standalone failures retain their traceback without a field dump. GPU attribution uses
+  native failure evidence or a single-device mapping, not later allocator counters.
+  Updated `dataset/failures.py`, both CLIs, `trlx/diagnostics.py`, `README.md`, and `SPEC.md`.
+  Controlled OOM, data, I/O, model-loading, endpoint, process-exit, multi-device, and unexpected-error
+  presentation checks, syntax checks, and independent review passed. No GPU rerun or regression-test files.
 - Dispatched/split batches report shapes and explicitly unavailable CPU counts. Full trainer coverage
   beyond SFT and this implementation's FSDP path remain unverified. The training OOM itself remains
   unresolved; diagnostics now expose its padded-batch and FP32 LoRA activation costs.

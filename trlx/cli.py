@@ -372,11 +372,11 @@ def main(argv=None):
             except Exception as reporting_error:
                 error.add_note(f"cannot deliver failure report: {reporting_error}")
                 if sys.stderr is not None:
-                    print(f"{label}: {failures.render(failures.capture(error), detailed=True)}", file=sys.stderr)
+                    print(f"{label}: {failures.render(failures.capture(error), include_traceback=True)}", file=sys.stderr)
         elif sys.stderr is not None:
             # Unexpected startup/standalone failures have no run log to hold their traceback.
-            detailed = not report["expected"] and not report["context"].get("log")
-            print(f"{label}: {failures.render(report, detailed=detailed)}", file=sys.stderr)
+            include_traceback = not report["expected"] and not report["context"].get("log")
+            print(f"{label}: {failures.render(report, include_traceback=include_traceback)}", file=sys.stderr)
         return getattr(error, "exit_code", 1)
     finally:
         if connection is not None:
