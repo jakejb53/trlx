@@ -84,7 +84,8 @@ Do not normalize text when comparing examples.
 - FastAPI serves the page and API through Uvicorn. Each output uses an independent
   non-streaming request; completed responses appear without waiting for other outputs.
   Failures retain the previous response, when present, and identify it as retained.
-- Each response retains its submitted user prompt for subsequent dataset additions.
+- Add to dataset captures the current user prompt and edited response. Later edits
+  do not alter examples already in the pending collection.
 - Per-output timeout and retries start at 120 seconds and 2 additional attempts,
   respectively, matching the dataset endpoint defaults. Both are editable and persisted.
 - Saved paths refer to the server filesystem, relative to its working directory

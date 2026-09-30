@@ -794,7 +794,8 @@ with separate clear buttons for user, system, or both.
 Choose reasoning, answer, or both and use each card's **Add to dataset** button.
 Any number of candidates can be added. The user is always saved; the system
 prompt is excluded. Excluding reasoning omits its field; excluding the answer
-leaves an empty assistant message. Each response retains its original user prompt.
+leaves an empty assistant message. Adding captures the current user prompt, including
+edits made after generation. Later edits do not change examples already pending.
 
 The pending collection, prompts, edited responses, endpoint settings, and API keys
 persist in this browser's localStorage for the same origin. **Save dataset** appends

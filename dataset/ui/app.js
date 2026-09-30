@@ -21,11 +21,11 @@ export function identity(row) {
     Object.hasOwn(row, "reasoning"), row.reasoning ?? null]);
 }
 
-// Use the generation's captured prompt, never a subsequently edited input box.
-export function exampleFrom(card) {
+// Capture the current prompt and edited response when adding, not when generating.
+export function exampleFrom(card, user) {
   if (!card.response) throw new Error("Generate a response first.");
   if (!card.includeReasoning && !card.includeAnswer) throw new Error("Select reasoning, assistant answer, or both.");
-  const row = {messages: [{role: "user", content: card.response.user},
+  const row = {messages: [{role: "user", content: user},
     {role: "assistant", content: card.includeAnswer ? card.response.answer : ""}]};
   if (card.includeReasoning) row.reasoning = card.response.reasoning;
   return row;
@@ -136,7 +136,7 @@ export function start() {
   // Each add captures an immutable edited example; later edits do not mutate the collection.
   function addExample(card, message) {
     try {
-      const row = exampleFrom(card);
+      const row = exampleFrom(card, workspace.user);
       if (workspace.pending.some(existing => identity(existing) === identity(row))) {
         showMessage(message, "This exact example is already pending.");
         return;
