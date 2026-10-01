@@ -8,6 +8,15 @@ Its [interactive web UI](#interactive-dataset-authoring) lets you compare respon
 from different endpoints, edit answers and reasoning, and save selected examples
 to a training dataset.
 
+**Start the web UI** from the repository root:
+
+```sh
+python -m dataset.cli ui --host 127.0.0.1 --port 8000
+```
+
+Open <http://127.0.0.1:8000> in your browser. Both arguments are required;
+`--port` accepts 1..65535.
+
 ## Why trlx exists
 
 Using TRL directly gives you Python trainer APIs; you assemble the surrounding workflow
@@ -39,6 +48,7 @@ of TRL, so its preparation tools are useful outside a trlx training run.
 ## Guide
 
 - [Start here](#start-here) and [installing updates](#installing-updates)
+- [Start the web UI and author datasets interactively](#interactive-dataset-authoring)
 - [Prepare datasets](#dataset-cheat-sheet) and [generate data through endpoints](#tutorial-endpoint-generation-and-credentials)
 - [Choose a trainer](#training-cheat-sheet) and [configure runs](#tutorial-temporary-and-persistent-settings)
 - [Train on reasoning](#sft-reasoning-supervision), [use rewards](#tutorial-rewards), and [mix replay data](#tutorial-sft-replay)
