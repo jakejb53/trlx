@@ -16,9 +16,12 @@ configured OpenAI-compatible endpoints. The interface does not run training.
 
 ## Prompts and generation
 
-- Accept a user prompt and an optional system prompt, shared across outputs.
-- Keep both prompts populated after generation and adding examples.
-- Provide separate buttons to clear the user prompt, system prompt, or both.
+- Share the user prompt across outputs; each output has its own optional system prompt.
+- Each output has an optional Context JSON editor. Blank means no context; otherwise
+  require an array of objects. Send the system prompt, Context entries in their original
+  order, then the user prompt. Preserve all Context message fields without interpretation.
+- Keep prompts populated after generation and adding examples.
+- Provide a button to clear the user prompt and a separate system-prompt clear button per output.
 - Generate a configurable number of response options, with a minimum of two.
 - Each output has independently configurable endpoint, model, credentials, and
   sampling settings, all changeable in the UI.
@@ -44,7 +47,7 @@ configured OpenAI-compatible endpoints. The interface does not run training.
 
 Every example contains a `messages` list with exactly one user message followed
 by one assistant message. The user message is always included. The system
-prompt is never included.
+prompt and Context are never included.
 
 | Selection | Assistant `content` | Top-level `reasoning` |
 |---|---|---|
@@ -68,8 +71,8 @@ Do not normalize text when comparing examples.
 
 ## Browser persistence
 
-- Persist the pending collection, prompts, per-output endpoint and model
-  settings, sampling settings, and credentials in browser `localStorage`.
+- Persist the pending collection, shared user prompt, per-output system prompts, endpoint and model
+  settings, sampling settings, credentials, and Context editor text in browser `localStorage`.
 - Restore that state across refreshes and application restarts when accessed
   through the same browser origin.
 - Credentials are entered directly in the UI and may be stored in

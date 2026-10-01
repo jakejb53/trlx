@@ -38,6 +38,8 @@ class Generation(Input):
     api_key: str = ""
     user: str = Field(min_length=1)
     system: str = ""
+    # Endpoint-owned message fields remain unrestricted, including tool calls and rich content.
+    context: list[dict] = Field(default_factory=list)
     sampling: Sampling
     timeout: float = Field(gt=0)
     retries: int = Field(ge=0)
@@ -107,6 +109,7 @@ def create_app():
             raise DatasetError("model and user prompt must not be blank")
         endpoint = Endpoint(body.endpoint, body.model, body.api_key or None, body.timeout, body.retries)
         messages = ([{"role": "system", "content": body.system}] if body.system else [])
+        messages.extend(body.context)
         messages.append({"role": "user", "content": body.user})
         parameters = body.sampling.model_dump(exclude_none=True)
         max_tokens = parameters.pop("max_tokens", None)

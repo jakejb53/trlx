@@ -59,6 +59,32 @@ class AuthoringAPI(unittest.TestCase):
             {"role": "system", "content": "instruction"}, {"role": "user", "content": "prompt"}], **parameters})
         self.assertEqual(sent.get_header("Authorization"), "Bearer private-key")
 
+    # Context fields belong to the endpoint; wire serialization preserves rich history and order.
+    def test_context_preserves_messages_between_system_and_user(self):
+        context = [
+            {"role": "user", "content": [{"type": "text", "text": "Earlier question"}]},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "result", "extra": {"flag": True}},
+        ]
+        reply = {"choices": [{"message": {"content": "result"}}]}
+        for system in ("instruction", ""):
+            with self.subTest(system=system), patch("dataset.endpoint.urllib.request.urlopen",
+                    return_value=io.BytesIO(json.dumps(reply).encode())) as call:
+                response = self.client.post("/api/generate", json={**self.body, "system": system, "context": context})
+                self.assertEqual(response.status_code, 200, response.text)
+                expected = ([{"role": "system", "content": system}] if system else [])
+                self.assertEqual(json.loads(call.call_args.args[0].data)["messages"],
+                                 expected + context + [{"role": "user", "content": "prompt"}])
+
+    # Validate only the array/object boundary, never message roles or provider-specific fields.
+    def test_context_rejects_invalid_outer_shape(self):
+        for context in (None, {}, "[]", [None], ["text"], [[]], [1]):
+            with self.subTest(context=context), patch.object(Endpoint, "complete_full") as generate:
+                response = self.client.post("/api/generate", json={**self.body, "context": context})
+                self.assertEqual(response.status_code, 422)
+                generate.assert_not_called()
+
     # Disabled sampling controls and an empty system prompt must truly be absent.
     def test_unset_parameters_are_omitted(self):
         reply = {"choices": [{"message": {"content": "result"}}]}
@@ -210,10 +236,23 @@ const card = newCard();
 card.endpoint = "http://example/v1";
 card.model = "one";
 card.api_key = "key";
+card.system = "first instruction";
+const context = [{role: "assistant", content: null, tool_calls: [{id: "call-1", function: {name: "lookup", arguments: "{}"}}]},
+  {role: "tool", tool_call_id: "call-1", content: [{type: "text", text: "result"}], extra: {flag: true}}];
+card.context = JSON.stringify(context);
+assert.deepEqual(generationBody(card, "prompt").context, context);
+for (const invalid of ["{", "{}", "null", "[null]", "[[]]", '["text"]', "[1]"]) {
+  assert.throws(() => generationBody({...card, context: invalid}, "prompt"), /Context/);
+}
+for (const empty of ["", "  ", "[]"]) {
+  assert.deepEqual(generationBody({...card, context: empty}, "prompt").context, []);
+}
 card.response = {user: "original prompt", reasoning: "edited reasoning", answer: "edited answer"};
 const both = exampleFrom(card, "edited prompt");
 assert.equal(both.messages[0].content, "edited prompt");
 assert.equal(both.reasoning, "edited reasoning");
+assert.deepEqual(Object.keys(both).sort(), ["messages", "reasoning"]);
+assert.equal(both.messages.length, 2);
 card.includeAnswer = false;
 assert.equal(exampleFrom(card, "edited prompt").messages[1].content, "");
 card.includeAnswer = true;
@@ -223,19 +262,32 @@ assert.equal(Object.hasOwn(answerOnly, "reasoning"), false);
 assert.notEqual(identity(answerOnly), identity({...answerOnly, reasoning: ""}));
 card.includeAnswer = false;
 assert.throws(() => exampleFrom(card, "edited prompt"));
-assert.deepEqual(generationBody(card, "new prompt", "system").sampling, {});
+assert.equal(generationBody(card, "new prompt").system, "first instruction");
+assert.equal(generationBody(newCard(), "new prompt").system, "");
+assert.deepEqual(both.messages.map(message => message.role), ["user", "assistant"]);
+assert.deepEqual(generationBody(card, "new prompt").sampling, {});
 card.sampling.top_k.enabled = true;
 card.sampling.top_k.value = "23";
-assert.deepEqual(generationBody(card, "new prompt", "system").sampling, {top_k: 23});
+assert.deepEqual(generationBody(card, "new prompt").sampling, {top_k: 23});
 card.sampling.top_k.value = "";
-assert.throws(() => generationBody(card, "prompt", ""));
+assert.throws(() => generationBody(card, "prompt"));
 card.sampling.top_k.enabled = false;
-assert.deepEqual(generationBody(card, "prompt", "").sampling, {});
-const workspace = {version: 1, user: "changed prompt", system: "system", destination: "train.jsonl",
+assert.deepEqual(generationBody(card, "prompt").sampling, {});
+const workspace = {version: 1, user: "changed prompt", destination: "train.jsonl",
   cards: [card, newCard()], pending: [both, answerOnly]};
 assert.deepEqual(validateWorkspace(JSON.parse(JSON.stringify(workspace))), workspace);
+// Incomplete JSON remains an editable draft across reloads; generation rejects it.
+assert.equal(validateWorkspace({...workspace, cards: [{...card, context: "["}, newCard()]}).cards[0].context, "[");
+const noContext = structuredClone(workspace);
+delete noContext.cards[0].context;
+assert.throws(() => validateWorkspace(noContext));
 assert.throws(() => validateWorkspace({...workspace, version: 2}));
 assert.throws(() => validateWorkspace({...workspace, pending: [{messages: []}]}));
+const oldWorkspace = structuredClone(workspace);
+oldWorkspace.system = "shared instruction";
+oldWorkspace.cards.forEach(card => { delete card.system; });
+assert.throws(() => validateWorkspace(oldWorkspace));
+assert.throws(() => validateWorkspace({...workspace, cards: [card, {...newCard(), system: null}]}));
 '''
         result = subprocess.run(["node", "--input-type=module", "-e", script],
                                 cwd=pathlib.Path(__file__).resolve().parent.parent,
@@ -271,26 +323,27 @@ class Element {
 // Build the same card control groups that the HTML template supplies.
 function cardElement() {
   const element = new Element();
-  element.one = Object.fromEntries(["h3", ".sampling", ".add", ".card-message", ".card-status", "details"].map(k => [k, new Element()]));
+  element.one = Object.fromEntries(["h3", ".sampling", ".add", ".card-message", ".card-status", "details", ".clear-system", "[data-system-label]"].map(k => [k, new Element()]));
   element.many = {};
   for (const [selector, field, names] of [
-    ["[data-setting]", "setting", ["endpoint", "model", "api_key", "timeout", "retries"]],
+    ["[data-setting]", "setting", ["endpoint", "model", "api_key", "timeout", "retries", "system", "context"]],
     ["[data-include]", "include", ["reasoning", "answer"]],
     ["[data-response]", "response", ["reasoning", "answer"]],
   ]) element.many[selector] = names.map(name => { const input = new Element(); input.dataset[field] = name; return input; });
+  element.one['[data-setting="system"]'] = element.many["[data-setting]"].find(input => input.dataset.setting === "system");
   return element;
 }
-const elements = Object.fromEntries(["storage-error", "user", "system", "destination", "clear-user", "clear-system",
-  "clear-both", "output-count", "generate", "save", "outputs", "pending", "pending-count", "collection-count",
+const elements = Object.fromEntries(["storage-error", "theme", "theme-error", "user", "destination", "clear-user",
+  "output-count", "generate", "save", "outputs", "pending", "pending-count", "collection-count",
   "save-status", "generation-status"].map(id => ["#" + id, new Element()]));
 elements["#output-template"] = {content: {firstElementChild: {cloneNode: cardElement}}};
-globalThis.document = {querySelector: key => elements[key], createElement: () => new Element(), createTextNode: text => text};
+globalThis.document = {documentElement: new Element(), querySelector: key => elements[key], createElement: () => new Element(), createTextNode: text => text};
 const cards = [newCard(), newCard()];
-cards.forEach((card, index) => { card.endpoint = "http://example/v1"; card.model = "model-" + index; });
+cards.forEach((card, index) => { card.endpoint = "http://example/v1"; card.model = "model-" + index; card.system = "instruction-" + index; });
 cards[0].sampling.temperature = {enabled: true, value: ""};
-let saved = JSON.stringify({version: 1, user: "original", system: "instruction", destination: "train.jsonl", cards, pending: []});
+let saved = JSON.stringify({version: 1, user: "original", destination: "train.jsonl", cards, pending: []});
 let quota = false;
-globalThis.localStorage = {getItem: () => saved, setItem: (key, value) => {
+globalThis.localStorage = {getItem: key => key === "trlx.dataset.theme" ? null : saved, setItem: (key, value) => {
   if (quota) throw new Error("quota exceeded"); saved = value;
 }};
 const requests = [];
@@ -305,6 +358,7 @@ start();
 await elements["#generate"].events.click();
 assert.equal(requests.length, 1);
 assert.equal(requests[0].body.model, "model-1");
+assert.equal(requests[0].body.system, "instruction-1");
 assert.match(elements["#outputs"].children[0].one[".card-message"].textContent, /numeric/);
 const card = elements["#outputs"].children[1];
 elements["#user"].value = "changed prompt";
@@ -346,11 +400,36 @@ completeSave({ok: true, json: async () => ({added: 0, duplicates: 1})});
 await retry;
 assert.equal(JSON.parse(saved).pending.length, 0);
 assert.equal(elements["#pending-count"].textContent, 0);
-elements["#clear-system"].events.click();
-assert.equal(JSON.parse(saved).system, "");
+card.one[".clear-system"].events.click();
+assert.equal(JSON.parse(saved).cards[1].system, "");
+assert.equal(JSON.parse(saved).cards[0].system, "instruction-0");
 assert.equal(JSON.parse(saved).user, "next prompt");
-elements["#clear-both"].events.click();
+const system = card.one['[data-setting="system"]'];
+system.value = "edited instruction";
+system.events.input();
+const contextEditor = card.many["[data-setting]"].find(input => input.dataset.setting === "context");
+contextEditor.value = '[{"role":"tool","tool_call_id":"prior","content":"history"}]';
+contextEditor.events.input();
+// Reload restores each card independently; a new card starts with empty instructions.
+start();
+assert.equal(elements["#outputs"].children[1].one['[data-setting="system"]'].value, "edited instruction");
+assert.equal(elements["#outputs"].children[0].one['[data-setting="system"]'].value, "instruction-0");
+assert.equal(elements["#outputs"].children[1].many["[data-setting]"].find(input => input.dataset.setting === "context").value, contextEditor.value);
+assert.equal(JSON.parse(saved).cards[0].context, "");
+elements["#output-count"].value = "3";
+elements["#output-count"].events.change({target: elements["#output-count"]});
+assert.equal(JSON.parse(saved).cards[2].system, "");
+// Valid cards submit their own instructions in the same generation round.
+const firstTemperature = elements["#outputs"].children[0].one[".sampling"].children[0].children[1];
+firstTemperature.value = "1";
+firstTemperature.events.input();
+requests.length = 0;
+await elements["#generate"].events.click();
+assert.deepEqual(requests.map(request => request.body.system), ["instruction-0", "edited instruction", ""]);
+assert.deepEqual(requests.map(request => request.body.context), [[], JSON.parse(contextEditor.value), []]);
+elements["#clear-user"].events.click();
 assert.equal(JSON.parse(saved).user, "");
+assert.equal(JSON.parse(saved).cards[1].system, "edited instruction");
 '''
         result = subprocess.run(["node", "--input-type=module", "-e", script],
                                 cwd=pathlib.Path(__file__).resolve().parent.parent,

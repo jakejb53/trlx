@@ -11,17 +11,19 @@
   <main>
     <header class="masthead"><div><p class="eyebrow">DATASET / AUTHORING</p><h1>Dataset Studio</h1>
       <p class="subtitle">Compare responses. Refine the details. Keep what works.</p></div>
-      <a href="#collection" class="collection-link">Pending <span id="pending-count">0</span></a>
+      <div class="masthead-actions">
+        <label class="theme-control">Theme <select id="theme">
+          <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
+        </select></label>
+        <a href="#collection" class="collection-link">Pending <span id="pending-count">0</span></a>
+      </div>
+      <p id="theme-error" class="error" role="alert" hidden></p>
     </header>
     <p id="storage-error" class="error" role="alert" hidden></p>
     <section class="panel" aria-labelledby="prompt-heading">
-      <div class="section-heading"><h2 id="prompt-heading">01 / Prompt</h2><button id="clear-both" class="quiet">Clear both</button></div>
-      <div class="prompts">
+      <div class="section-heading"><h2 id="prompt-heading">01 / Prompt</h2></div>
         <div><div class="field-heading"><label for="user">User prompt</label><button id="clear-user" class="quiet">Clear user</button></div>
           <textarea id="user" rows="6" placeholder="What would you like the models to answer?"></textarea></div>
-        <div><div class="field-heading"><label for="system">System prompt <span class="muted">optional</span></label><button id="clear-system" class="quiet">Clear system</button></div>
-          <textarea id="system" rows="6" placeholder="Instructions for generation. Not included in saved examples."></textarea></div>
-      </div>
       <div class="toolbar"><label class="inline">Outputs <input id="output-count" type="number" min="2" step="1" value="2"></label>
         <button id="generate" class="primary">Generate responses</button><span id="generation-status" role="status"></span></div>
     </section>
@@ -48,6 +50,11 @@
         <div class="pair"><label>Request timeout (seconds)<input data-setting="timeout" type="number" min="0.01" step="any"></label>
           <label>Retries<input data-setting="retries" type="number" min="0" step="1"></label></div>
       </details>
+      <div class="field-heading"><label data-system-label>System prompt <span class="muted">optional</span></label><button class="quiet clear-system">Clear system</button></div>
+      <textarea data-setting="system" rows="4" placeholder="Instructions for this output. Not included in saved examples."></textarea>
+      <label>Context <span class="muted">optional · JSON messages array</span>
+        <textarea data-setting="context" rows="5" spellcheck="false" placeholder="Paste a messages array. Sent after the system prompt and before the user prompt. Not included in saved examples."></textarea>
+      </label>
       <div class="field-heading"><label class="inline"><input type="checkbox" data-include="reasoning">Include reasoning</label></div>
       <textarea data-response="reasoning" rows="7" placeholder="Reasoning appears here; edit before adding." disabled></textarea>
       <div class="field-heading"><label class="inline"><input type="checkbox" data-include="answer">Include assistant answer</label></div>

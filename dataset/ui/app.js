@@ -10,7 +10,7 @@ const CONTROLS = [
 
 // New cards have no guessed endpoint or model; sampling values remain inactive.
 export function newCard() {
-  return {endpoint: "", model: "", api_key: "", timeout: 120, retries: 2,
+  return {endpoint: "", model: "", api_key: "", system: "", context: "", timeout: 120, retries: 2,
     sampling: Object.fromEntries(CONTROLS.map(([name, , value]) => [name, {enabled: false, value}])),
     includeReasoning: true, includeAnswer: true, response: null};
 }
@@ -32,7 +32,15 @@ export function exampleFrom(card, user) {
 }
 
 // Disabled controls are omitted, including any stale value left in their input.
-export function generationBody(card, user, system) {
+export function generationBody(card, user) {
+  // Keep draft JSON as text in storage; only generation validates its outer shape.
+  // Message fields belong to the endpoint and must pass through without rewriting.
+  let context;
+  try { context = card.context.trim() ? JSON.parse(card.context) : []; }
+  catch { throw new Error("Context must be valid JSON: an array of message objects."); }
+  if (!Array.isArray(context) || context.some(message => message === null || typeof message !== "object" || Array.isArray(message))) {
+    throw new Error("Context must be a JSON array of message objects.");
+  }
   const sampling = {};
   for (const [name] of CONTROLS) {
     if (card.sampling[name].enabled) {
@@ -43,17 +51,17 @@ export function generationBody(card, user, system) {
   }
   if (card.timeout === "" || card.retries === "") throw new Error("Enter timeout and retries.");
   return {endpoint: card.endpoint, model: card.model, api_key: card.api_key,
-    timeout: Number(card.timeout), retries: Number(card.retries), user, system, sampling};
+    timeout: Number(card.timeout), retries: Number(card.retries), user, system: card.system, context, sampling};
 }
 
 // Validate stored structure before binding editors; an invalid workspace is never overwritten.
 export function validateWorkspace(value) {
   if (!value || value.version !== 1 || !Array.isArray(value.cards) || value.cards.length < 2 ||
-      !Array.isArray(value.pending) || ![value.user, value.system, value.destination].every(v => typeof v === "string")) {
+      !Array.isArray(value.pending) || ![value.user, value.destination].every(v => typeof v === "string")) {
     throw new Error("Stored workspace has an unsupported or damaged format.");
   }
   for (const card of value.cards) {
-    if (![card.endpoint, card.model, card.api_key].every(v => typeof v === "string") ||
+    if (![card.endpoint, card.model, card.api_key, card.system, card.context].every(v => typeof v === "string") ||
         typeof card.includeReasoning !== "boolean" || typeof card.includeAnswer !== "boolean" ||
         ![card.timeout, card.retries].every(v => typeof v === "number" || typeof v === "string")) {
       throw new Error("Stored output settings are invalid.");
@@ -80,8 +88,38 @@ export function validateWorkspace(value) {
   return value;
 }
 
+// Theme storage is independent of workspace data so appearance changes cannot overwrite examples.
+export function startTheme() {
+  const key = "trlx.dataset.theme";
+  const selector = document.querySelector("#theme");
+  const errorNode = document.querySelector("#theme-error");
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved !== null && !["system", "light", "dark"].includes(saved)) {
+      throw new Error("Stored theme is invalid. Select a theme to replace it.");
+    }
+    selector.value = saved ?? "system";
+    document.documentElement.dataset.theme = selector.value;
+  } catch (error) {
+    errorNode.textContent = `Cannot restore theme: ${error.message}`;
+    errorNode.hidden = false;
+  }
+  // Apply immediately even when storage fails; report that the choice will not persist.
+  selector.addEventListener("change", () => {
+    document.documentElement.dataset.theme = selector.value;
+    try {
+      localStorage.setItem(key, selector.value);
+      errorNode.hidden = true;
+    } catch (error) {
+      errorNode.textContent = `Cannot save theme: ${error.message} This choice applies only to this page.`;
+      errorNode.hidden = false;
+    }
+  });
+}
+
 // Browser initialization stays separate from pure row/request helpers for verification.
 export function start() {
+  startTheme();
   const $ = selector => document.querySelector(selector);
   let workspace;
   let lastStored;
@@ -90,7 +128,7 @@ export function start() {
   const storageError = $("#storage-error");
   try {
     lastStored = localStorage.getItem(STORAGE_KEY);
-    workspace = lastStored === null ? {version: 1, user: "", system: "", destination: "", cards: [newCard(), newCard()], pending: []}
+    workspace = lastStored === null ? {version: 1, user: "", destination: "", cards: [newCard(), newCard()], pending: []}
       : validateWorkspace(JSON.parse(lastStored));
   } catch (error) {
     storageError.textContent = `Cannot restore workspace: ${error.message} Stored data was not changed.`;
@@ -155,6 +193,15 @@ export function start() {
     workspace.cards.forEach((card, index) => {
       const article = $("#output-template").content.firstElementChild.cloneNode(true);
       article.querySelector("h3").textContent = `Output ${index + 1}`;
+      const system = article.querySelector('[data-setting="system"]');
+      system.id = `system-${index}`;
+      article.querySelector("[data-system-label]").htmlFor = system.id;
+      // Clearing instructions affects this card only, including its persisted settings.
+      article.querySelector(".clear-system").addEventListener("click", () => {
+        card.system = "";
+        system.value = "";
+        persist();
+      });
       for (const input of article.querySelectorAll("[data-setting]")) {
         const name = input.dataset.setting;
         input.value = card[name];
@@ -258,7 +305,6 @@ export function start() {
     // prevent valid neighbors from issuing their own requests.
     const cards = structuredClone(workspace.cards);
     const user = workspace.user;
-    const system = workspace.system;
     persist();
     busy = true;
     $("#generate").disabled = true;
@@ -277,7 +323,7 @@ export function start() {
       showMessage(message, "");
       const clock = setInterval(() => { status.textContent = `Waiting · ${Math.floor((Date.now() - started) / 1000)}s`; }, 1000);
       try {
-        const body = generationBody(settings, user, system);
+        const body = generationBody(settings, user);
         const result = await post("api/generate", body);
         if (typeof result.answer !== "string" || typeof result.reasoning !== "string") throw new Error("Server returned an invalid response.");
         card.response = {user: body.user, answer: result.answer, reasoning: result.reasoning};
@@ -325,19 +371,18 @@ export function start() {
     finally { saving = false; renderPending(); }
   }
 
-  // Clearing prompts never discards pending data or changes a candidate's captured user text.
-  function clearPrompts(names) {
-    for (const name of names) { workspace[name] = ""; $(`#${name}`).value = ""; }
+  // Clearing the shared prompt leaves per-output instructions and pending examples intact.
+  function clearUser() {
+    workspace.user = "";
+    $("#user").value = "";
     persist();
   }
 
-  for (const name of ["user", "system", "destination"]) {
+  for (const name of ["user", "destination"]) {
     $(`#${name}`).value = workspace[name];
     $(`#${name}`).addEventListener("input", event => { workspace[name] = event.target.value; persist(); });
   }
-  $("#clear-user").addEventListener("click", () => clearPrompts(["user"]));
-  $("#clear-system").addEventListener("click", () => clearPrompts(["system"]));
-  $("#clear-both").addEventListener("click", () => clearPrompts(["user", "system"]));
+  $("#clear-user").addEventListener("click", clearUser);
   $("#output-count").value = workspace.cards.length;
   $("#output-count").addEventListener("change", event => {
     const count = Number(event.target.value);

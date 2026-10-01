@@ -686,8 +686,8 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
 - Contract: `SPEC-webui.md`. Launch from the repository root with
   `python -m dataset.cli ui --host 127.0.0.1 --port 8000`; both arguments are
   required, and port must be in 1..65535. FastAPI and Uvicorn serve the UI.
-- Shared user/system prompts feed independently configured output cards with
-  endpoint, credentials, model, and checkbox-enabled sampling overrides. Reasoning
+- A shared user prompt feeds independently configured output cards with per-output system
+  prompts, endpoint, credentials, model, and checkbox-enabled sampling overrides. Reasoning
   and answers are editable and independently selectable; any number of outputs
   can enter the pending collection. Saved examples retain their submitted user
   prompt and exclude the system prompt.
@@ -713,6 +713,34 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   expects old error wording;
   `tests.test_io.OutputPublication.test_split_cleanup_preserves_primary_failure_and_completed_paths`
   expects cleanup notes in the exception message rather than its notes.
+
+- Dark mode complete (2026-09-30): System / Light / Dark selector defaults to the browser's
+  color preference and persists choices in `localStorage` under `trlx.dataset.theme`, separate
+  from workspace data. Updated `dataset/ui/{index.html,app.js,style.css}`; storage failures
+  remain visible. Node checks with simulated DOM/storage passed for switching, reload persistence,
+  storage-error recovery, and workspace isolation. All 13 checked text/background pairs per
+  palette meet 4.5:1 contrast. Real-browser rendering remains unverified.
+
+- Per-output system prompts complete (2026-09-30): each card independently edits, clears,
+  persists, and submits its instructions; new cards start empty. The shared user prompt is
+  full-width; shared system and Clear both controls are removed. Updated
+  `dataset/ui/{index.html,app.js,style.css}`, `tests/test_ui.py`, and `SPEC-webui.md`.
+  Both browser contract scripts passed under Node, covering distinct requests, independent
+  clearing, reload persistence, and rejection of the old workspace format. No compatibility
+  conversion: existing workspaces require deleting the site's `trlx.dataset.workspace.v1`
+  localStorage entry and reloading, discarding its browser-held workspace data.
+  Real-browser rendering remains unverified.
+
+- Per-output Context complete (2026-10-01): an optional JSON messages-array editor persists
+  with each card. Requests send system prompt, unchanged Context entries, then user prompt;
+  Context is excluded from saved examples. Blank means no context; validation checks only
+  the array/object shape. Updated `dataset/ui/{index.html,app.js}`, `dataset/ui.py`,
+  `tests/test_ui.py`, and `SPEC-webui.md`. Five focused browser/API checks passed, covering
+  request order, tool-call fields, persistence, invalid input, and dataset exclusion.
+  API checks used mocked endpoints outside the sandbox after TestClient stalled inside it.
+  No compatibility conversion: existing workspaces require deleting the site's
+  `trlx.dataset.workspace.v1` localStorage entry and reloading, discarding browser-held
+  workspace data. Real-browser rendering and live endpoint generation remain unverified.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 
