@@ -9,6 +9,14 @@ Development progress is tracked in this file. Each phase heading below carries i
 Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, SFT reasoning inclusion, and interactive dataset authoring UI complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below). Web UI browser/live-endpoint validation and two additional stale test assertions are recorded in its section below.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
+### Session start procedure
+
+At each session start, list all features explicitly marked planned in this file,
+with a brief description of each feature's scope. If none remain, say so.
+This replaces the instruction in `ONBOARD.md` and `IN-PROG.md` to propose the next
+feature or phase at session start. Wait for the user to select the session scope
+before proposing an implementation plan.
+
 ### Session notes
 
 - GPU recovery (2026-09-25): after an OOM and NCCL timeout, GPU 0 remained at 100% utilization with no compute processes and only 2 MiB allocated. A tiny CUDA kernel followed by synchronization and explicit context destruction restored 0% utilization, P8, and 19.5 W without stopping monitoring services or resetting hardware. Saved as `recover_gpu.py` (Python standard library plus NVIDIA driver; Ampere or newer).
