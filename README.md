@@ -6,7 +6,9 @@ fine-tuning, multi-GPU execution, evaluation, and live metrics. Its companion
 `dataset` CLI creates and manages the training and evaluation data those trainers need.
 Its [interactive web UI](#interactive-dataset-authoring) lets you compare responses
 from different endpoints, edit answers and reasoning, and save selected examples
-to a training dataset.
+to a training dataset. The [stateless CLI](#stateless-cli-authoring) exposes generation
+and saving for scripts and agents. Use the [model-specific authoring workflow](#model-specific-dataset-authoring)
+to improve a target model's examples for training while preserving its voice.
 
 **Start the web UI** from the repository root:
 
@@ -49,6 +51,7 @@ of TRL, so its preparation tools are useful outside a trlx training run.
 
 - [Start here](#start-here) and [installing updates](#installing-updates)
 - [Start the web UI and author datasets interactively](#interactive-dataset-authoring)
+- [Author through the CLI](#stateless-cli-authoring) and [create model-specific training examples](#model-specific-dataset-authoring)
 - [Prepare datasets](#dataset-cheat-sheet) and [generate data through endpoints](#tutorial-endpoint-generation-and-credentials)
 - [Choose a trainer](#training-cheat-sheet) and [configure runs](#tutorial-temporary-and-persistent-settings)
 - [Train on reasoning](#sft-reasoning-supervision), [use rewards](#tutorial-rewards), and [mix replay data](#tutorial-sft-replay)
@@ -126,7 +129,9 @@ to update them.
 `dataset` works independently of TRL. Files may be JSONL (one object per line), JSON
 (an array of objects), CSV, or Parquet. The output extension selects the file format.
 CSV cells are strings; use JSONL or Parquet for nested messages. Replacing an existing
-output or input requires `--force`. All writers support `--no-staging` for direct writes.
+output or input requires `--force`. File-transform commands support `--no-staging`
+for direct writes. Authoring saves append unique JSONL examples without `--force`
+and always stage publication; see [CLI authoring](#stateless-cli-authoring).
 
 ```sh
 # Convert the file format, or reshape prompt/completion rows into messages.
@@ -819,11 +824,12 @@ UI process for a destination and avoid concurrent writes from other applications
 
 Use `generate` and `save` independently of the web server. Each reads one JSON
 object from stdin and returns JSON on stdout; progress/errors go to stderr.
-Run these commands from the repository root:
+Keep those streams separate when capturing responses. Run these commands from the
+repository root with your project environment's Python executable:
 
 ```sh
 python -m dataset.cli generate --context-file context.json <<'JSON'
-{"endpoint":"http://localhost:8000/v1","model":"served-model","user":"Explain this.","system":"Be precise.","sampling":{"max_tokens":1024},"timeout":120,"retries":2}
+{"endpoint":"http://localhost:8000/v1","model":"served-model","user":"Explain this.","system":"","sampling":{},"timeout":3600,"retries":0}
 JSON
 ```
 
@@ -833,10 +839,12 @@ are sent unchanged between system and user. Relative paths use the working
 directory. Context is not accepted in stdin JSON.
 
 `endpoint`, `model`, `user`, `sampling`, `timeout`, and `retries` are required.
-`system` is optional. For authentication, add `"api_key":"ENVIRONMENT_VARIABLE"`;
-the CLI resolves it from the environment or `.env`. Omission means no authentication.
-`sampling: {}` sends no overrides. Supported controls and constraints are in
-`python -m dataset.cli generate --help`.
+`system` is optional and defaults to empty. For authentication, add
+`"api_key":"ENVIRONMENT_VARIABLE"`; the CLI resolves it from the environment or
+`.env`, with existing environment values taking precedence. Omission means no
+authentication. `sampling: {}` sends no overrides. The example allows one hour
+and disables automatic retries so long reasoning runs can finish. Supported
+controls and constraints are in `python -m dataset.cli generate --help`.
 
 Generation returns `{"answer":"...","reasoning":"..."}` without saving it.
 Repeat for other candidates, edit/select responses, then explicitly save:
@@ -847,12 +855,56 @@ python -m dataset.cli save <<'JSON'
 JSON
 ```
 
-Omit `reasoning` for answer-only examples; use empty assistant content for
-reasoning-only examples. Save accepts exactly user/assistant turns, without
-system or Context, and returns added/duplicate counts. Existing bytes are preserved
+Store reasoning as a separate top-level string, without manually added reasoning
+delimiters. Omit `reasoning` for answer-only examples; use empty assistant content
+for reasoning-only examples. Save accepts exactly one user turn followed by one
+assistant turn, without system or Context, and returns `{"added":N,"duplicates":N}`.
+Exact duplicates include reasoning presence and text. Existing bytes are preserved
 through staged publication; no `--force` is needed. The destination parent must
 exist. Run saves to the same destination sequentially, including browser saves.
 The CLI retains no workspace or pending collection.
+
+## Model-specific dataset authoring
+
+To use an agent to create training examples for a particular model, explicitly
+invoke [DATASET-AUTHORING.md](DATASET-AUTHORING.md). Supply the target model and
+endpoint, training tokenizer/template and reasoning-field mapping, full-sequence
+token limit, dataset destination, and generation settings. Established session
+choices can be reused. This workflow applies across model families.
+
+The process starts with the target model's own output:
+
+1. Generate a response to a focused, challenging prompt. Let the raw reasoning
+   finish; it need not fit the final training limit.
+2. Edit that text directly: fix grammar and formatting while preserving its voice,
+   remove circular detours and repetition, and make localized correctness fixes
+   in both reasoning and answer. Preserve sound explanations and code.
+3. Verify substantive claims and code with appropriate checks. Count the complete
+   rendered training example, including the saved prompt, reasoning, answer, and
+   template tokens, using the training tokenizer and template.
+4. When available, measure the edited continuation's log-probability under the
+   target model. Prefer more likely wording when quality is preserved; correctness
+   and better problem-solving remain the primary objective. Likelihood supports
+   model compatibility but does not by itself establish training effectiveness.
+5. Review and save the example under the agreed approval scope, then verify saved
+   fields, row counts, and preservation of existing examples.
+
+Token counting and likelihood scoring require suitable endpoint APIs or authorized
+local model resources; `generate` and `save` do not perform these checks. See
+[SFT reasoning supervision](#sft-reasoning-supervision) for training on the saved
+reasoning field.
+
+For an autonomous batch, agree on a topic and number of new rows, then approve the
+agent's scenario list. That approval authorizes prompt formulation, generation,
+editing, validation, and saving to the agreed destination without per-row approval.
+The agent saves each verified row as it finishes and continues until all approved
+scenarios are saved or an unexpected problem requires your attention. The final
+report includes completed scenarios, validation results, and new and total row counts.
+
+Independent generations can run concurrently within the endpoint's capacity: the
+agent or calling script launches separate `generate` requests. Concurrency is
+orchestrated by the caller, not a batch option on `generate`. Keep saves to the same
+destination sequential, including saves from other processes or the browser.
 
 ## Tutorial: endpoint generation and credentials
 
