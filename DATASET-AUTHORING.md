@@ -4,12 +4,15 @@ Follow this workflow only when explicitly invoked. Repository approval and file-
 
 ## Session inputs
 
-Reuse established session choices; ask for missing inputs before dependent work:
+Reuse established session choices. Generation requires:
 
 - Target model/checkpoint, endpoint, and credentials if needed.
-- Training tokenizer, chat template, reasoning-field mapping, and full-sequence token limit.
 - Dataset destination and the scope of permission to save examples.
 - Approved prompt or scenario list, plus system prompt, Context, and sampling settings.
+
+Before asking for validation inputs, inspect the applicable repository training configuration and rendering code, then the endpoint's available model metadata and tokenizer/template APIs. Use authorized local model resources when needed; repository access rules still apply. Establish the training tokenizer, chat template, reasoning-field mapping, and full-sequence token limit from evidence. Training loss settings are not prerequisites for generating, validating, or saving examples. Do not assume an unrelated run configuration applies or that a served model alias proves matching training and endpoint rendering.
+
+Ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving; optional likelihood scoring may be unavailable if reported explicitly.
 
 Prefer focused, challenging problems whose corrected solutions fit the training limit. Follow the user's topic choices. Ensure the saved user prompt contains the facts needed to understand the response.
 
@@ -67,7 +70,7 @@ Edit in place rather than compose a replacement and then try to make it resemble
 - When available, score the edited continuation under the target model, conditioned on the original saved prompt and the preceding continuation tokens. Exclude editing instructions from scoring. Record mean log-probability for reasoning and response separately and together, with the scoring mask stated.
 - Use likelihood to support model-compatible editing. Prefer higher-likelihood wording when quality is preserved. Do not invent acceptance thresholds, restore mistakes, or add filler to improve scores. Edited examples are not strictly on-policy samples; likelihood alone does not establish training effectiveness.
 
-The authoring CLI does not tokenize or score likelihood. Inspect the target endpoint's supported API or use authorized local model resources. Use the actual reasoning-field mapping and training loss mask. Report unavailable or unverified measurements explicitly.
+The authoring CLI does not tokenize or score likelihood. Inspect the target endpoint's supported API or use authorized local model resources. Use the actual reasoning-field mapping. For likelihood measurements, state which tokens are scored, including treatment of template and reasoning boundaries; choosing the eventual training loss settings is unnecessary. Report unavailable or unverified measurements explicitly.
 
 ## Review and save
 
