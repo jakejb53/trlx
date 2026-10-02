@@ -241,6 +241,48 @@ def _cmd_stats(args):
     return 0
 
 
+# Read one stateless request; the browser alone accepts inline Context and literal credentials.
+def _cmd_generate(args):
+    import json
+    from dataset import authoring
+
+    value = authoring.read_json(sys.stdin, "stdin")
+    if isinstance(value, dict) and "context" in value:
+        raise DatasetError("stdin: context is supplied only through optional --context-file PATH")
+    body = authoring.validate(authoring.Generation, value)
+    if args.context_file is not None:
+        try:
+            with open(args.context_file, encoding="utf-8") as stream:
+                context = authoring.read_json(stream, args.context_file)
+        except (OSError, ValueError) as error:
+            raise DatasetError(f"{args.context_file}: cannot open Context file: {error}") from None
+        if not isinstance(context, list) or any(not isinstance(message, dict) for message in context):
+            raise DatasetError(f"{args.context_file}: Context must be a JSON array of message objects")
+        body.context = context
+    # Resolve only after type validation; neither request values nor secrets enter diagnostics.
+    if body.api_key:
+        if "=" in body.api_key or "\0" in body.api_key:
+            raise DatasetError("api_key must name an environment variable, not contain a credential")
+        credential = os.environ.get(body.api_key)
+        if not credential:
+            raise DatasetError("api_key environment variable is unset or empty; set it or omit api_key")
+        body.api_key = credential
+    result = authoring.generate(body, progress=args.progress)
+    print(json.dumps(result, ensure_ascii=True, allow_nan=False), flush=True)
+    return 0
+
+
+# Explicit saves append selected rows; no CLI-owned pending collection or output replacement exists.
+def _cmd_save(args):
+    import json
+    from dataset import authoring
+
+    body = authoring.validate(authoring.Save, authoring.read_json(sys.stdin, "stdin"))
+    result = authoring.save(body, progress=args.progress)
+    print(json.dumps(result, allow_nan=False), flush=True)
+    return 0
+
+
 # Import web dependencies only when starting the UI, never for other commands or help.
 def _cmd_ui(args):
     from dataset.ui import run
@@ -554,6 +596,52 @@ def build_parser():
     p.add_argument("--port", required=True, type=int, help="listen port, integer 1..65535; no default")
     p.add_argument("--force", action="store_true", help="accepted for consistency; UI saves preserve existing rows")
     p.set_defaults(func=_cmd_ui)
+
+    p = sub.add_parser("generate", help="generate one editable answer and reasoning from stdin JSON",
+        description=(
+            "Read one JSON object from stdin; return {answer, reasoning} JSON on stdout.\n"
+            "Required: endpoint (HTTP(S) API base), model and user (nonblank strings),\n"
+            "sampling (object), timeout (finite positive seconds), retries (integer >= 0).\n"
+            "Optional: system (string, default empty), api_key (environment-variable name;\n"
+            "omitted or empty means no authentication). Loads secrets from .env.\n"
+            "sampling accepts temperature >= 0, top_p in [0,1], integer top_k >= -1,\n"
+            "positive integer max_tokens, finite presence_penalty, repetition_penalty > 0.\n"
+            "Omitted/null controls are not sent; {} sends no sampling overrides.\n"
+            "Context comes only from optional --context-file, never stdin. Messages are\n"
+            "system, Context entries unchanged, then user. Generate writes no dataset.\n"
+            "Progress/errors go to stderr; failures exit nonzero. No web server is needed."
+        ),
+        epilog=('Examples:\n  dataset generate --context-file context.json\n'
+                '  stdin: {"endpoint":"http://localhost:8000/v1","model":"served-model",\n'
+                '          "user":"Explain this.","sampling":{},"timeout":120,"retries":2}\n'
+                '  dataset generate --force\n  Supply the same stdin JSON without Context.'),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--context-file", metavar="PATH",
+                   help="optional UTF-8 JSON array of message objects; relative to working directory; default: no Context")
+    p.add_argument("--force", action="store_true", help="accepted for consistency; generation writes no dataset")
+    p.set_defaults(func=_cmd_generate)
+
+    p = sub.add_parser("save", help="append selected examples from stdin JSON to a dataset",
+        description=(
+            "Read {path, examples} from stdin; return {added, duplicates} JSON on stdout.\n"
+            "path: nonempty .jsonl filename, relative to working directory or absolute;\n"
+            "parent must exist; no directories or final symlinks. examples: nonempty array.\n"
+            "Each example has messages: exactly one user then one assistant, with string\n"
+            "content, plus optional string reasoning. No system or Context is saved.\n"
+            "Answer only: omit reasoning. Reasoning only: use empty assistant content.\n"
+            "Both: include assistant content and reasoning. Unknown fields are errors.\n"
+            "Existing bytes are preserved; exact duplicates, including reasoning presence\n"
+            "and text, are skipped. Publication is staged. No --force is required to append.\n"
+            "Serialize saves to one destination, including browser and other writers.\n"
+            "Progress/errors go to stderr; failures exit nonzero. No web server is needed."
+        ),
+        epilog=('Examples:\n  dataset save --force\n'
+                '  stdin: {"path":"examples.jsonl","examples":[{"messages":[\n'
+                '          {"role":"user","content":"Question"},\n'
+                '          {"role":"assistant","content":"Edited answer"}]}]}'),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--force", action="store_true", help="accepted for consistency; saves preserve existing rows")
+    p.set_defaults(func=_cmd_save)
     return parser
 
 

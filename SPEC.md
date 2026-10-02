@@ -397,7 +397,8 @@ Reports use staged publication by default, with `--no-staging` selecting direct 
 
 Dataset transforms read inputs and write output files; `split` writes two and `stats` only reports.
 Formats: JSONL, JSON array, CSV, Parquet, by extension; a path without a recognised extension is an error.
-Replacing an existing output or input requires `--force`; writers support `--no-staging` (§1.1).
+Replacing an existing output or input requires `--force`; transform writers support `--no-staging` (§1.1).
+Authoring saves append unique examples with mandatory staging, without requiring `--force`.
 
 | Subcommand | Does |
 |---|---|
@@ -414,6 +415,12 @@ Replacing an existing output or input requires `--force`; writers support `--no-
 | `chat` | Text file to `messages` via endpoint. Pass 1: chunk plus instruction yields N questions. Pass 2: each question plus its chunk yields the answer. Each pass has its own endpoint, model, and prompt-file flags. Unparseable replies reported and skipped. Rows carry the answer's reasoning in a `reasoning` column, from the endpoint's reasoning field, `""` when it returns none. The endpoint must return reasoning in that field; a reply with reasoning inline in the content is fatal unless `--strip-reasoning-tags` removes it. |
 | `stats` | Token length distribution per column. With `--model`, per-token log-prob of response columns. |
 | `eval-build` | One factual prose summary per input `text` row via an OpenAI-compatible endpoint; writes ordered `text` rows for ordinary CPT evaluation. |
+| `generate` | Stateless stdin JSON request to one endpoint; returns answer/reasoning JSON. Optional `--context-file PATH` loads a UTF-8 JSON messages array. |
+| `save` | Stateless stdin JSON containing `path` and selected `examples`; appends unique authoring rows to JSONL and returns added/duplicate counts. |
+
+`generate` and `save` execute shared authoring operations directly, without a web server
+or workspace. Their input contracts and save semantics are defined in `SPEC-webui.md`.
+Results go to stdout; progress and errors go to stderr. Failures exit nonzero.
 
 `chat --exclude-reasoning` omits the separate `reasoning` column. Its default is false.
 It is independent of `--strip-reasoning-tags` and does not disable endpoint reasoning.

@@ -212,16 +212,17 @@ class DatasetOutputs(unittest.TestCase):
     # All documented command examples accept the common authorization flag.
     def test_force_and_no_staging_parser_contract(self):
         parser = cli.build_parser()
+        staged_transforms = set(_commands(parser)) - {"stats", "ui", "generate", "save"}
         for name, command in _commands(parser).items():
             example = next(line for line in command.epilog.replace("\\\n", " ").splitlines()
                            if line.strip().startswith("dataset "))
             argv = shlex.split(example)[1:] + ["--force"]
-            if name not in ("stats", "ui"):
+            if name in staged_transforms:
                 argv.append("--no-staging")
             with self.subTest(command=name):
                 args = parser.parse_args(argv)
                 self.assertTrue(args.force)
-                self.assertEqual(getattr(args, "no_staging", False), name not in ("stats", "ui"))
+                self.assertEqual(getattr(args, "no_staging", False), name in staged_transforms)
 
     # Invalid UTF-8 plain text becomes a concise path-specific command failure.
     def test_cpt_invalid_utf8(self):
@@ -270,8 +271,8 @@ class DatasetOutputs(unittest.TestCase):
                             "--timeout", "1", "--retries", "0"], "source row summaries from model"),
             "stats": ([self.source], "counting tokens in text"),
         }
-        # The persistent UI owns progress per API request, not per CLI lifetime.
-        self.assertEqual(set(cases), set(_commands(cli.build_parser())) - {"ui"})
+        # UI progress is per request; stdin authoring progress is covered in test_authoring_cli.
+        self.assertEqual(set(cases), set(_commands(cli.build_parser())) - {"ui", "generate", "save"})
         original_open = builtins.open
         for name, (arguments, processing) in cases.items():
             with self.subTest(command=name):

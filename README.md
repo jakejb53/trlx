@@ -815,6 +815,45 @@ through staged publication. Exact duplicates include reasoning presence and text
 Successful saves clear submitted examples; failures retain them for retry. Use one
 UI process for a destination and avoid concurrent writes from other applications.
 
+### Stateless CLI authoring
+
+Use `generate` and `save` independently of the web server. Each reads one JSON
+object from stdin and returns JSON on stdout; progress/errors go to stderr.
+Run these commands from the repository root:
+
+```sh
+python -m dataset.cli generate --context-file context.json <<'JSON'
+{"endpoint":"http://localhost:8000/v1","model":"served-model","user":"Explain this.","system":"Be precise.","sampling":{"max_tokens":1024},"timeout":120,"retries":2}
+JSON
+```
+
+Replace endpoint/model with your served model. `--context-file` is optional;
+when supplied it must name a UTF-8 JSON array of message objects. Its entries
+are sent unchanged between system and user. Relative paths use the working
+directory. Context is not accepted in stdin JSON.
+
+`endpoint`, `model`, `user`, `sampling`, `timeout`, and `retries` are required.
+`system` is optional. For authentication, add `"api_key":"ENVIRONMENT_VARIABLE"`;
+the CLI resolves it from the environment or `.env`. Omission means no authentication.
+`sampling: {}` sends no overrides. Supported controls and constraints are in
+`python -m dataset.cli generate --help`.
+
+Generation returns `{"answer":"...","reasoning":"..."}` without saving it.
+Repeat for other candidates, edit/select responses, then explicitly save:
+
+```sh
+python -m dataset.cli save <<'JSON'
+{"path":"examples.jsonl","examples":[{"messages":[{"role":"user","content":"Explain this."},{"role":"assistant","content":"Edited answer"}],"reasoning":"Edited reasoning"}]}
+JSON
+```
+
+Omit `reasoning` for answer-only examples; use empty assistant content for
+reasoning-only examples. Save accepts exactly user/assistant turns, without
+system or Context, and returns added/duplicate counts. Existing bytes are preserved
+through staged publication; no `--force` is needed. The destination parent must
+exist. Run saves to the same destination sequentially, including browser saves.
+The CLI retains no workspace or pending collection.
+
 ## Tutorial: endpoint generation and credentials
 
 `ENDPOINT` is an OpenAI-compatible API base URL, including `/v1` when required;

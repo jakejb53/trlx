@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, SFT reasoning inclusion, and interactive dataset authoring UI complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below). Web UI browser/live-endpoint validation and two additional stale test assertions are recorded in its section below.
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, SFT reasoning inclusion, interactive dataset authoring UI, and stateless CLI authoring complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below). Web UI browser/live-endpoint validation and two additional stale test assertions are recorded in its section below. CLI live-endpoint validation and an existing import-allowlist failure are recorded in the stateless CLI authoring section.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session start procedure
@@ -749,6 +749,24 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   No compatibility conversion: existing workspaces require deleting the site's
   `trlx.dataset.workspace.v1` localStorage entry and reloading, discarding browser-held
   workspace data. Real-browser rendering and live endpoint generation remain unverified.
+
+### Stateless CLI authoring (complete, 2026-10-01)
+
+- `dataset generate [--context-file PATH]` reads one request from stdin JSON and
+  returns answer/reasoning JSON. Optional Context is a UTF-8 JSON messages array;
+  CLI credentials name environment variables. `dataset save` reads a destination
+  and selected examples from stdin JSON and returns added/duplicate counts.
+  Both execute directly without a web server or workspace; saves retain the UI's
+  staged append rules and must be sequential across processes for one destination.
+- Added `dataset/authoring.py` and `tests/test_authoring_cli.py`; updated
+  `dataset/ui.py`, `dataset/cli.py`, `tests/test_dataset_cli.py`, `README.md`,
+  `SPEC.md`, and `SPEC-webui.md`. Browser and CLI share validation and operations.
+- Validation: 30 CLI tests and 18 existing UI tests passed. UI tests required
+  execution outside the sandbox after TestClient stalled inside it. Independent
+  review's Context numeric-overflow finding was fixed, regression-tested, and
+  re-reviewed with no remaining findings. Live endpoint generation remains unverified.
+- The unrelated `tests.test_imports.ImportRule.test_trlx_imports_only_allowed_dataset_modules`
+  still fails because its allowlist omits the existing `dataset.failures` import.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

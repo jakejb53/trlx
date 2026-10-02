@@ -99,3 +99,28 @@ Do not normalize text when comparing examples.
   Unrelated processes must not concurrently write the destination.
 - Browser storage also retains edited responses and the destination path. Storage
   errors are visible and never trigger a silent reset of saved browser state.
+
+## Stateless CLI authoring
+
+- `dataset generate [--context-file PATH]` reads one JSON object from stdin.
+  Required fields: `endpoint`, `model`, `user`, `sampling`, `timeout`, `retries`.
+  `model` and `user` are nonblank strings; `timeout` is finite positive seconds;
+  `retries` is an integer >= 0. Optional `system` and `api_key` default to empty.
+  `api_key` names an environment variable loaded by the existing CLI credential path;
+  omitted or empty means no authentication. A named but unset/empty variable is an error.
+- `sampling` accepts the UI's six controls and constraints; `{}` or omitted/null
+  members send no overrides. Unknown request or sampling fields are errors.
+- Context is accepted only through optional `--context-file`: UTF-8 JSON containing
+  an array of objects, preserved unchanged between system and user messages.
+  Relative paths use the CLI working directory. Omission means no Context;
+  invalid/unreadable files fail before generation. Stdin `context` is rejected.
+- Generation returns `{"answer": "...", "reasoning": "..."}`. Each invocation generates
+  one response; callers retain, compare, edit, and select responses themselves.
+- `dataset save` reads `{"path": "examples.jsonl", "examples": [...]}` from stdin.
+  `examples` is nonempty and follows the saved row contract above. Unknown fields
+  are rejected. Save returns `{"added": N, "duplicates": N}` using the existing
+  staged append and duplicate rules. Paths refer to the CLI filesystem and working
+  directory. Saves to one destination must be sequential across CLI, UI, and other writers.
+- Both commands execute shared Python operations directly with no server or persistent
+  workspace. Results are JSON on stdout; progress/errors use stderr. Failures exit nonzero.
+  `--force` is accepted for consistency but unnecessary; save always stages publication.
