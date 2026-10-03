@@ -4,7 +4,9 @@ runs/
 trlx.egg-info/
 IN-PROG.md
 ONBOARD.md
+ONBOARD-dataset.md
 run.toml
 build/
 prompts/
 data/
+dataset-authoring.toml
