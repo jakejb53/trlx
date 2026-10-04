@@ -13,6 +13,27 @@ When saved values are not accepted or the file is absent, reuse established sess
 - Target model/checkpoint, endpoint, and credentials if needed.
 - Dataset destination and the scope of permission to save examples.
 - Approved prompt or scenario list, plus system prompt, Context, and sampling settings.
+- Generation method: standard or Context-assisted.
+
+To list available Contexts, enumerate every `contexts/*.json` file in filename
+order. For each JSON file, read the same-stem `.txt` file and display the
+filename with its complete description. List every Context, not only ones that
+appear relevant to the current topic. If `contexts/` contains no JSON files,
+state that no saved Contexts are available. If a matching description is
+missing or unreadable, report that defect instead of inventing a description;
+repair the inventory before presenting it as complete. Use this procedure both
+when the user requests the available Contexts and during onboarding.
+
+After generation settings are resolved and before proposing scenarios, list all
+available Contexts with their descriptions using that procedure, then explicitly
+ask: **"Use Context-assisted generation for this batch?"** State that yes builds
+source-backed conversational Context, performs a mandatory rendering/token gate,
+and pauses for review before generation; no uses the standard direct-generation
+workflow. Require this choice in every authoring session. Do not infer it from
+the topic or from whether `context_file` is populated in saved settings. A no
+answer omits Context for this batch; a yes answer uses an approved existing
+Context or triggers a proposal for the required Context artifact under the
+repository's approval rules.
 
 For the configured model, reuse `[probes]`: its model identity, tokenization URLs, reasoning field and boundaries, template-inserted system text, and scoring request settings. `training_uses_endpoint_tokenizer_and_template = true` records the user's confirmation that endpoint rendering is the training reference. Do not repeat capability or metadata probes each session. Per-example correctness checks, token counting, and likelihood measurements remain required as described below.
 
@@ -20,9 +41,9 @@ For token counting, map the saved reasoning into the final assistant's recorded 
 
 If the user specifies a different model, establish its validation metadata after onboarding: inspect the applicable repository training configuration and rendering code, then the endpoint's available model metadata and tokenizer/template APIs. Use authorized local model resources when needed; repository access rules still apply. Establish the training tokenizer, chat template, and reasoning-field mapping from evidence; use the user-supplied full-sequence token limit. Training loss settings are not prerequisites for generating, validating, or saving examples. Do not assume an unrelated run configuration applies or that a served model alias proves matching training and endpoint rendering.
 
-Ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving; optional likelihood scoring may be unavailable if reported explicitly.
+Apart from the required generation-method question, ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving; optional likelihood scoring may be unavailable if reported explicitly.
 
-Prefer focused, challenging problems whose corrected solutions fit the training limit. Follow the user's topic choices. Ensure the saved user prompt contains the facts needed to understand the response.
+Prefer focused, challenging problems. Follow the user's topic choices. Ensure the saved user prompt contains the facts needed to understand the response.
 
 ## Batch workflow
 
@@ -52,6 +73,10 @@ The durable Context is the exact UTF-8 JSON messages array accepted by
 `dataset generate --context-file`. It has no wrapper, system prompt, final user
 prompt, export step, sidecar, profile, recipe, or knowledge-base schema. One
 Context can be reused with many external scenario prompts on the same topic.
+Every saved `contexts/NAME.json` must have a matching `contexts/NAME.txt`
+containing a two- or three-sentence free-form description of what the Context
+teaches the model and which source material it includes. Keep that description
+current when the Context's instructional scope or sources change.
 
 Build and inspect it with the Context builder documented in
 `SPEC-context-packages.md`:
@@ -223,8 +248,7 @@ In particular:
 2. Keep sound reasoning verbatim when it needs no correction.
 3. Identify the exact defect before every answer change.
 4. Remove leading assistant-answer whitespace.
-5. Keep the answer within its prompt word limit and the complete saved row
-   within the training token limit.
+5. Keep the complete saved row within the training token limit.
 6. Verify source-dependent claims and execute meaningful state, race, code, or
    schema checks where applicable.
 7. Score raw and corrected reasoning and answers separately and together under
