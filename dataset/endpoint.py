@@ -13,11 +13,14 @@ from contextlib import nullcontext
 import http.client
 import json
 import math
+import os
+import pathlib
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from dataset.io import DatasetError
 from dataset.progress import Progress, stage
@@ -30,9 +33,26 @@ from dataset import failures
 Reply = collections.namedtuple("Reply", "content reasoning")
 
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
+RESPONSE_DIR = pathlib.Path("endpoint-responses")
 # Deliberate constant, not a flag: an accepted exception to the no-runtime-
 # defaults principle, recorded in PLAN.md. Attempt k waits base * 2**(k-1).
 _BACKOFF_BASE_SECONDS = 1.0
+
+
+# Persist every received body exactly before decoding, validation, retry, or return.
+def _persist_response(data):
+    if not isinstance(data, bytes):
+        raise DatasetError("endpoint response body must be bytes before persistence")
+    try:
+        RESPONSE_DIR.mkdir(exist_ok=True)
+        path = RESPONSE_DIR / f"{uuid.uuid4().hex}.response"
+        with path.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return path
+    except OSError as error:
+        raise DatasetError(f"cannot persist endpoint response in {RESPONSE_DIR}: {error}") from error
 
 
 # Batch-local request clocks never imply token generation or provider-side progress.
@@ -205,22 +225,26 @@ class Endpoint:
             try:
                 req = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    response_data = resp.read()
+                    response_path = _persist_response(response_data)
+                    if progress is not None:
+                        progress.note(f"{request}: response saved to {response_path}")
                     # Retry only response decoding/schema failures here. Request errors and
                     # explicit generation limits below must not become transient failures.
                     try:
-                        raw = json.loads(resp.read().decode("utf-8"))
+                        raw = json.loads(response_data.decode("utf-8"))
                         reply = self._extract(raw)
                     except json.JSONDecodeError as error:
                         last_error = error
-                        last = "reply is not JSON; check the endpoint's chat-completions response"
+                        last = f"reply is not JSON; response saved to {response_path}"
                         continue
                     except UnicodeDecodeError as error:
                         last_error = error
-                        last = "reply has invalid UTF-8 encoding; check the endpoint response"
+                        last = f"reply has invalid UTF-8 encoding; response saved to {response_path}"
                         continue
                     except DatasetError as error:
                         last_error = error
-                        last = self._diagnostic(error)
+                        last = f"{self._diagnostic(error)}; response saved to {response_path}"
                         continue
                     if require_stop:
                         reason = raw["choices"][0].get("finish_reason")
@@ -229,21 +253,26 @@ class Endpoint:
                             remedy = ("increase --max-tokens" if reason == "length" else
                                       "check the endpoint's completion metadata and response")
                             raise DatasetError(
-                                f"{self.display_url}: expected finish_reason='stop', got {detail}; {remedy}"
+                                f"{self.display_url}: expected finish_reason='stop', got {detail}; {remedy}; "
+                                f"response saved to {response_path}"
                             )
                     return reply
             except urllib.error.HTTPError as e:
                 last_error = e
-                last = f"HTTP {e.code}"
+                # HTTPError is also the response object; retain its complete body on every attempt.
+                try:
+                    response_data = e.read()
+                except (OSError, http.client.HTTPException) as read_error:
+                    raise DatasetError(
+                        f"{self.display_url}: HTTP {e.code}; cannot read error response: "
+                        f"{self._diagnostic(read_error)}; check the endpoint response and connection"
+                    ) from read_error
+                response_path = _persist_response(response_data)
+                if progress is not None:
+                    progress.note(f"{request}: response saved to {response_path}")
+                last = f"HTTP {e.code}; response saved to {response_path}"
                 if e.code not in _RETRY_STATUSES:
-                    # Reading an error body may itself fail; the HTTP status stays final.
-                    try:
-                        detail = self._diagnostic(e.read().decode("utf-8", "replace"))[:500]
-                    except (OSError, http.client.HTTPException) as read_error:
-                        raise DatasetError(
-                            f"{self.display_url}: {last}; cannot read error response: "
-                            f"{self._diagnostic(read_error)}; check the endpoint response and connection"
-                        ) from read_error
+                    detail = self._diagnostic(response_data.decode("utf-8", "replace"))[:500]
                     raise DatasetError(f"{self.display_url}: {last}: {detail}")
             except urllib.error.URLError as e:
                 last_error = e

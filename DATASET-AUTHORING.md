@@ -34,6 +34,216 @@ Prefer focused, challenging problems whose corrected solutions fit the training 
 6. Continue until every approved scenario has a verified saved row, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
 7. Report completed scenarios, destination, new and total row counts, and validation results. If blocked, identify the problem and completed progress.
 
+## Context-assisted generation (alternative)
+
+Use this alternative when the target model needs researched facts, platform
+semantics, failure cases, or design invariants that are awkward to place in the
+saved user prompt. It is also appropriate when an ordinary generation would
+require extensive factual rewriting. The objective is a strong untouched target-
+model response that needs only the minimum editing permitted below.
+
+This option changes generation input, not the saved row contract. The Context is
+excluded from the training example. The final saved prompt must still be
+self-contained enough to identify the problem and requested result.
+
+### Context artifact
+
+The durable Context is the exact UTF-8 JSON messages array accepted by
+`dataset generate --context-file`. It has no wrapper, system prompt, final user
+prompt, export step, sidecar, profile, recipe, or knowledge-base schema. One
+Context can be reused with many external scenario prompts on the same topic.
+
+Build and inspect it with the Context builder documented in
+`SPEC-context-packages.md`:
+
+```sh
+python -m dataset.cli context create contexts/TOPIC.json
+python -m dataset.cli context add contexts/TOPIC.json --role user --text "RESEARCH QUESTION"
+python -m dataset.cli context add contexts/TOPIC.json --role assistant --content-file ANALYSIS.txt
+python -m dataset.cli context tool contexts/TOPIC.json \
+  --name web_search --arg 'query=QUERY' --content-file SEARCH-RESULT.txt
+python -m dataset.cli context tool contexts/TOPIC.json \
+  --name read_file --arg 'path=DOCUMENT' --content-file DOCUMENT
+python -m dataset.cli context outline contexts/TOPIC.json
+python -m dataset.cli context validate contexts/TOPIC.json
+```
+
+Content ingestion and model-visible representation are independent. Inline
+text, stdin, or a file can become a user message, assistant message, or result
+of any fabricated tool name and arguments. The builder never performs the
+represented retrieval.
+
+### Source material
+
+Use authoritative material for standardized or externally defined behavior.
+Prefer selected relevant passages over entire noisy documents and over lossy
+LLM summaries. Strip navigation and unrelated boilerplate without rewriting the
+substantive passage. Keep source names and locations in the model-visible result
+when they help distinguish evidence from analysis.
+
+Use reviewed synthetic internal documents for application-specific contracts
+that no external source defines, such as state transitions, accounting
+invariants, concurrency rules, or required behavior from an unspecified
+provider. Present these as internal engineering material, not fabricated
+external authority.
+
+The agent does not need to load large sources into its own conversation. A local
+command process can retrieve and extract passages in memory, assert every
+expected section, and call `dataset.context_builder.add_tool_exchange` only
+after all assertions pass. Alternatively, produce a verified local result file
+and pass it with `--content-file`.
+
+Do not stream a fallible producer directly into a mutating builder command. A
+producer can fail after the builder sees EOF, causing an empty result to be
+committed even when shell `pipefail` reports failure. Verify extraction before
+mutation. If an insertion fails or contains the wrong data, remove the complete
+tool-call/result pair, validate the Context, and stop after the retry limit in
+the repository instructions.
+
+### Conversation design
+
+Construct a natural research conversation rather than an answer pasted into
+Context:
+
+1. A user turn asks a focused research question.
+2. The assistant makes a fabricated retrieval call.
+3. The tool result supplies selected source material or an internal document.
+4. The assistant analyzes implications and resolves conflicts.
+5. Later user turns introduce the next part of the problem.
+6. The conversation ends with a synthesis that makes the final scenario prompt
+   a natural next user turn.
+
+Supply facts, invariants, counterexamples, and failure cases. Do not include a
+polished answer to the final scenario. The target model must still perform the
+synthesis and express the response in its own voice.
+
+Use a blank system prompt by default. A reasoning model can see a system
+instruction and repeat or discuss it in its reasoning. Put style and behavior
+steering into the natural conversation unless the user explicitly approves a
+nonblank system prompt for the run.
+
+### Build and inspect
+
+The complete Context-building sequence is:
+
+1. Obtain approval for the Context path and create it with `context create`.
+2. Add focused conversational framing.
+3. Add exact selected external passages as fabricated retrieval results.
+4. Add reviewed internal design notes for scenario-specific knowledge.
+5. Add assistant analysis connecting evidence to constraints and failure cases.
+6. End with a natural transition into the approved final prompt.
+7. Run `context outline` without previews to review only roles, sizes, tool
+   names, call IDs, and ordering.
+8. Run `context validate`. Resolve every structural or tool-pairing error before
+   rendering.
+
+The outline and validation output should be sufficient for routine inspection;
+use `context show` only for a targeted message that needs review. Preserve the
+Context file after successful generation so it can support later scenarios.
+
+### Mandatory rendering and budget gate
+
+Rendering is a separate step from generation and must stop for user review.
+Read the Context file directly, append the exact final user prompt, and include
+the exact approved system message only when nonblank. Submit that messages
+array to the configured tokenizer with the generation boundary enabled.
+
+For the recorded remote tokenizer contract this ordinarily means:
+
+- `add_generation_prompt = true`
+- `continue_final_message = false`
+- `add_special_tokens = false`
+
+Report:
+
+- Context message count.
+- Whether a system message is included.
+- Rendered input tokens.
+- Reserved generation tokens.
+- Total required tokens.
+- Model context-window tokens.
+- Remaining headroom.
+- Whether the target template rendered all tool messages successfully.
+
+Require:
+
+```text
+rendered_input_tokens + reserved_generation_tokens <= model_context_tokens
+```
+
+Do not truncate Context or silently lower the generation reserve. Stop after
+reporting this gate. Generation begins only after the user reviews the result.
+
+### Generate with Context
+
+After the rendering gate is accepted, call the existing generator with the
+same Context, system text, final prompt, model, and output-token reserve:
+
+```sh
+python -m dataset.cli generate --context-file contexts/TOPIC.json <<'JSON'
+{"endpoint":"http://HOST:PORT/v1","model":"MODEL","user":"APPROVED PROMPT","system":"","sampling":{"max_tokens":4096},"timeout":1200,"retries":0}
+JSON
+```
+
+Do not make duplicate requests while one is active. Preserve the complete raw
+generation before editing.
+
+`dataset.endpoint.Endpoint` stores the exact body bytes of every received HTTP
+response under `endpoint-responses/` before decoding or validation. This
+includes successful, malformed, retryable, and final error responses. Do not
+delete or rewrite the response artifact. On generation failure, inspect the
+stored response before deciding whether another request is justified.
+
+### Review the untouched output
+
+Judge the target model's reasoning by correctness, coherence, grammar, and
+genuine drafting defects—not by a preferred prose style. A concise outline or
+requirements checklist can be the model's natural reasoning and is not a defect
+merely because it is not discursive. Preserve it when it is grammatical,
+decisive, consistent with the answer, and free of stale alternatives or
+unresolved hedging such as repeated “wait”, “but wait”, or “actually” reversals.
+
+Check the untouched answer against the final prompt, source material, internal
+contracts, and representative failure cases. A successful Context-assisted
+generation should retain the target model's voice and require local corrections,
+not reconstruction.
+
+If the reasoning is only prompt planning, do not reject it for that fact alone.
+If it contains actual grammar errors, contradictions, abandoned alternatives,
+or unresolved writing instructions, apply the ordinary minimum-edit rules. If
+no permitted local edit can produce a correct example, reject the generation;
+do not reconstruct reasoning from the answer.
+
+### Edit, score, validate, and save
+
+The standard editing, validation, and saving contracts below still apply.
+In particular:
+
+1. Preserve the raw prompt, reasoning, and answer separately.
+2. Keep sound reasoning verbatim when it needs no correction.
+3. Identify the exact defect before every answer change.
+4. Remove leading assistant-answer whitespace.
+5. Keep the answer within its prompt word limit and the complete saved row
+   within the training token limit.
+6. Verify source-dependent claims and execute meaningful state, race, code, or
+   schema checks where applicable.
+7. Score raw and corrected reasoning and answers separately and together under
+   the saved prompt. When reasoning is unchanged, the answer comparison already
+   holds preceding context fixed.
+8. If several necessary corrections are comparably small and correct, compare
+   their likelihood under identical reasoning and select the better-supported
+   wording.
+9. Investigate material likelihood decline; never restore a false claim to
+   improve score.
+10. Save only the final user prompt, assistant answer, and optional reasoning.
+    Exclude system and Context.
+11. Verify that the saved text exactly matches the scored candidate and that
+    previous dataset bytes remain unchanged.
+
+Report the Context path and raw response artifact with the ordinary generation,
+editing, likelihood, validation, and dataset results. Context-assisted origin
+does not by itself prove factual correctness or exempt any saved row from review.
+
 ## Generate
 
 Run from the repository root using the project environment's absolute Python executable. The CLI executes directly; no web UI server or workspace is required.

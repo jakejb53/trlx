@@ -10,3 +10,5 @@ build/
 prompts/
 data/
 dataset-authoring.toml
+contexts/
+endpoint-responses/

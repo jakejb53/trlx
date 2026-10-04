@@ -7,8 +7,12 @@ fine-tuning, multi-GPU execution, evaluation, and live metrics. Its companion
 Its [interactive web UI](#interactive-dataset-authoring) lets you compare responses
 from different endpoints, edit answers and reasoning, and save selected examples
 to a training dataset. The [stateless CLI](#stateless-cli-authoring) exposes generation
-and saving for scripts and agents. Use the [model-specific authoring workflow](#model-specific-dataset-authoring)
-to improve a target model's examples for training while preserving its voice.
+and saving for scripts and agents. Its [reusable Context builder](#reusable-context-builder)
+incrementally assembles source-backed conversation histories—including fabricated
+tool calls and supplied results—directly in the format used for generation. Use the
+[model-specific authoring workflow](#model-specific-dataset-authoring) to generate
+stronger target-model examples from those contexts, then make minimum corrections
+while preserving the model's voice.
 
 **Start the web UI** from the repository root:
 
@@ -32,7 +36,7 @@ and combines them with the tools needed before, during, and after training:
 | Need | What trlx provides |
 | --- | --- |
 | Choose a training objective | SFT, DPO, KTO, reward modeling, GRPO, RLOO, and distillation, with trainer settings and per-run overrides. |
-| Prepare suitable data | Format conversion, text chunking, endpoint-generated Q&A and evaluation summaries, preference pairs, filtering, splitting, mixing, sampling, repair, and statistics. |
+| Prepare suitable data | Format conversion, text chunking, reusable source-backed generation Contexts, endpoint-generated Q&A and evaluation summaries, preference pairs, filtering, splitting, mixing, sampling, repair, and statistics. |
 | Check a setup before committing to training | Full dataset inspection, a review of effective tuning settings, and preflight checks for model, adapter, dataset, and trainer compatibility. |
 | Use available GPUs | Hardware-aware initialization, automatic data-parallel or sharded launch, and explicit device/strategy overrides without a separate launcher configuration. |
 | See what training is doing | Live metric tables or a full-screen TUI, loss charts, measured progress, complete diagnostic logs, and saved metrics that can be viewed later. |

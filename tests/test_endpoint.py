@@ -3,6 +3,8 @@
 import io
 import http.client
 import json
+import pathlib
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -13,7 +15,18 @@ from dataset.io import DatasetError
 from dataset.progress import Progress
 
 
-class EndpointErrors(unittest.TestCase):
+class EndpointTest(unittest.TestCase):
+    # Persist mocked responses outside the repository while exercising the real writer.
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.responses = pathlib.Path(scratch.name)
+        response_patch = patch("dataset.endpoint.RESPONSE_DIR", self.responses)
+        response_patch.start()
+        self.addCleanup(response_patch.stop)
+
+
+class EndpointErrors(EndpointTest):
     # Create a local-looking endpoint; every test that issues a request mocks transport.
     def endpoint(self, **overrides):
         args = dict(url="http://localhost:8000/v1", model="model", api_key=None, timeout=1, retries=0)
@@ -57,6 +70,34 @@ class EndpointErrors(unittest.TestCase):
                 endpoint._extract({"choices": [{"message": message}]})
         reply = endpoint._extract({"choices": [{"message": {"content": "ok", "reasoning": None}}]})
         self.assertEqual((reply.content, reply.reasoning), ("ok", ""))
+
+    # Successful response bodies are retained byte-for-byte before reply parsing.
+    def test_successful_response_is_persisted_exactly(self):
+        data = b'{"choices":[{"message":{"content":"ok"}}],"spacing":  true}\n'
+        with patch("dataset.endpoint.urllib.request.urlopen", return_value=io.BytesIO(data)):
+            self.assertEqual(self.endpoint().complete([]), "ok")
+        artifacts = list(self.responses.iterdir())
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].read_bytes(), data)
+
+    # Every malformed attempt and the eventual success retain their original bytes.
+    def test_retry_responses_are_all_persisted(self):
+        invalid = b'{"choices":[]}'
+        valid = b'{"choices":[{"message":{"content":"ok"}}]}'
+        with patch("dataset.endpoint.urllib.request.urlopen", side_effect=[
+                io.BytesIO(invalid), io.BytesIO(valid)]), patch("dataset.endpoint.time.sleep"):
+            self.assertEqual(self.endpoint(retries=1).complete([]), "ok")
+        self.assertCountEqual([path.read_bytes() for path in self.responses.iterdir()], [invalid, valid])
+
+    # Persistence is mandatory: a received response cannot succeed if storage fails.
+    def test_response_persistence_failure_is_fatal(self):
+        blocked = self.responses / "not-a-directory"
+        blocked.write_text("occupied")
+        data = b'{"choices":[{"message":{"content":"ok"}}]}'
+        with patch("dataset.endpoint.RESPONSE_DIR", blocked), \
+                patch("dataset.endpoint.urllib.request.urlopen", return_value=io.BytesIO(data)):
+            with self.assertRaisesRegex(DatasetError, "cannot persist endpoint response"):
+                self.endpoint().complete([])
 
     # Malformed replies consume the same bounded retry budget as transport failures.
     def test_malformed_responses_retry_then_succeed(self):
@@ -151,6 +192,9 @@ class EndpointErrors(unittest.TestCase):
         self.assertEqual(request.full_url, endpoint.url)
         self.assertEqual(request.get_header("Authorization"), "Bearer " + key)
         self.assertEqual(call.call_count, 1)
+        artifacts = list(self.responses.iterdir())
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].read_bytes(), body)
 
     # URLError text also comes from an external boundary and can contain credentials.
     def test_connection_error_redacts_echoed_secret(self):
@@ -184,7 +228,7 @@ class EndpointErrors(unittest.TestCase):
                 self.assertEqual(call.call_count, 1)
 
 
-class EndpointProgress(unittest.TestCase):
+class EndpointProgress(EndpointTest):
     # Remote diagnostics can echo decoded credentials, percent escapes, or form-encoded spaces.
     def test_encoded_and_decoded_url_secrets_are_redacted_from_retries_and_final_error(self):
         secrets = ("pa%3Ass%2Fword", "pa:ss/word", "query+secret%2Fone", "query%20secret%2Fone", "query secret/one")
