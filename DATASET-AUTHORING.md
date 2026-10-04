@@ -147,6 +147,53 @@ instruction and repeat or discuss it in its reasoning. Put style and behavior
 steering into the natural conversation unless the user explicitly approves a
 nonblank system prompt for the run.
 
+### Context sufficiency
+
+A structurally valid, topically relevant, or concise Context is not necessarily
+sufficient. The Context must resolve the factual and design uncertainty that
+would otherwise make the target model rediscover requirements, invent missing
+capabilities, cycle through alternatives, or require reconstructive editing.
+
+Build depth in proportion to the scenario. Include, as applicable:
+
+- Exact authoritative passages for externally defined behavior.
+- A closed capability contract that distinguishes available, unavailable, and
+  unspecified APIs or guarantees.
+- Reviewed internal contracts for state meanings, invariants, ownership,
+  authorization, timing, ordering, accounting, and failure handling.
+- Concrete transaction or operation boundaries and the evidence each boundary
+  can and cannot establish.
+- Representative concurrency schedules, crash matrices, edge cases, and
+  counterexamples to superficially plausible but invalid designs.
+- Acceptance cases with observable postconditions.
+- Intermediate assistant analyses that reconcile the evidence and resolve
+  conflicts before the final synthesis.
+
+Do not reuse one Context merely because several scenarios share a broad topic.
+Reuse it only when its evidence and resolved contracts cover every assigned
+scenario. Split or extend it when scenarios depend on different APIs,
+invariants, platforms, or failure modes.
+
+Before rendering, perform a sufficiency review:
+
+1. Map every substantive final-prompt requirement to supplied evidence, a
+   reviewed internal contract, or a fact stated directly in that prompt.
+2. Identify every behavioral choice whose alternatives would change accepted,
+   rejected, produced, preserved, or failed outcomes. Resolve it through the
+   approved design or leave it explicitly for the final prompt to decide.
+3. Check that unavailable capabilities are explicit, so the model cannot fill
+   gaps with familiar but unsupported APIs.
+4. Include tests or counterexamples for the general failure classes most likely
+   to produce a plausible but incorrect answer.
+5. End with a synthesis that states the resolved model and makes the final
+   scenario a natural next question without drafting its answer.
+
+There is no fixed minimum or target Context size. Use as much selected,
+relevant material as the scenario needs, subject to the model-specific
+performance threshold and context-window gate agreed for the session. Passing
+the rendering budget proves only that the input fits; it does not prove that
+the Context is sufficient.
+
 ### Build and inspect
 
 The complete Context-building sequence is:
@@ -157,9 +204,11 @@ The complete Context-building sequence is:
 4. Add reviewed internal design notes for scenario-specific knowledge.
 5. Add assistant analysis connecting evidence to constraints and failure cases.
 6. End with a natural transition into the approved final prompt.
-7. Run `context outline` without previews to review only roles, sizes, tool
+7. Perform the Context-sufficiency review above. Extend or split the Context
+   until every identified gap is resolved.
+8. Run `context outline` without previews to review only roles, sizes, tool
    names, call IDs, and ordering.
-8. Run `context validate`. Resolve every structural or tool-pairing error before
+9. Run `context validate`. Resolve every structural or tool-pairing error before
    rendering.
 
 The outline and validation output should be sufficient for routine inspection;
@@ -238,6 +287,19 @@ If it contains actual grammar errors, contradictions, abandoned alternatives,
 or unresolved writing instructions, apply the ordinary minimum-edit rules. If
 no permitted local edit can produce a correct example, reject the generation;
 do not reconstruct reasoning from the answer.
+
+Treat the untouched output as evidence about Context sufficiency. Repeated
+rediscovery of supplied requirements, abandoned state models, invented APIs,
+multiple related invariant failures, or corrections that would reconstruct the
+reasoning or answer indicate an insufficient Context. Pause that scenario and
+improve the Context before generating again; do not compensate with extensive
+manual rewriting or repeated requests using the same inadequate input.
+
+Use rejected generations as negative evidence: record their general defect
+classes, invalid assumptions, counterexamples, and acceptance checks in the
+Context without pasting a polished replacement answer. After changing the
+Context, rerun the mandatory rendering gate and obtain review before a fresh
+generation.
 
 ### Edit, score, validate, and save
 

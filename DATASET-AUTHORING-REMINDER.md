@@ -23,6 +23,10 @@ PROCESS
    - The saved text must be exactly the text validated and scored.
    - Any substantial likelihood deterioration must be investigated. Do not save while an editing or compatibility concern remains unresolved.
 
+8. When using Context-assisted generation, treat reconstruction-level defects as a Context failure. If the untouched output repeatedly rediscovers requirements, cycles through abandoned designs, invents capabilities, or violates related invariants, stop the scenario and improve the Context. Add the defect classes, counterexamples, and acceptance checks, rerun the rendering gate, and generate afresh; do not compensate with extensive manual rewriting.
+
+9. When using Context-assisted generation, favor improving the Context until the target model produces a response whose core reasoning and design are correct and require only local repair. Use direct edits for minor correctness, grammar, formatting, repetition, and token-limit cleanup after that threshold is met.
+
 WHAT NOT TO DO
 
 - Do not write an ideal replacement answer and then recover fragments of the original.
@@ -36,5 +40,7 @@ WHAT NOT TO DO
 - Do not call edited examples “on-policy” merely because they originated from the target model or were scored by it.
 - Do not use passing correctness checks as permission for unauthorized edits.
 - Do not save questionable rows to finish the batch and explain the departures afterward.
+- When using Context-assisted generation, do not keep generating from or reconstruct outputs produced by a Context that failed the sufficiency review; improve the Context and rerun its rendering gate first.
+- When using Context-assisted generation, do not use direct editing to turn a fundamentally incorrect response into a different answer or complete rewrite; improve the Context and generate afresh.
 
 Batch approval removes per-row approval requirements; it does not relax this contract. Continue autonomously within it. If an unexpected problem prevents compliance, stop the affected work before saving and explain the specific conflict.
