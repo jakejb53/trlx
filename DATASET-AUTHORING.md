@@ -27,10 +27,11 @@ when the user requests the available Contexts and during onboarding.
 After generation settings are resolved and before proposing scenarios, list all
 available Contexts with their descriptions using that procedure, then explicitly
 ask: **"Use Context-assisted generation for this batch?"** State that yes builds
-source-backed conversational Context, performs a mandatory rendering/token gate,
-and pauses for review before generation; no uses the standard direct-generation
-workflow. Require this choice in every authoring session. Do not infer it from
-the topic or from whether `context_file` is populated in saved settings. A no
+source-backed conversational Context, prints a mandatory sufficiency challenge,
+and performs a mandatory rendering/token check before generation; no uses the
+standard direct-generation workflow. Neither check requires user approval under
+normal procedure. Require this choice in every authoring session. Do not infer it
+from the topic or from whether `context_file` is populated in saved settings. A no
 answer omits Context for this batch; a yes answer uses an approved existing
 Context or triggers a proposal for the required Context artifact under the
 repository's approval rules.
@@ -174,7 +175,7 @@ Reuse it only when its evidence and resolved contracts cover every assigned
 scenario. Split or extend it when scenarios depend on different APIs,
 invariants, platforms, or failure modes.
 
-Before rendering, perform a sufficiency review:
+Before declaring the Context ready, perform these coverage checks:
 
 1. Map every substantive final-prompt requirement to supplied evidence, a
    reviewed internal contract, or a fact stated directly in that prompt.
@@ -194,6 +195,36 @@ performance threshold and context-window gate agreed for the session. Passing
 the rendering budget proves only that the input fits; it does not prove that
 the Context is sufficient.
 
+#### Printed sufficiency challenge
+
+After the Context appears complete and before rendering, print this three-part
+challenge:
+
+1. **Case for sufficiency** — Give a concrete defense of why the Context contains
+   enough facts, resolved decisions, failure cases, and guidance for the target
+   model to answer correctly without reconstructive edits.
+2. **Case against sufficiency** — Give the strongest good-faith argument that the
+   Context remains inadequate. Identify plausible missing facts, unresolved
+   choices, unsupported assumptions, insufficient depth, or work the model must
+   still perform. A generic claim that more Context is always possible is not a
+   valid case against.
+3. **Adjudication** — Evaluate both arguments against the final prompt and actual
+   Context. Return `READY` only when the case against does not expose a material
+   risk that the model must research, invent, or redesign something essential.
+   Otherwise return `NOT READY`, improve or split the Context, and repeat the
+   complete challenge.
+
+A `READY` adjudication must answer the strongest objection with concrete Context
+evidence. Message count, token count, structural validation, and topical
+relevance are not evidence of sufficiency by themselves.
+
+Under normal procedure this challenge is not an approval request. Print it for
+the user, but do not ask the user to approve a `READY` result. Continue to the
+rendering check automatically. The user may explicitly override normal
+procedure and require review. Other repository approval rules remain unchanged.
+For a batch, one challenge may cover every named row that uses the same Context;
+a `NOT READY` result pauses only those rows.
+
 ### Build and inspect
 
 The complete Context-building sequence is:
@@ -204,8 +235,8 @@ The complete Context-building sequence is:
 4. Add reviewed internal design notes for scenario-specific knowledge.
 5. Add assistant analysis connecting evidence to constraints and failure cases.
 6. End with a natural transition into the approved final prompt.
-7. Perform the Context-sufficiency review above. Extend or split the Context
-   until every identified gap is resolved.
+7. Perform the coverage checks and print the sufficiency challenge above.
+   Extend or split the Context until the adjudication is `READY`.
 8. Run `context outline` without previews to review only roles, sizes, tool
    names, call IDs, and ordering.
 9. Run `context validate`. Resolve every structural or tool-pairing error before
@@ -215,9 +246,9 @@ The outline and validation output should be sufficient for routine inspection;
 use `context show` only for a targeted message that needs review. Preserve the
 Context file after successful generation so it can support later scenarios.
 
-### Mandatory rendering and budget gate
+### Mandatory rendering and budget check
 
-Rendering is a separate step from generation and must stop for user review.
+Rendering is a separate mandatory technical check before generation.
 Read the Context file directly, append the exact final user prompt, and include
 the exact approved system message only when nonblank. Submit that messages
 array to the configured tokenizer with the generation boundary enabled.
@@ -228,7 +259,7 @@ For the recorded remote tokenizer contract this ordinarily means:
 - `continue_final_message = false`
 - `add_special_tokens = false`
 
-Report:
+Print:
 
 - Context message count.
 - Whether a system message is included.
@@ -245,12 +276,15 @@ Require:
 rendered_input_tokens + reserved_generation_tokens <= model_context_tokens
 ```
 
-Do not truncate Context or silently lower the generation reserve. Stop after
-reporting this gate. Generation begins only after the user reviews the result.
+Do not truncate Context or silently lower the generation reserve. Under normal
+procedure user approval is not needed: if rendering succeeds and the budget
+fits, proceed directly to generation. If the check fails, correct the affected
+Context or prompt before generation. The user may explicitly override normal
+procedure and require review.
 
 ### Generate with Context
 
-After the rendering gate is accepted, call the existing generator with the
+After the rendering check passes, call the existing generator with the
 same Context, system text, final prompt, model, and output-token reserve:
 
 ```sh
@@ -282,6 +316,14 @@ contracts, and representative failure cases. A successful Context-assisted
 generation should retain the target model's voice and require local corrections,
 not reconstruction.
 
+Review the reasoning and answer as they will appear in the saved row, with the
+system prompt and Context omitted. References such as “the research,” “the
+internal contracts,” “the provided context,” prior tool calls, or earlier
+authoring turns are drafting residue when their referent exists only in excluded
+input. Remove or localize only the dangling reference; preserve the substantive
+reasoning and any source attribution that is self-contained or required by the
+saved prompt.
+
 If the reasoning is only prompt planning, do not reject it for that fact alone.
 If it contains actual grammar errors, contradictions, abandoned alternatives,
 or unresolved writing instructions, apply the ordinary minimum-edit rules. If
@@ -298,8 +340,9 @@ manual rewriting or repeated requests using the same inadequate input.
 Use rejected generations as negative evidence: record their general defect
 classes, invalid assumptions, counterexamples, and acceptance checks in the
 Context without pasting a polished replacement answer. After changing the
-Context, rerun the mandatory rendering gate and obtain review before a fresh
-generation.
+Context, repeat the printed sufficiency challenge and mandatory rendering check
+before a fresh generation. Under normal procedure, proceed without requesting
+user approval when both pass.
 
 ### Edit, score, validate, and save
 
@@ -323,7 +366,10 @@ In particular:
    improve score.
 10. Save only the final user prompt, assistant answer, and optional reasoning.
     Exclude system and Context.
-11. Verify that the saved text exactly matches the scored candidate and that
+11. Read that saved prompt, reasoning, and answer without the excluded inputs.
+    Remove or localize any authoring-process reference that no longer has a
+    self-contained referent.
+12. Verify that the saved text exactly matches the scored candidate and that
     previous dataset bytes remain unchanged.
 
 Report the Context path and raw response artifact with the ordinary generation,
@@ -370,6 +416,9 @@ An edit is permitted only to:
 - Satisfy an explicit prompt requirement, or supply something necessary to make a retained claim correct.
 - Repair a grammatical error, malformed formatting, or ambiguity that prevents a definite interpretation.
 - Remove instructions about composing the response, stale draft commentary, unresolved writing choices, repetition, abandoned deliberation, or duplicate answer drafts. Preserve genuine uncertainty about the problem.
+- Remove dangling references to excluded system text, Context, tool calls,
+  research steps, internal contracts, or prior authoring turns. Do not remove
+  source references that remain meaningful and self-contained in the saved row.
 - Fit the verified token limit without losing required content.
 
 A different valid design, greater robustness outside the stated assumptions, broader coverage, more formal terminology, or a formulation you prefer is not a defect. Preserve sound choices even when you would have chosen differently.
