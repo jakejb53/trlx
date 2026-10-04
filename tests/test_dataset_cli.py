@@ -212,8 +212,10 @@ class DatasetOutputs(unittest.TestCase):
     # All documented command examples accept the common authorization flag.
     def test_force_and_no_staging_parser_contract(self):
         parser = cli.build_parser()
-        staged_transforms = set(_commands(parser)) - {"stats", "ui", "generate", "save"}
+        staged_transforms = set(_commands(parser)) - {"stats", "ui", "context", "generate", "save"}
         for name, command in _commands(parser).items():
+            if name == "context":
+                continue
             example = next(line for line in command.epilog.replace("\\\n", " ").splitlines()
                            if line.strip().startswith("dataset "))
             argv = shlex.split(example)[1:] + ["--force"]
@@ -272,7 +274,7 @@ class DatasetOutputs(unittest.TestCase):
             "stats": ([self.source], "counting tokens in text"),
         }
         # UI progress is per request; stdin authoring progress is covered in test_authoring_cli.
-        self.assertEqual(set(cases), set(_commands(cli.build_parser())) - {"ui", "generate", "save"})
+        self.assertEqual(set(cases), set(_commands(cli.build_parser())) - {"ui", "context", "generate", "save"})
         original_open = builtins.open
         for name, (arguments, processing) in cases.items():
             with self.subTest(command=name):

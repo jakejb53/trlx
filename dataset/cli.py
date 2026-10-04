@@ -11,7 +11,7 @@ import argparse
 import os
 import sys
 
-from dataset import chat, convert, cpt, env, eval_build, fields, heal, pairs, rows, stats
+from dataset import chat, context_builder, convert, cpt, env, eval_build, fields, heal, pairs, rows, stats
 from dataset.endpoint import Endpoint
 from dataset.failures import capture, render
 from dataset.io import DatasetError, read_rows, validate_rows_output, validate_rows_outputs, write_many_rows, write_rows
@@ -239,6 +239,134 @@ def _cmd_stats(args):
     columns =args.columns.split(",") if args.columns else None
     stats.run(read_rows(args.input, progress=args.progress), columns, args.model, progress=args.progress)
     return 0
+
+
+# Write one machine result without leaking Context content through routine summaries.
+def _context_result(value):
+    import json
+
+    print(json.dumps(value, ensure_ascii=False, allow_nan=False), flush=True)
+    return 0
+
+
+# Read exact message/result content from an explicit value, file, or stdin.
+def _context_content(args):
+    if args.text is not None:
+        return args.text
+    source = args.content_file
+    if source is None or source == "-":
+        try:
+            return sys.stdin.read()
+        except UnicodeError:
+            raise DatasetError("stdin: Context content must be valid UTF-8 text") from None
+    try:
+        with open(source, encoding="utf-8") as stream:
+            return stream.read()
+    except (OSError, UnicodeError) as error:
+        raise DatasetError(f"{source}: cannot read Context content as UTF-8 text: {error}") from None
+
+
+# Create one new durable Context array without replacement semantics.
+def _cmd_context_create(args):
+    return _context_result(context_builder.create_context(args.path, progress=args.progress))
+
+
+# Insert either a simple role/content message or one exact raw provider message.
+def _cmd_context_add(args):
+    if args.message_file is not None:
+        if args.text is not None or args.content_file is not None:
+            raise DatasetError("--message-file cannot be combined with --text or --content-file")
+        message = context_builder.read_message_file(args.message_file)
+    else:
+        if not args.role:
+            raise DatasetError("--role: expected a nonempty role")
+        message = {"role": args.role, "content": _context_content(args)}
+    return _context_result(context_builder.add_message(
+        args.path, message, at=args.at, progress=args.progress))
+
+
+# Parse the convenient flat-string form without inventing types or nested syntax.
+def _context_arguments(args):
+    if args.arguments_file is not None:
+        return context_builder.read_arguments_file(args.arguments_file)
+    result = {}
+    for assignment in args.arg:
+        key, separator, value = assignment.partition("=")
+        if not separator or not key:
+            raise DatasetError(f"--arg expects nonempty KEY=VALUE, got {assignment!r}")
+        if key in result:
+            raise DatasetError(f"--arg repeats key {key!r}; supply each tool argument once")
+        result[key] = value
+    return result
+
+
+# Insert a fabricated function call and the supplied result as one atomic edit.
+def _cmd_context_tool(args):
+    return _context_result(context_builder.add_tool_exchange(
+        args.path, args.name, _context_arguments(args), _context_content(args),
+        call_id=args.call_id, at=args.at, progress=args.progress))
+
+
+# Replace one complete message or only its content while preserving other fields.
+def _cmd_context_replace(args):
+    if args.message_file is not None:
+        if args.text is not None or args.content_file is not None:
+            raise DatasetError("--message-file cannot be combined with --text or --content-file")
+        result = context_builder.replace_message(
+            args.path, args.index, message=context_builder.read_message_file(args.message_file),
+            progress=args.progress)
+    else:
+        result = context_builder.replace_message(
+            args.path, args.index, content=_context_content(args), progress=args.progress)
+    return _context_result(result)
+
+
+# Remove one explicit contiguous range.
+def _cmd_context_remove(args):
+    return _context_result(context_builder.remove_messages(
+        args.path, args.index, args.count, progress=args.progress))
+
+
+# Move one explicit contiguous range using post-removal destination coordinates.
+def _cmd_context_move(args):
+    return _context_result(context_builder.move_messages(
+        args.path, args.source, args.destination, args.count, progress=args.progress))
+
+
+# Keep the default outline content-free while offering an exact JSON form for agents.
+def _cmd_context_outline(args):
+    rows = context_builder.outline_context(args.path, args.preview)
+    if args.json:
+        return _context_result(rows)
+    columns = ["index", "role", "content", "tool calls", "tool result"]
+    if args.preview is not None:
+        columns.append("preview")
+    print("\t".join(columns))
+    for row in rows:
+        content = (f"{row['content_characters']} chars" if row["content_type"] == "string"
+                   else row["content_type"])
+        calls = ",".join(f"{call['id']}:{call['name']}" for call in row["tool_calls"])
+        values = [str(row["index"]), str(row["role"]), content, calls,
+                  str(row["tool_call_id"] or "")]
+        if args.preview is not None:
+            values.append(row.get("preview", ""))
+        print("\t".join(values))
+    return 0
+
+
+# Print only the requested exact message region for focused inspection.
+def _cmd_context_show(args):
+    import json
+
+    value = context_builder.show_messages(args.path, args.index, args.count)
+    print(json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2))
+    return 0
+
+
+# Validate without rewriting the Context and return only compact counts.
+def _cmd_context_validate(args):
+    messages = context_builder.read_context(args.path)
+    return _context_result(context_builder.validate_context(messages, str(args.path)))
 
 
 # Read one stateless request; the browser alone accepts inline Context and literal credentials.
@@ -596,6 +724,90 @@ def build_parser():
     p.add_argument("--port", required=True, type=int, help="listen port, integer 1..65535; no default")
     p.add_argument("--force", action="store_true", help="accepted for consistency; UI saves preserve existing rows")
     p.set_defaults(func=_cmd_ui)
+
+    p = sub.add_parser("context", help="create and edit reusable generation Context arrays",
+        description=(
+            "Edit the exact JSON messages array consumed by dataset generate --context-file.\n"
+            "Content may come from --text, --content-file, or stdin independently of\n"
+            "whether it is represented as an ordinary message or fabricated tool result.\n"
+            "Mutations validate and stage the complete replacement; serialize writers to one file."
+        ),
+        epilog="Run dataset context ACTION --help for action-specific examples.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    actions = p.add_subparsers(dest="context_action", title="actions", metavar="ACTION", required=True,
+                               help="Context action; run dataset context ACTION --help for details")
+
+    # Every content-bearing action uses the same mutually exclusive ingestion choices.
+    def content_options(parser):
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument("--text", help="literal content; default: read complete UTF-8 content from stdin")
+        group.add_argument("--content-file", metavar="PATH",
+                           help="read exact UTF-8 content from PATH; '-' reads stdin")
+
+    p = actions.add_parser("create", help="create a new empty Context array")
+    p.add_argument("path", help="new Context JSON path; parent must exist; path must be absent")
+    p.set_defaults(func=_cmd_context_create)
+
+    p = actions.add_parser("add", help="insert an ordinary or raw message")
+    p.add_argument("path", help="existing Context JSON array")
+    representation = p.add_mutually_exclusive_group(required=True)
+    representation.add_argument("--role", help="role for a generated {role, content} message")
+    representation.add_argument("--message-file", metavar="PATH",
+                                help="UTF-8 JSON file containing one exact message object")
+    p.add_argument("--at", type=int, metavar="INDEX", help="zero-based insertion index; default: append")
+    content_options(p)
+    p.set_defaults(func=_cmd_context_add)
+
+    p = actions.add_parser("tool", help="insert a fabricated function call and supplied result")
+    p.add_argument("path", help="existing Context JSON array")
+    p.add_argument("--name", required=True, help="nonempty represented function name")
+    arguments = p.add_mutually_exclusive_group()
+    arguments.add_argument("--arg", action="append", default=[], metavar="KEY=VALUE",
+                           help="flat string argument; repeatable; default: empty object")
+    arguments.add_argument("--arguments-file", metavar="PATH",
+                           help="UTF-8 JSON file containing one argument object")
+    p.add_argument("--call-id", help="explicit unique tool-call ID; default: next call_NNNN")
+    p.add_argument("--at", type=int, metavar="INDEX", help="zero-based insertion index; default: append")
+    content_options(p)
+    p.set_defaults(func=_cmd_context_tool)
+
+    p = actions.add_parser("replace", help="replace one message or only its content")
+    p.add_argument("path", help="existing Context JSON array")
+    p.add_argument("index", type=int, help="zero-based message index")
+    p.add_argument("--message-file", metavar="PATH", help="replace with one exact JSON message object")
+    content_options(p)
+    p.set_defaults(func=_cmd_context_replace)
+
+    p = actions.add_parser("remove", help="remove one contiguous message range")
+    p.add_argument("path", help="existing Context JSON array")
+    p.add_argument("index", type=int, help="zero-based first message index")
+    p.add_argument("--count", type=int, default=1, help="positive messages to remove; default: 1")
+    p.set_defaults(func=_cmd_context_remove)
+
+    p = actions.add_parser("move", help="move one contiguous message range")
+    p.add_argument("path", help="existing Context JSON array")
+    p.add_argument("source", type=int, help="zero-based first source index")
+    p.add_argument("destination", type=int,
+                   help="zero-based insertion index after removing the source range")
+    p.add_argument("--count", type=int, default=1, help="positive messages to move; default: 1")
+    p.set_defaults(func=_cmd_context_move)
+
+    p = actions.add_parser("outline", help="summarize messages without printing content")
+    p.add_argument("path", help="existing Context JSON array")
+    p.add_argument("--json", action="store_true", help="emit the outline as JSON")
+    p.add_argument("--preview", type=int, metavar="CHARACTERS",
+                   help="include at most this many escaped content characters; default: none")
+    p.set_defaults(func=_cmd_context_outline)
+
+    p = actions.add_parser("show", help="print one focused message range")
+    p.add_argument("path", help="existing Context JSON array")
+    p.add_argument("index", type=int, help="zero-based first message index")
+    p.add_argument("--count", type=int, default=1, help="positive messages to show; default: 1")
+    p.set_defaults(func=_cmd_context_show)
+
+    p = actions.add_parser("validate", help="validate the complete Context and tool pairing")
+    p.add_argument("path", help="existing Context JSON array")
+    p.set_defaults(func=_cmd_context_validate)
 
     p = sub.add_parser("generate", help="generate one editable answer and reasoning from stdin JSON",
         description=(

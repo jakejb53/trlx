@@ -820,6 +820,44 @@ through staged publication. Exact duplicates include reasoning presence and text
 Successful saves clear submitted examples; failures retain them for retry. Use one
 UI process for a destination and avoid concurrent writes from other applications.
 
+### Reusable Context builder
+
+`dataset context` incrementally builds the exact messages array accepted by
+`generate --context-file`. The JSON file is the durable state; no separate
+workspace or export step exists.
+
+```sh
+dataset context create security-context.json
+
+# Add ordinary messages from stdin, a file, or short inline text.
+dataset context add security-context.json --role user < research-question.txt
+dataset context add security-context.json --role assistant --content-file analysis.txt
+dataset context add security-context.json --role user --text "Apply those findings."
+
+# Represent supplied data as fabricated retrieval without executing that tool.
+dataset context tool security-context.json \
+  --name web_search \
+  --arg 'query=JWT verification requirements' \
+  --content-file search-results.txt
+dataset context tool security-context.json \
+  --name read_file \
+  --arg 'path=manual.md' \
+  --content-file manual.md
+
+# Inspect structure without printing the full content, then validate it.
+dataset context outline security-context.json
+dataset context show security-context.json 3 --count 2
+dataset context validate security-context.json
+```
+
+Content ingestion and message representation are independent: a result read
+from any local file or stdin may be represented using any caller-selected tool
+name and arguments. The builder only creates messages; it does not fetch URLs,
+run commands, query services, or generate responses. Mutations use staged
+replacement and must be serialized for one Context file. See
+[SPEC-context-packages.md](SPEC-context-packages.md) for insertion, replacement,
+range editing, raw-message, validation, and formatting contracts.
+
 ### Stateless CLI authoring
 
 Use `generate` and `save` independently of the web server. Each reads one JSON

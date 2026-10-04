@@ -415,12 +415,18 @@ Authoring saves append unique examples with mandatory staging, without requiring
 | `chat` | Text file to `messages` via endpoint. Pass 1: chunk plus instruction yields N questions. Pass 2: each question plus its chunk yields the answer. Each pass has its own endpoint, model, and prompt-file flags. Unparseable replies reported and skipped. Rows carry the answer's reasoning in a `reasoning` column, from the endpoint's reasoning field, `""` when it returns none. The endpoint must return reasoning in that field; a reply with reasoning inline in the content is fatal unless `--strip-reasoning-tags` removes it. |
 | `stats` | Token length distribution per column. With `--model`, per-token log-prob of response columns. |
 | `eval-build` | One factual prose summary per input `text` row via an OpenAI-compatible endpoint; writes ordered `text` rows for ordinary CPT evaluation. |
+| `context` | Create and atomically edit the exact JSON messages array consumed by `generate --context-file`, including fabricated function-tool exchanges from inline, file, or stdin content. |
 | `generate` | Stateless stdin JSON request to one endpoint; returns answer/reasoning JSON. Optional `--context-file PATH` loads a UTF-8 JSON messages array. |
 | `save` | Stateless stdin JSON containing `path` and selected `examples`; appends unique authoring rows to JSONL and returns added/duplicate counts. |
 
 `generate` and `save` execute shared authoring operations directly, without a web server
 or workspace. Their input contracts and save semantics are defined in `SPEC-webui.md`.
 Results go to stdout; progress and errors go to stderr. Failures exit nonzero.
+
+`context` owns no workspace beyond the messages-array file itself and performs
+no retrieval or generation. Content ingestion is independent from ordinary-message
+or fabricated-tool representation. Its mutation, validation, and CLI contracts
+are defined in `SPEC-context-packages.md`.
 
 `chat --exclude-reasoning` omits the separate `reasoning` column. Its default is false.
 It is independent of `--strip-reasoning-tags` and does not disable endpoint reasoning.
