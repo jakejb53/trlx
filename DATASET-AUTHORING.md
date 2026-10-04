@@ -1,6 +1,6 @@
 # Model-specific dataset authoring
 
-Follow this workflow only when explicitly invoked. Repository approval and file-operation rules still apply.
+Follow this workflow. Repository approval and file-operation rules still apply.
 
 ## Session inputs
 
@@ -27,7 +27,7 @@ Prefer focused, challenging problems whose corrected solutions fit the training 
 ## Batch workflow
 
 1. Obtain the topic and number N of new dataset rows explicitly for this session, using the agreed destination. Do not reuse a previous session's topic or count.
-2. Propose exactly N scenarios, one per row, and obtain approval of the list before starting generation.
+2. Propose exactly N scenarios, one per row. As the final step before requesting approval to begin generation, read `DATASET-AUTHORING-REMINDER.md` in full and explicitly tell the user that you understand and agree to follow its instructions. Then ask for approval of the scenario list. Do not begin generation before approval.
 3. Scenario-list approval authorizes formulating prompts, generating, editing, validating, and saving all N rows to the agreed destination. Do not request per-prompt or per-row approval.
 4. Handle ordinary prompt refinements, editing, and validation corrections autonomously within the approved scenarios. Provide progress updates without stopping for review.
 5. Save each verified row as it is completed, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
