@@ -15,6 +15,10 @@ When saved values are not accepted or the file is absent, reuse established sess
 - Approved prompt or scenario list, plus system prompt, Context, and sampling settings.
 - Generation method: standard or Context-assisted.
 
+Autonomous batches are the normal authoring mode. One-at-a-time review is a testing mode.
+
+Before starting an autonomous batch, obtain agreement on the logprob-difference metric, acceptance threshold, adjustment/retry limits, and what happens when those limits are exhausted. Do not infer these settings or supply defaults.
+
 To list available Contexts, enumerate every `contexts/*.json` file in filename
 order. For each JSON file, read the same-stem `.txt` file and display the
 filename with its complete description. List every Context, not only ones that
@@ -48,7 +52,7 @@ For token counting, map the saved reasoning into the final assistant's recorded 
 
 If the user specifies a different model, establish its validation metadata after onboarding: inspect the applicable repository training configuration and rendering code, then the endpoint's available model metadata and tokenizer/template APIs. Use authorized local model resources when needed; repository access rules still apply. Establish the training tokenizer, chat template, and reasoning-field mapping from evidence; use the user-supplied full-sequence token limit. Training loss settings are not prerequisites for generating, validating, or saving examples. Do not assume an unrelated run configuration applies or that a served model alias proves matching training and endpoint rendering.
 
-Apart from the required generation-method question, ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving; optional likelihood scoring may be unavailable if reported explicitly.
+Apart from the required generation-method question, ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving. If likelihood scoring or a baseline is unavailable, report it explicitly; autonomous saves must still satisfy the agreed logprob acceptance policy.
 
 Prefer focused, challenging problems. Follow the user's topic choices. Ensure the saved user prompt contains the facts needed to understand the response.
 
@@ -59,10 +63,10 @@ Prefer focused, challenging problems. Follow the user's topic choices. Ensure th
 3. When an exact prompt or scenario set and an existing candidate Context are already known, print the sufficiency challenge before requesting scenario-list approval. Resolve a `NOT READY` result first and include the final adjudication in the scenario proposal. Do not promise that the Context will remain unchanged before this challenge.
 4. If a required Context does not exist yet, name its exact artifact paths and intended scope in the proposal. After the required approval, build it and run the sufficiency challenge before rendering; a `READY` result needs no additional approval.
 5. As the final step before requesting approval to begin generation, read `DATASET-AUTHORING-REMINDER.md` in full and explicitly tell the user that you understand and agree to follow its instructions. Then ask for approval of the scenario list. Do not begin generation before approval.
-6. Scenario-list approval authorizes formulating prompts, generating, editing, validating, and saving all N rows to the agreed destination. Do not request per-prompt or per-row approval.
-7. Handle ordinary prompt refinements, editing, and validation corrections autonomously within the approved scenarios. Provide progress updates without stopping for review.
-8. Save each verified row as it is completed, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
-9. Continue until every approved scenario has a verified saved row, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
+6. Scenario-list approval authorizes formulating prompts, generating, editing, validating, and saving rows that satisfy the agreed acceptance policy to the agreed destination. Do not request per-prompt or per-row approval in autonomous mode.
+7. Handle ordinary prompt refinements, editing, and validation corrections autonomously within the approved scenarios. When a candidate fails the logprob threshold, adjust and retry within the editing contract and agreed limits. Threshold failures follow the agreed policy without introducing a per-row approval pause. Provide progress updates without stopping for review.
+8. Save each completed row only when it satisfies the agreed logprob threshold and all editing, correctness, and token-limit requirements, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
+9. Continue until every approved scenario has a verified saved row or has reached the outcome specified by the agreed exhausted-retry policy, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
 10. Report completed scenarios, destination, new and total row counts, and validation results. If blocked, identify the problem and completed progress.
 
 ## Context-assisted generation (alternative)
@@ -460,9 +464,9 @@ The authoring CLI does not tokenize or score likelihood. Use the saved validatio
 
 ## Review and save
 
-For individual examples, present the edited reasoning and response, material corrections, complete token count, likelihood measurements if available, and validation results. Await save approval unless the session already authorizes saving that scope. Preserve the approved text exactly.
+In testing mode, present the final prompt, edited reasoning and response, material corrections, complete rendered token count, and validation results. Show original and final mean logprobs and their differences for reasoning, response, and both combined, with scored token counts and scoring masks. State treatment of template and reasoning boundaries; report unavailable measurements explicitly. Report fixed-context comparisons separately from original-versus-final continuation scores. Obtain explicit approval of the exact final candidate after presenting these results and before writing it to the dataset. Prior scenario or destination approval does not replace this save approval. Preserve the approved text exactly.
 
-For an approved batch, validate and save each completed example without a per-row presentation or approval gate. Summarize progress during the run and report results at completion.
+In autonomous mode, score each original and final candidate's reasoning, response, and combined continuation. Save only candidates that satisfy the agreed logprob threshold and all editing, correctness, and token-limit requirements. When a candidate fails the threshold, adjust and retry within the editing contract and agreed limits; likelihood does not authorize rewriting sound text, restoring errors, or weakening validation. Follow the agreed exhausted-retry policy without introducing a per-row approval pause. Summarize progress during the run and report results at completion.
 
 `python -m dataset.cli save` reads a destination and nonempty array of examples from stdin:
 
