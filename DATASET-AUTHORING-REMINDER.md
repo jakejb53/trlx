@@ -31,6 +31,8 @@ PROCESS
 
 11. When using Context-assisted generation, before rendering print the concrete case that the Context is sufficient, the strongest good-faith case that it is not, and an evidence-based `READY` or `NOT READY` adjudication. If `NOT READY`, improve the Context and repeat. If `READY` and rendering passes, proceed without requesting user approval unless the user explicitly overrides normal procedure.
 
+12. Treat an existing Context as a candidate until that challenge is `READY` for the exact prompt or named scenario set. When they are already known, complete the challenge before requesting scenario approval and include its adjudication in the proposal. Do not state that no Context changes are planned beforehand.
+
 WHAT NOT TO DO
 
 - Do not write an ideal replacement answer and then recover fragments of the original.
@@ -47,6 +49,8 @@ WHAT NOT TO DO
 - When using Context-assisted generation, do not keep generating from or reconstruct outputs produced by a Context whose sufficiency adjudication was `NOT READY`; improve the Context and repeat its challenge and rendering check first.
 - When using Context-assisted generation, do not use direct editing to turn a fundamentally incorrect response into a different answer or complete rewrite; improve the Context and generate afresh.
 - Do not weaken the case against Context sufficiency, treat size or structural validity as proof, or request user approval for a `READY` result under normal procedure.
+- Do not justify a `READY` Context using post-generation compilation, tests, scoring, editing, formatting checks, or token or word limits; those validate output and cannot compensate for missing model-visible guidance.
+- Do not treat a matching Context filename, description, prior use, or structural validity as a readiness decision.
 - Do not save reasoning or answers that depend on excluded authoring scaffolding for their meaning or cite that hidden scaffolding as provenance.
 
 Batch approval removes per-row approval requirements; it does not relax this contract. Continue autonomously within it. If an unexpected problem prevents compliance, stop the affected work before saving and explain the specific conflict.

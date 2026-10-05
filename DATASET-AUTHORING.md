@@ -36,6 +36,12 @@ answer omits Context for this batch; a yes answer uses an approved existing
 Context or triggers a proposal for the required Context artifact under the
 repository's approval rules.
 
+Treat every existing Context as a candidate until its printed sufficiency
+challenge returns `READY` for the exact final prompt or named scenario set. A
+matching filename, description, prior use, or structural validity does not prove
+readiness. Do not state that no Context modification is planned before that
+adjudication.
+
 For the configured model, reuse `[probes]`: its model identity, tokenization URLs, reasoning field and boundaries, template-inserted system text, and scoring request settings. `training_uses_endpoint_tokenizer_and_template = true` records the user's confirmation that endpoint rendering is the training reference. Do not repeat capability or metadata probes each session. Per-example correctness checks, token counting, and likelihood measurements remain required as described below.
 
 For token counting, map the saved reasoning into the final assistant's recorded reasoning field and POST `model`, `messages`, and the recorded tokenization flags to the tokenization URL. Read `count` and `tokens`; POST `model` and `tokens` to the detokenization URL to obtain the rendered `prompt`. Submit that text to the scoring URL with `model` and the recorded scoring request settings; read `choices[0].logprobs`. Probe notes and measured result fields are metadata, not request arguments.
@@ -49,12 +55,15 @@ Prefer focused, challenging problems. Follow the user's topic choices. Ensure th
 ## Batch workflow
 
 1. Obtain the topic and number N of new dataset rows explicitly for this session, using the agreed destination. Do not reuse a previous session's topic or count.
-2. Propose exactly N scenarios, one per row. As the final step before requesting approval to begin generation, read `DATASET-AUTHORING-REMINDER.md` in full and explicitly tell the user that you understand and agree to follow its instructions. Then ask for approval of the scenario list. Do not begin generation before approval.
-3. Scenario-list approval authorizes formulating prompts, generating, editing, validating, and saving all N rows to the agreed destination. Do not request per-prompt or per-row approval.
-4. Handle ordinary prompt refinements, editing, and validation corrections autonomously within the approved scenarios. Provide progress updates without stopping for review.
-5. Save each verified row as it is completed, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
-6. Continue until every approved scenario has a verified saved row, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
-7. Report completed scenarios, destination, new and total row counts, and validation results. If blocked, identify the problem and completed progress.
+2. Draft exactly N scenarios, one per row, and assign any existing Contexts as candidates rather than assuming they are ready.
+3. When an exact prompt or scenario set and an existing candidate Context are already known, print the sufficiency challenge before requesting scenario-list approval. Resolve a `NOT READY` result first and include the final adjudication in the scenario proposal. Do not promise that the Context will remain unchanged before this challenge.
+4. If a required Context does not exist yet, name its exact artifact paths and intended scope in the proposal. After the required approval, build it and run the sufficiency challenge before rendering; a `READY` result needs no additional approval.
+5. As the final step before requesting approval to begin generation, read `DATASET-AUTHORING-REMINDER.md` in full and explicitly tell the user that you understand and agree to follow its instructions. Then ask for approval of the scenario list. Do not begin generation before approval.
+6. Scenario-list approval authorizes formulating prompts, generating, editing, validating, and saving all N rows to the agreed destination. Do not request per-prompt or per-row approval.
+7. Handle ordinary prompt refinements, editing, and validation corrections autonomously within the approved scenarios. Provide progress updates without stopping for review.
+8. Save each verified row as it is completed, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
+9. Continue until every approved scenario has a verified saved row, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
+10. Report completed scenarios, destination, new and total row counts, and validation results. If blocked, identify the problem and completed progress.
 
 ## Context-assisted generation (alternative)
 
@@ -206,17 +215,27 @@ challenge:
 2. **Case against sufficiency** — Give the strongest good-faith argument that the
    Context remains inadequate. Identify plausible missing facts, unresolved
    choices, unsupported assumptions, insufficient depth, or work the model must
-   still perform. A generic claim that more Context is always possible is not a
-   valid case against.
+   still perform. Identify concrete model-visible material that could materially
+   reduce the risk of incorrect reasoning, invented behavior, or reconstructive
+   editing. A generic claim that more Context is always possible is not a valid
+   case against.
 3. **Adjudication** — Evaluate both arguments against the final prompt and actual
    Context. Return `READY` only when the case against does not expose a material
    risk that the model must research, invent, or redesign something essential.
-   Otherwise return `NOT READY`, improve or split the Context, and repeat the
-   complete challenge.
+   If the case against identifies useful missing material, return `NOT READY`
+   unless the Context already contains it or the adjudication explains with
+   specific evidence why it would be redundant. Otherwise improve or split the
+   Context and repeat the complete challenge.
 
 A `READY` adjudication must answer the strongest objection with concrete Context
 evidence. Message count, token count, structural validation, and topical
 relevance are not evidence of sufficiency by themselves.
+
+Evaluate only whether the model-visible input is sufficient for a substantially
+correct untouched response. Post-generation compilation, tests, scoring,
+editing, formatting checks, and token or word limits may detect defects, but
+they are not evidence that the Context is sufficient and must not be used to
+justify `READY`.
 
 Under normal procedure this challenge is not an approval request. Print it for
 the user, but do not ask the user to approve a `READY` result. Continue to the
