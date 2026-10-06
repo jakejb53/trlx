@@ -17,6 +17,10 @@ When saved values are not accepted or the file is absent, reuse established sess
 
 Autonomous batches are the normal authoring mode. One-at-a-time review is a testing mode.
 
+Before every autonomous run, ask how many scenarios the user wants in that
+batch. Do not reuse the size of an earlier batch, including when the user
+continues the same topic and settings.
+
 Before starting an autonomous batch, obtain agreement on the logprob-difference metric, acceptance threshold, adjustment/retry limits, and what happens when those limits are exhausted. Do not infer these settings or supply defaults.
 
 To list available Contexts, enumerate every `contexts/*.json` file in filename
@@ -58,7 +62,7 @@ Prefer focused, challenging problems. Follow the user's topic choices. Ensure th
 
 ## Batch workflow
 
-1. Obtain the topic and number N of new dataset rows explicitly for this session, using the agreed destination. Do not reuse a previous session's topic or count.
+1. Obtain the topic explicitly for this session and the number N of new dataset rows for this autonomous run, using the agreed destination. Do not reuse a previous session's topic or an earlier run's count.
 2. Draft exactly N scenarios, one per row, and assign any existing Contexts as candidates rather than assuming they are ready.
 3. When an exact prompt or scenario set and an existing candidate Context are already known, print the sufficiency challenge before requesting scenario-list approval. Resolve a `NOT READY` result first and include the final adjudication in the scenario proposal. Do not promise that the Context will remain unchanged before this challenge.
 4. If a required Context does not exist yet, name its exact artifact paths and intended scope in the proposal. After the required approval, build it and run the sufficiency challenge before rendering; a `READY` result needs no additional approval.
@@ -68,6 +72,38 @@ Prefer focused, challenging problems. Follow the user's topic choices. Ensure th
 8. Save each completed row only when it satisfies the agreed logprob threshold and all editing, correctness, and token-limit requirements, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
 9. Continue until every approved scenario has a verified saved row or has reached the outcome specified by the agreed exhausted-retry policy, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
 10. Report completed scenarios, destination, new and total row counts, and validation results. If blocked, identify the problem and completed progress.
+
+### Autonomous run orchestration
+
+In autonomous mode, assign every drafted scenario to its own dedicated
+subagent. Run scenario subagents sequentially; only one may be active at a
+time. Retain and resume the same subagent across approval pauses so its working
+context remains outside the main thread.
+
+The scenario subagent owns the full lifecycle: exact prompt preparation;
+Context research, creation, or repair; the sufficiency challenge; rendering;
+generation; minimum editing; correctness validation; token counting;
+likelihood scoring and acceptance-policy enforcement; saving; and post-save
+verification. It follows this document, `DATASET-AUTHORING-REMINDER.md`, and
+all repository approval and file-operation rules itself.
+
+Before scenario-list approval, run each assigned subagent through Context
+readiness. It returns a compact readiness record containing the exact scenario,
+Context paths, and sufficiency adjudication. When a Context write, design
+decision, or other approval boundary is reached, the subagent returns a compact
+proposal; the main agent obtains the user's decision and resumes that same
+subagent. After every scenario is `READY`, the main agent performs step 5 and
+requests approval for the complete scenario list.
+
+After scenario-list approval, resume the assigned subagents one at a time to
+complete their scenarios. Each subagent keeps raw generations and detailed
+evidence in the required artifacts and returns only the compact result needed
+for batch accounting: scenario identity, status, Context and raw-response
+paths, material edits, validation and likelihood results, save result, and
+verified row counts. Dataset saves are therefore serialized. The main agent
+owns user interaction, approvals, orchestration, and the aggregate batch
+report; it does not repeat the subagent's investigation or load full outputs
+into its context unless a decision or unexpected problem requires them.
 
 ## Context-assisted generation (alternative)
 
@@ -80,6 +116,113 @@ model response that needs only the minimum editing permitted below.
 This option changes generation input, not the saved row contract. The Context is
 excluded from the training example. The final saved prompt must still be
 self-contained enough to identify the problem and requested result.
+
+### Teach the model through Context
+
+Build Context as a curriculum that develops the knowledge needed for the final
+prompt. Work backward from that prompt to identify prerequisite facts, concepts,
+reasoning methods, and likely failure modes. Keep the final prompt a natural next
+question that requires applying and combining what the conversation establishes.
+
+Construct a coherent investigation: user questions motivate retrieval; tool
+results supply authoritative material; assistant analyses interpret the evidence;
+follow-up questions expose uncertainty, test understanding, and connect the
+pieces. Use actual retrieved material, with source locations and a clear
+distinction between excerpts, paraphrases, and original analysis.
+
+Provide depth through worked examples, complete derivations, exercises,
+counterexamples, and representative operation sequences where relevant. Teach
+why plausible approaches fail and how to evaluate alternatives. Short assertions
+or summaries are not substitutes for the evidence and reasoning needed to
+understand the subject.
+
+Preserve the final task's synthesis. Context may resolve prerequisite
+uncertainty, but should not contain the completed implementation or a polished
+answer to the final prompt. Avoid fabricated authority or conveniently tailored
+documents that merely deliver the solution.
+
+Context must not read as feedback on an earlier generation. Never tell the
+model that a prior response, draft, implementation, or reasoning attempt failed.
+Do not include reviewer comments, defect lists, exact corrections, replacement
+spans, retry instructions, scoring results, or scenario-specific acceptance
+checks. This prohibition applies even when the failed generation identified a
+real knowledge gap.
+
+Use as much relevant material as needed within the agreed context and performance
+limits. Neither brevity nor token volume establishes sufficiency.
+
+#### Evidence provenance gate
+
+“Fabricated” or “simulated” describes only the model-visible tool call. It
+never authorizes fabricating the tool result. Every new or changed result must
+come from an operation that actually occurred or from an existing artifact
+whose exact contents and provenance were already verified.
+
+Before adding or replacing a model-visible tool result:
+
+1. Perform the represented retrieval or execution, or read the previously
+   verified artifact.
+2. Inspect the returned source material, output, status, and relevant metadata.
+3. Verify every passage, result, and observation that will appear in Context.
+4. Only then construct the model-visible tool exchange and mutate the Context.
+
+A source name, URL, citation, search-result snippet, remembered fact, or
+agent-written summary is not retrieved source material by itself. Do not label
+content “retrieved,” “executed,” “observed,” or “verified” unless that operation
+occurred and supports the claim. For external sources, identify locations and
+distinguish direct excerpts, faithful paraphrases, and original analysis. Label
+reviewed synthetic internal material as internal rather than external authority.
+
+Do not draft a tool result and verify it afterward. Any unsupported retrieval
+or execution claim invalidates the Context and requires correction before the
+sufficiency challenge.
+
+When any violation of these authoring instructions is found in an existing or
+in-progress Context, stop using that Context. Remove the violating
+model-visible material completely, including the complete tool-call/result pair
+when either half is affected. Do not leave the violation in place and append a
+correction, disclaimer, or compliant parallel account around it.
+
+Replace removed material only with curriculum that independently satisfies the
+current instructions: obtain and verify its evidence first, present it without
+feedback framing or answer leakage, reconnect the surrounding conversation, and
+update the description when its instructional scope or sources change. Then
+rerun structural validation, the provenance audit, feedback and answer-leakage
+checks, the complete sufficiency challenge, and rendering before generation.
+
+#### Repair curriculum gaps from generation evidence
+
+A rejected generation is private authoring evidence. Keep the generation, its
+defects, and proposed corrections outside model-visible Context.
+
+For each material defect:
+
+1. Identify the general prerequisite fact, concept, reasoning method, or failure
+   class that the curriculum failed to teach.
+2. Retrieve authoritative material for that prerequisite.
+3. Introduce it through a natural research question and evidence-bearing tool
+   result.
+4. Develop understanding through analysis, derivation, or an analogous exercise
+   that uses different names, values, and circumstances from the final task.
+5. Include general counterexamples where useful, without reproducing the final
+   task's erroneous and corrected forms.
+6. Reconnect the new material to the existing curriculum so the final prompt
+   remains a natural request for new synthesis.
+
+Do not append isolated corrective assertions. Do not expose the prior failure,
+state the exact fix, provide corrected final-task code, or turn the Context into
+a review checklist for the final answer.
+
+Before accepting a repair, perform both checks:
+
+- **Feedback check:** Could a model-visible reader infer that these turns are
+  correcting or grading an earlier answer? If yes, rewrite them as curriculum.
+- **Answer-leakage check:** Could the final answer be produced largely by copying
+  the added material and substituting the final prompt's names? If yes, the
+  repair tells rather than teaches.
+
+A repaired Context is ready only when it teaches the missing prerequisite while
+leaving the final prompt's implementation and synthesis unresolved.
 
 ### Context artifact
 
@@ -145,8 +288,10 @@ Construct a natural research conversation rather than an answer pasted into
 Context:
 
 1. A user turn asks a focused research question.
-2. The assistant makes a fabricated retrieval call.
-3. The tool result supplies selected source material or an internal document.
+2. After the provenance gate passes, the assistant makes a simulated
+   model-visible retrieval call backed by that verified evidence.
+3. The tool result supplies the verified selected source material, execution
+   result, or reviewed internal document.
 4. The assistant analyzes implications and resolves conflicts.
 5. Later user turns introduce the next part of the problem.
 6. The conversation ends with a synthesis that makes the final scenario prompt
@@ -201,6 +346,9 @@ Before declaring the Context ready, perform these coverage checks:
    to produce a plausible but incorrect answer.
 5. End with a synthesis that states the resolved model and makes the final
    scenario a natural next question without drafting its answer.
+6. Map every model-visible retrieval and execution claim to the actual source,
+   command output, or previously verified artifact that supports it. A missing
+   or unverifiable mapping makes the Context `NOT READY`.
 
 There is no fixed minimum or target Context size. Use as much selected,
 relevant material as the scenario needs, subject to the model-specific
@@ -254,15 +402,20 @@ The complete Context-building sequence is:
 
 1. Obtain approval for the Context path and create it with `context create`.
 2. Add focused conversational framing.
-3. Add exact selected external passages as fabricated retrieval results.
-4. Add reviewed internal design notes for scenario-specific knowledge.
-5. Add assistant analysis connecting evidence to constraints and failure cases.
-6. End with a natural transition into the approved final prompt.
-7. Perform the coverage checks and print the sufficiency challenge above.
+3. Retrieve or execute outside the builder, inspect the result, and verify every
+   passage or observation intended for Context.
+4. Only after that verification, add selected external passages or execution
+   evidence through simulated model-visible tool exchanges.
+5. Add reviewed internal design notes for scenario-specific knowledge, clearly
+   labelled as internal material.
+6. Add assistant analysis connecting evidence to constraints and failure cases.
+7. End with a natural transition into the approved final prompt.
+8. Audit the provenance mapping for every retrieval and execution claim.
+9. Perform the coverage checks and print the sufficiency challenge above.
    Extend or split the Context until the adjudication is `READY`.
-8. Run `context outline` without previews to review only roles, sizes, tool
+10. Run `context outline` without previews to review only roles, sizes, tool
    names, call IDs, and ordering.
-9. Run `context validate`. Resolve every structural or tool-pairing error before
+11. Run `context validate`. Resolve every structural or tool-pairing error before
    rendering.
 
 The outline and validation output should be sufficient for routine inspection;
@@ -360,12 +513,12 @@ reasoning or answer indicate an insufficient Context. Pause that scenario and
 improve the Context before generating again; do not compensate with extensive
 manual rewriting or repeated requests using the same inadequate input.
 
-Use rejected generations as negative evidence: record their general defect
-classes, invalid assumptions, counterexamples, and acceptance checks in the
-Context without pasting a polished replacement answer. After changing the
-Context, repeat the printed sufficiency challenge and mandatory rendering check
-before a fresh generation. Under normal procedure, proceed without requesting
-user approval when both pass.
+Use rejected generations as private diagnostic evidence. Do not copy their
+defects, corrections, or acceptance checks into Context. Repair the curriculum
+using “Repair curriculum gaps from generation evidence,” then repeat the
+printed sufficiency challenge and mandatory rendering check before a fresh
+generation. Under normal procedure, proceed without requesting user approval
+when both pass.
 
 ### Edit, score, validate, and save
 
@@ -467,6 +620,12 @@ The authoring CLI does not tokenize or score likelihood. Use the saved validatio
 In testing mode, present the final prompt, edited reasoning and response, material corrections, complete rendered token count, and validation results. Show original and final mean logprobs and their differences for reasoning, response, and both combined, with scored token counts and scoring masks. State treatment of template and reasoning boundaries; report unavailable measurements explicitly. Report fixed-context comparisons separately from original-versus-final continuation scores. Obtain explicit approval of the exact final candidate after presenting these results and before writing it to the dataset. Prior scenario or destination approval does not replace this save approval. Preserve the approved text exactly.
 
 In autonomous mode, score each original and final candidate's reasoning, response, and combined continuation. Save only candidates that satisfy the agreed logprob threshold and all editing, correctness, and token-limit requirements. When a candidate fails the threshold, adjust and retry within the editing contract and agreed limits; likelihood does not authorize rewriting sound text, restoring errors, or weakening validation. Follow the agreed exhausted-retry policy without introducing a per-row approval pause. Summarize progress during the run and report results at completion.
+
+After an autonomous run completes, the main agent presents the aggregate
+scenario results, exhausted retries or failures, validation results,
+destination, and new and total row counts. It then asks whether the user wants
+another autonomous run. If the user continues, ask for a fresh batch size
+before preparing scenarios; do not carry the completed run's count forward.
 
 `python -m dataset.cli save` reads a destination and nonempty array of examples from stdin:
 
