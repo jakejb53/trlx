@@ -21,7 +21,11 @@ Before every autonomous run, ask how many scenarios the user wants in that
 batch. Do not reuse the size of an earlier batch, including when the user
 continues the same topic and settings.
 
-Before starting an autonomous batch, obtain agreement on the logprob-difference metric, acceptance threshold, adjustment/retry limits, and what happens when those limits are exhausted. Do not infer these settings or supply defaults.
+Before starting an autonomous batch, obtain agreement on the logprob-difference
+metric, adjustment/retry limits, and what happens when those limits are
+exhausted. The acceptance threshold defaults to a mean-logprob difference of
+`-0.30`; state that value before the run and use a different threshold when the
+user chooses one. Do not infer the other settings or supply defaults for them.
 
 To list available Contexts, enumerate every `contexts/*.json` file in filename
 order. For each JSON file, read the same-stem `.txt` file and display the
@@ -72,38 +76,6 @@ Prefer focused, challenging problems. Follow the user's topic choices. Ensure th
 8. Save each completed row only when it satisfies the agreed logprob threshold and all editing, correctness, and token-limit requirements, preserving existing examples. Count only new saved rows toward N; skipped duplicates do not count. On continuation, inspect saved progress before creating more rows.
 9. Continue until every approved scenario has a verified saved row or has reached the outcome specified by the agreed exhausted-retry policy, or an unexpected problem requires the user's attention. Do not substitute scenarios or weaken validation to finish the batch.
 10. Report completed scenarios, destination, new and total row counts, and validation results. If blocked, identify the problem and completed progress.
-
-### Autonomous run orchestration
-
-In autonomous mode, assign every drafted scenario to its own dedicated
-subagent. Run scenario subagents sequentially; only one may be active at a
-time. Retain and resume the same subagent across approval pauses so its working
-context remains outside the main thread.
-
-The scenario subagent owns the full lifecycle: exact prompt preparation;
-Context research, creation, or repair; the sufficiency challenge; rendering;
-generation; minimum editing; correctness validation; token counting;
-likelihood scoring and acceptance-policy enforcement; saving; and post-save
-verification. It follows this document, `DATASET-AUTHORING-REMINDER.md`, and
-all repository approval and file-operation rules itself.
-
-Before scenario-list approval, run each assigned subagent through Context
-readiness. It returns a compact readiness record containing the exact scenario,
-Context paths, and sufficiency adjudication. When a Context write, design
-decision, or other approval boundary is reached, the subagent returns a compact
-proposal; the main agent obtains the user's decision and resumes that same
-subagent. After every scenario is `READY`, the main agent performs step 5 and
-requests approval for the complete scenario list.
-
-After scenario-list approval, resume the assigned subagents one at a time to
-complete their scenarios. Each subagent keeps raw generations and detailed
-evidence in the required artifacts and returns only the compact result needed
-for batch accounting: scenario identity, status, Context and raw-response
-paths, material edits, validation and likelihood results, save result, and
-verified row counts. Dataset saves are therefore serialized. The main agent
-owns user interaction, approvals, orchestration, and the aggregate batch
-report; it does not repeat the subagent's investigation or load full outputs
-into its context unless a decision or unexpected problem requires them.
 
 ## Context-assisted generation (alternative)
 
@@ -621,7 +593,7 @@ In testing mode, present the final prompt, edited reasoning and response, materi
 
 In autonomous mode, score each original and final candidate's reasoning, response, and combined continuation. Save only candidates that satisfy the agreed logprob threshold and all editing, correctness, and token-limit requirements. When a candidate fails the threshold, adjust and retry within the editing contract and agreed limits; likelihood does not authorize rewriting sound text, restoring errors, or weakening validation. Follow the agreed exhausted-retry policy without introducing a per-row approval pause. Summarize progress during the run and report results at completion.
 
-After an autonomous run completes, the main agent presents the aggregate
+After an autonomous run completes, the agent presents the aggregate
 scenario results, exhausted retries or failures, validation results,
 destination, and new and total row counts. It then asks whether the user wants
 another autonomous run. If the user continues, ask for a fresh batch size

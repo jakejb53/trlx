@@ -12,3 +12,4 @@ data/
 dataset-authoring.toml
 contexts/
 endpoint-responses/
+.codex
