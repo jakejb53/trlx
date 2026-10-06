@@ -6,7 +6,7 @@ Contract: `SPEC.md`. This file records what each phase builds and how it is veri
 
 Development progress is tracked in this file. Each phase heading below carries its status when work on it starts.
 
-Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, SFT reasoning inclusion, interactive dataset authoring UI, and stateless CLI authoring complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below). Web UI browser/live-endpoint validation and two additional stale test assertions are recorded in its section below. CLI live-endpoint validation and an existing import-allowlist failure are recorded in the stateless CLI authoring section.
+Current status: Phases 1-8, startup settings review, settings assessment, training output improvements, cooperative cancellation, distributed failure cleanup, common failure reporting, synthetic CPT evaluation, optional random evaluation splitting, checkpoint defaults, runtime metrics/loss charts, SFT reasoning inclusion, interactive dataset authoring UI, stateless CLI authoring, and automatic DeepSeek-V4 message encoding complete. Runtime metrics/loss charts supersede the assessment recommendation overhaul. Optional acceleration recommendations remain planned. Full-scale cancellation and synthetic evaluation execution validation remain with the operator. Five stale line-renderer tests remain unresolved (assessment overhaul below). Web UI browser/live-endpoint validation and two additional stale test assertions are recorded in its section below. CLI live-endpoint validation and an existing import-allowlist failure are recorded in the stateless CLI authoring section.
 Phase 8, startup settings review, settings assessment, and training output improvements record current work; the addendum records earlier work and supersedes historical Phases 1-7.
 
 ### Session start procedure
@@ -767,6 +767,28 @@ PYTHONDONTWRITEBYTECODE=1 TMPDIR="$PWD/tests" python -B -m unittest \
   re-reviewed with no remaining findings. Live endpoint generation remains unverified.
 - The unrelated `tests.test_imports.ImportRule.test_trlx_imports_only_allowed_dataset_modules`
   still fails because its allowlist omits the existing `dataset.failures` import.
+
+### Automatic DeepSeek-V4 message encoding (complete, 2026-10-06)
+
+- Models whose metadata names `DeepseekV4ForCausalLM` automatically use the bundled Apache-2.0
+  vLLM-derived Python encoder instead of requiring a Jinja chat template. The adapter implements the
+  Transformers processor contract for SFT, DPO, KTO, GRPO, RLOO, distillation, and shared assessment,
+  preflight, quality, generation, and verification paths. Explicit Jinja overrides retain ownership.
+- Default training encoding uses DeepSeek's canonical low/no-prefix reasoning effort. Assistant masks
+  include native reasoning boundaries and EOS; response metadata separates reasoning, content, and DSML
+  tool calls. The base Flash-0731 checkpoint remains unavailable to `reward` because its model metadata
+  provides no sequence-classification class.
+- Added `trlx/deepseek_v4_encoding.py`, `trlx/chat_encoding.py`, and
+  `tests/test_chat_encoding.py`; updated `trlx/model.py`, `trlx/reasoning.py`,
+  `trlx/data_profile.py`, `trlx/train.py`, `SPEC.md`, and `README.md`.
+- Validation: all four official encoding fixtures matched; all 101 `data/engineering.jsonl` rows passed
+  ordinary and reasoning-only preparation with the real Flash-0731 tokenizer; DPO, KTO, GRPO, RLOO,
+  and distillation fixture shapes passed. Nine focused adapter tests and 28 adapter/profile tests passed.
+  The original SFT startup reached review and cancelled successfully before weights or run allocation.
+  No model weights or live training were run.
+- Broader validation still encounters unrelated existing failures: the import allowlist above, stale
+  supervisor assertions, and four reasoning-retention tests that expect oversized reasoning to be rejected
+  although the current contract requires automatic reasoning-first fitting.
 
 ### Additional TODO: optional acceleration recommendations (planned)
 

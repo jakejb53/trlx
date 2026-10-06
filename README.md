@@ -208,6 +208,13 @@ Conversational columns contain lists of `{role, content}` messages. An SFT JSONL
 {"messages":[{"role":"user","content":"What is 2 + 2?"},{"role":"assistant","content":"4"}]}
 ```
 
+Models whose architecture registers a bundled Python message encoder do not need a Jinja chat template.
+DeepSeek-V4 is detected from its model metadata and uses its native encoding automatically across SFT,
+DPO, KTO, GRPO, RLOO, and distillation. Its default training encoding adds no reasoning-effort instruction;
+explicit chat-template kwargs remain available for generation requests. `reward` additionally requires the
+selected checkpoint to provide a sequence-classification model class, which the base DeepSeek-V4-Flash-0731
+checkpoint does not provide. An explicit `chat_template_path` overrides automatic encoding.
+
 The normal command for SFT, DPO, KTO, or reward-model training is:
 
 ```sh

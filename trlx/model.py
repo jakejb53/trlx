@@ -20,7 +20,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICA
 from dataset.progress import stage
 from dataset import failures
 from trlx import TrlxError
-from trlx import diagnostics
+from trlx import chat_encoding, diagnostics
 
 SEQUENCE_CLASSIFICATION = "sequence_classification"
 CAUSAL = "causal"
@@ -113,13 +113,16 @@ def load_model(spec, kind, device_map=None, *, progress=None):
         raise TrlxError(f"[model].path '{spec.path}': cannot load weights: {e}")
 
 
-# Tokenizer or processor for the model. AutoProcessor returns the tokenizer
-# for text-only checkpoints, so one call covers both.
+# Tokenizer or processor for the model. Architecture metadata selects any
+# registered Python encoder before the processor reaches trainers or utilities.
 def load_processor(spec, *, progress=None):
     try:
         with failures.context(model=spec.path, operation="loading tokenizer/processor"), stage(progress, f"loading processor {spec.path}", visible=True):
-            return AutoProcessor.from_pretrained(spec.path, **_pretrained_kwargs(spec))
-    except (OSError, ValueError, ImportError) as e:
+            kwargs = _pretrained_kwargs(spec)
+            config = AutoConfig.from_pretrained(spec.path, **kwargs)
+            processor = AutoProcessor.from_pretrained(spec.path, **kwargs)
+            return chat_encoding.adapt_processor(processor, config)
+    except (OSError, ValueError, TypeError, ImportError) as e:
         raise TrlxError(f"[model].path '{spec.path}': cannot load tokenizer or processor: {e}")
 
 
@@ -143,18 +146,15 @@ def assessment_processor(cfg, *, progress=None):
             path = pathlib.Path(template)
             if path.is_file() and path.suffix in {".jinja", ".j2"}:
                 processor.chat_template = path.read_text(encoding="utf-8")
-                if getattr(cfg.dataset, "include_reasoning", False):
-                    # A replacement template cannot inherit a field mapping from the base template.
-                    # Reasoning validation resolves a recognized schema for this effective template.
-                    tokenizer.response_template = None
+                # A replacement renderer cannot inherit parser metadata from the automatic encoder.
+                tokenizer.response_template = None
             else:
                 from transformers import AddedToken, AutoTokenizer
                 from trl.chat_template_utils import clone_chat_template
 
                 source = AutoTokenizer.from_pretrained(template)
                 processor.chat_template = source.get_chat_template()
-                if getattr(cfg.dataset, "include_reasoning", False):
-                    tokenizer.response_template = getattr(source, "response_template", None)
+                tokenizer.response_template = getattr(source, "response_template", None)
                 tokenizer.add_tokens([token for token in source.added_tokens_decoder.values()
                                       if token.content not in tokenizer.get_vocab()])
                 tokenizer.eos_token = source.eos_token

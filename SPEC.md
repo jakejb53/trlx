@@ -128,6 +128,11 @@ TOML. One file holds persistent defaults for all methods. Precedence is explicit
 - `init` omits `save_strategy` and `save_steps`. By default, checkpoints follow evaluation's strategy and interval; with evaluation disabled, only the final checkpoint is saved (`save_strategy = "steps"`, `save_steps = 0`). Explicit save settings override these defaults. An explicit step strategy without evaluation or a save interval retains TRL's interval default.
 - `[run]`: `gpus` (`all` or comma-separated visible indices), `strategy` (`auto`, `ddp`, `fsdp`), `tui` and `verify` (booleans). CLI forms are `--gpus`, `--strategy`, `--tui`/`--no-tui`, `--verify`/`--no-verify`.
 - `[model]`: `path`, `dtype`, `trust_remote_code`, `attn_implementation`. Class is read from the model's own config, never hardcoded. `reward` resolves the sequence-classification variant of that architecture.
+  Registered architecture metadata may also select a bundled Python message encoder when the model has no Jinja
+  chat template. The encoder implements the same processor contract for every trainer and shared evaluation path;
+  an explicit `chat_template_path` still overrides it. DeepSeek-V4 uses its native encoding automatically, with
+  no reasoning-effort prefix unless explicitly requested. A checkpoint without a sequence-classification class
+  remains unavailable to `reward` independently of message encoding.
 - `[teacher]`: `distillation` only. Same keys as `[model]`.
 - `[dataset]`:
   - `split = true`: `dataset` and `eval_fraction` strictly between 0 and 1. At load time, the final `ceil(row_count * eval_fraction)` rows evaluate; earlier rows train. Both sides must be nonempty. The old `train` key is rejected.

@@ -11,7 +11,7 @@ from trl.chat_template_utils import add_response_schema, get_training_chat_templ
 from trl.data_utils import _tokenize, prepare_multimodal_messages
 
 from dataset.progress import stage
-from trlx import TrlxError, data_profile
+from trlx import TrlxError, chat_encoding, data_profile
 
 
 # Resolve metadata on a private processor: validation must not change the trainer's processor.
@@ -37,7 +37,8 @@ def _resolve(cfg, processor, progress):
     if len(candidates) != 1:
         raise ValueError("response_template must identify exactly one non-content text field for reasoning")
     template = None
-    if cfg.args.assistant_only_loss and not has_generation_markers(view.chat_template):
+    if (cfg.args.assistant_only_loss and not chat_encoding.is_non_jinja(view) and
+            not has_generation_markers(view.chat_template)):
         template = get_training_chat_template(view)
     return view, template, candidates[0]
 

@@ -17,6 +17,7 @@ from trl.chat_template_utils import get_training_chat_template, has_generation_m
 from trl.data_utils import _tokenize, extract_prompt, is_conversational, maybe_convert_to_chatml
 
 from dataset.progress import stage
+from trlx import chat_encoding
 
 
 # Stable identity compares source content, not dictionary insertion order.
@@ -433,7 +434,8 @@ def scan(cfg, processor, train_set, eval_set, *, primary_rows=None, progress=Non
             if cfg.args.eos_token not in tokenizer.get_vocab():
                 raise ValueError(f"eos_token {cfg.args.eos_token!r} is absent from the tokenizer vocabulary")
             tokenizer.eos_token = cfg.args.eos_token
-        if cfg.args.assistant_only_loss and not has_generation_markers(processor.chat_template):
+        if (cfg.args.assistant_only_loss and not chat_encoding.is_non_jinja(processor) and
+                not has_generation_markers(processor.chat_template)):
             template = get_training_chat_template(processor)
     train_rows = list(train_set)
     if primary_rows is not None and not 0 <= primary_rows <= len(train_rows):

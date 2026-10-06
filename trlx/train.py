@@ -39,6 +39,7 @@ from trlx import (
     TrlxError,
     assessment,
     cancellation,
+    chat_encoding,
     config as config_mod,
     data_load,
     data_profile,
@@ -614,6 +615,9 @@ def check(args):
 # build it. Metrics remain in metrics.jsonl; operational feedback goes to the log.
 def build_trainer(cfg, model, processor, train_set, eval_set, callbacks, *, progress=None):
     cfg.args.disable_tqdm = True
+    # An explicit Jinja source owns both rendering and response parsing inside the trainer.
+    if getattr(cfg.args, "chat_template_path", None):
+        chat_encoding.remove_adapter(processor)
     extra = {}
     if cfg.teacher is not None:
         # distillation: the teacher is a loaded object, never a path, so
@@ -642,7 +646,7 @@ def build_trainer(cfg, model, processor, train_set, eval_set, callbacks, *, prog
     try:
         with stage(progress, "constructing trainer and preparing datasets", visible=True), synthetic_eval.deferred_evaluation(
             cfg.args, cfg.dataset.synthetic_dataset_eval and eval_set is None,
-        ):
+        ), chat_encoding.trainer_capabilities(processor):
             trainer = trainer_cls(
                 model=model,
                 args=cfg.args,
