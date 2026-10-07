@@ -235,6 +235,14 @@ LLM summaries. Strip navigation and unrelated boilerplate without rewriting the
 substantive passage. Keep source names and locations in the model-visible result
 when they help distinguish evidence from analysis.
 
+Install the `authoring` project extra when extracting HTML or XML. Use `lxml`
+to parse the document and select unique structural elements such as section IDs;
+do not use regular expressions, repeated plaintext headings, or expected prose
+sentences as document boundaries or extraction-success checks. Use the native
+parser and structural identifiers for other machine-readable formats. Validate
+selector uniqueness, ordering, and a plausible nonempty result, then inspect the
+actual selected text before treating it as retrieved evidence.
+
 Use reviewed synthetic internal documents for application-specific contracts
 that no external source defines, such as state transitions, accounting
 invariants, concurrency rules, or required behavior from an unspecified
@@ -246,6 +254,11 @@ command process can retrieve and extract passages in memory, assert every
 expected section, and call `dataset.context_builder.add_tool_exchange` only
 after all assertions pass. Alternatively, produce a verified local result file
 and pass it with `--content-file`.
+
+When rebuilding a Context from external sources, finish every fallible retrieval
+and extraction first. Assemble and validate the complete replacement in memory,
+then publish it once through the staged writer; do not leave a partially rebuilt
+Context when a later source or insertion fails.
 
 Do not stream a fallible producer directly into a mutating builder command. A
 producer can fail after the builder sees EOF, causing an empty result to be
@@ -551,6 +564,32 @@ Choose an adequate timeout before launching. Let long reasoning runs finish; ver
 Keep the complete unedited prompt, reasoning, and response available throughout the session, including post-save review. Persist raw outputs or scratch artifacts only with authorization.
 
 ## Edit the original
+
+Before beginning the complete reasoning edit, measure the complete raw
+rendered example, read `REASONING-EDIT-REMINDER.md` in full, and reread the
+untouched reasoning from the raw response artifact. Complete the reasoning
+and answer edits, then run correctness checks, rendered-token validation, and
+likelihood scoring. Do not dispatch the adversarial reasoning reviewer unless
+the complete candidate passes those checks and the agreed likelihood threshold.
+
+Use `jq` only to inspect or extract fields. Do not use `jq sub`, shell regular
+expressions, or shell-embedded replacement expressions to edit generated text.
+Inspect the raw response's actual message keys before accessing them. Perform
+edits from the untouched response with one Python transformation using the
+observed field names and exact literal replacements. Every replacement must
+assert that its original span occurs exactly once. Do not apply transformations
+to an intermediate candidate.
+
+If the transformation command fails, return to the untouched response, correct
+the mechanical error, and rerun the same intended edit. Inspect the complete
+resulting reasoning and answer before continuing.
+
+Give the reviewer the exact untouched and edited reasoning in its initial
+request. If it returns `ACCEPT`, continue to saving. If it returns `REVISE`,
+apply only its identified local corrections, rerun correctness, rendering, and
+likelihood checks, then resubmit the exact revised reasoning. Regenerate only
+when the required correction cannot be made without violating the reasoning-edit
+contract.
 
 Treat the original as the authoritative text to be repaired, not a draft to improve generally. Preserve every passage unless it has an identifiable defect.
 

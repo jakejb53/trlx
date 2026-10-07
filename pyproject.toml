@@ -18,6 +18,11 @@ dependencies = [
     "uvicorn==0.53.0",
 ]
 
+[project.optional-dependencies]
+authoring = [
+    "lxml==6.1.3",
+]
+
 # Generated wrappers, not copies of repo files: pip writes each one to import
 # the module and call main(), whose return value is the exit code.
 [project.scripts]
