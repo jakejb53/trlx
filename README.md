@@ -16,15 +16,6 @@ target model a topic, generates on-policy reasoning and answers, repairs them un
 a strict editing contract with likelihood scoring and an adversarial review, and
 saves verified rows. The `authoring/` scripts implement each check.
 
-**Start the web UI** from the repository root:
-
-```sh
-python -m dataset.cli ui --host 127.0.0.1 --port 8000
-```
-
-Open <http://127.0.0.1:8000> in your browser. Both arguments are required;
-`--port` accepts 1..65535.
-
 ## Why trlx exists
 
 Using TRL directly gives you Python trainer APIs; you assemble the surrounding workflow
