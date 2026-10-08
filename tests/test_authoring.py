@@ -57,8 +57,58 @@ class ExtractTests(unittest.TestCase):
         self.assertIn("body b", sections["Beta"])
         self.assertNotIn("body c", sections["Beta"])
 
+    def test_dtdd_takes_the_definition_and_rejects_a_bare_term(self):
+        page = ('<html><head><meta charset="utf-8"></head><body><dl>'
+                '<dt id="m.f">m.f(x)<a class="headerlink">¶</a></dt>'
+                '<dd><p>Does the thing.</p><p>More.</p></dd>'
+                '<dt id="m.g">m.g()</dt></dl></body></html>')
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "doc.html"
+            p.write_text(page, encoding="utf-8")
+            out = pathlib.Path(d) / "out.txt"
+            _load("extract").dtdd(p, out, ["m.f"])
+            text = out.read_text(encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                _load("extract").dtdd(p, out, ["m.g"])   # no <dd> follows
+        self.assertTrue(text.startswith("[m.f]\nm.f(x)\n"))
+        self.assertNotIn("¶", text)
+        self.assertIn("Does the thing.", text)
+
+    def test_clause_removes_only_the_named_subclause(self):
+        page = ('<html><body><emu-clause id="sec-a"><h1>A</h1><p>keep one</p>'
+                '<emu-clause id="sec-a-x"><h1>A.x</h1><p>drop me</p></emu-clause>'
+                '<p>keep two</p></emu-clause></body></html>')
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "spec.html"
+            p.write_text(page, encoding="utf-8")
+            out = pathlib.Path(d) / "out.txt"
+            _load("extract").clause(p, out, ["sec-a,sec-a-x"])
+            text = out.read_text(encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                _load("extract").clause(p, out, ["sec-a,sec-missing"])
+        self.assertIn("keep one", text)
+        self.assertIn("keep two", text)
+        self.assertNotIn("drop me", text)
+        self.assertNotIn("\n\n\n", text)
+
 
 class EditTests(unittest.TestCase):
+    def test_derive_widens_to_unique_spans_merges_overlaps_and_round_trips(self):
+        edit = _load("edit")
+        raw = {"reasoning": "x a x b x a x", "answer": "\n\nkeep. drop this. keep."}
+        final = {"reasoning": "x c x b x a x", "answer": "keep. keep."}
+        edits = edit.derive_edits(raw, final)
+        self.assertEqual(edit.apply_edits(raw, edits), final)
+        for e in edits:
+            self.assertEqual(raw[e["field"]].count(e["old"]), 1)
+        # Two nearby changes whose unique spans overlap must become one edit.
+        raw2 = {"reasoning": "p q r s t q r s u", "answer": "z"}
+        final2 = {"reasoning": "p Q r S t q r s u", "answer": "z"}
+        edits2 = edit.derive_edits(raw2, final2)
+        self.assertEqual(edit.apply_edits(raw2, edits2), final2)
+        self.assertEqual(len([e for e in edits2 if e["field"] == "reasoning"]), 1)
+
+
     def test_duplicate_span_is_rejected_and_unique_span_is_applied(self):
         edit = _load("edit")
         raw = {"reasoning": "a b a", "answer": "\n\nx y"}
@@ -85,6 +135,28 @@ class CountScoreTests(unittest.TestCase):
         self.assertEqual(rendered[as_:ae], "## Answer\n\nfinal")
         with self.assertRaises(AssertionError):
             cs.spans(rendered, "not present", answer, r_open, r_close, a_end)
+
+
+class ReuseTests(unittest.TestCase):
+    def test_body_must_match_recorded_sha256(self):
+        import hashlib
+        reuse = _load("reuse")
+        body = "Section text.\n\nMore text.\n"
+        sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        ok = {"role": "tool", "content": f"SOURCE: S\nLOCATION: L\nRETRIEVED: 2026-10-07\nSHA256: {sha}\nREPRESENTATION: R\n\n{body}"}
+        header, got = reuse.verified_body(ok)
+        self.assertEqual(got, body)
+        self.assertTrue(header.startswith("SOURCE: S"))
+        inline = dict(ok, content=ok["content"].replace(f"SHA256: {sha}\nREPRESENTATION: R", f"REPRESENTATION: R; SHA256 {sha}"))
+        self.assertEqual(reuse.verified_body(inline)[1], body)
+        tampered = dict(ok, content=ok["content"].replace("More text.", "Other text."))
+        with self.assertRaises(AssertionError):
+            reuse.verified_body(tampered)
+        unhashed = dict(ok, content=ok["content"].replace(f"SHA256: {sha}\n", ""))
+        with self.assertRaises(AssertionError):
+            reuse.verified_body(unhashed)
+        with self.assertRaises(AssertionError):
+            reuse.verified_body({"role": "assistant", "content": ok["content"]})
 
 
 if __name__ == "__main__":

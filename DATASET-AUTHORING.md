@@ -158,6 +158,9 @@ limits. Neither brevity nor token volume establishes sufficiency.
 never authorizes fabricating the tool result. Every new or changed result must
 come from an operation that actually occurred or from an existing artifact
 whose exact contents and provenance were already verified.
+`authoring/reuse.py` copies a tool result out of an existing Context only when
+its body matches the SHA256 recorded in its header, and prints the header so
+the original SOURCE, LOCATION, and RETRIEVED values carry over.
 
 Before adding or replacing a model-visible tool result:
 
@@ -285,8 +288,9 @@ command process can retrieve and extract passages in memory, assert every
 expected section, and call `dataset.context_builder.add_tool_exchange` only
 after all assertions pass. Alternatively, produce a verified local result file
 and pass it with `--content-file`. `authoring/extract.py` performs structural
-extraction from htmlized and v3 RFC HTML, HTML by id, Markdown headings, and
-PDF page ranges; inspect its output before use.
+extraction from htmlized and v3 RFC HTML, HTML by id, definition entries (a
+`<dt>` with its `<dd>`), clauses with named subclauses removed, Markdown
+headings, and PDF page ranges; inspect its output before use.
 
 When rebuilding a Context from external sources, finish every fallible retrieval
 and extraction first. Assemble and validate the complete replacement in memory,
@@ -489,7 +493,8 @@ JSON
 ```
 
 Do not make duplicate requests while one is active. Preserve the complete raw
-generation before editing.
+generation before editing. Count it before reviewing it (see "Edit the
+original").
 
 `dataset.endpoint.Endpoint` stores the exact body bytes of every received HTTP
 response under `endpoint-responses/` before decoding or validation. This
@@ -599,9 +604,11 @@ Keep the complete unedited prompt, reasoning, and response available throughout 
 
 ## Edit the original
 
-Before beginning the complete reasoning edit, measure the complete raw
-rendered example, read `REASONING-EDIT-REMINDER.md` in full, and reread the
-untouched reasoning from the raw response artifact. Complete the reasoning
+Count the complete raw rendered example as the first step after a generation
+returns, so the size of any overrun is known before the review begins. An
+overrun is handled by "Fitting the token limit" after the review, not by
+regenerating on size alone. Then read `REASONING-EDIT-REMINDER.md` in full and
+reread the untouched reasoning from the raw response artifact. Complete the reasoning
 and answer edits, then run correctness checks, rendered-token validation, and
 likelihood scoring. Do not dispatch the adversarial reasoning reviewer unless
 the complete candidate passes those checks and the agreed likelihood threshold.
@@ -613,7 +620,10 @@ edits from the untouched response with one Python transformation using the
 observed field names and exact literal replacements. Every replacement must
 assert that its original span occurs exactly once. Do not apply transformations
 to an intermediate candidate. `authoring/edit.py` applies a JSON list of exact
-literal replacements this way and prints the diff.
+literal replacements this way and prints the diff. For a large set of cuts,
+edit a copy of the untouched text and let `edit.py derive` produce the list;
+it widens each span until unique, merges overlaps, and fails unless re-applying
+the list reproduces the copy exactly.
 
 If the transformation command fails, return to the untouched response, correct
 the mechanical error, and rerun the same intended edit. Inspect the complete

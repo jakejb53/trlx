@@ -973,12 +973,13 @@ python -m pip install '.[authoring]'
 
 | Script | Step | Example |
 | --- | --- | --- |
-| `extract.py` | Structural excerpts from RFC HTML, HTML ids, Markdown headings, and PDF pages | `python authoring/extract.py rfchtml rfc6960.html out.txt section-2.2 section-3.2` |
+| `extract.py` | Structural excerpts from RFC HTML, HTML ids, definition entries, clauses minus subclauses, Markdown headings, and PDF pages | `python authoring/extract.py rfchtml rfc6960.html out.txt section-2.2 section-3.2` |
+| `reuse.py` | Copy a hash-verified tool result out of an existing Context for reuse | `python authoring/reuse.py contexts/TOPIC.json 6 out.txt` |
 | `ctxbuild.py` | Build a Context from a script, with provenance headers | imported by a build script; see its docstring |
 | `render_check.py` | Mandatory rendering and budget check | `python authoring/render_check.py contexts/TOPIC.json prompt.txt` |
 | `gen.py` | One generation with the saved settings | `python authoring/gen.py --prompt-file prompt.txt --context-file contexts/TOPIC.json --out-dir gen --label row1` |
 | `count_score.py` | Token count and span log-probabilities | `python authoring/count_score.py prompt.txt reasoning.txt answer.txt --score` |
-| `edit.py` | Exact literal edits with uniqueness checks and a diff | `python authoring/edit.py gen/row1.out edits.json edited/` |
+| `edit.py` | Exact literal edits with uniqueness checks and a diff; `derive` builds the edit list from an edited copy | `python authoring/edit.py gen/row1.out edits.json edited/` |
 | `make_review_prompt.py` | Assemble the reviewer prompt | `python authoring/make_review_prompt.py gen/row1.out edited/ justifications.txt review.prompt` |
 | `review.sh` | Run the tool-call reviewer and read its ruling | `authoring/review.sh review.prompt review1` |
 

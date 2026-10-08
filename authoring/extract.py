@@ -14,6 +14,11 @@ Usage: python authoring/extract.py MODE ARGS...
                                     "!" selects a section's own text without nested sections.
   htmlid   FILE OUT ID...           generic HTML: the element with that id, or a heading plus its
                                     following siblings up to the next heading of equal or higher level.
+  dtdd     FILE OUT ID...           generic HTML definition entry: the <dt> with that id plus its
+                                    following <dd> (Python reference entries such as re.sub).
+  clause   FILE OUT ID[,EXCL,...]... generic HTML: the element with that id, with each named
+                                    descendant id removed (ECMA-262 clauses minus subclauses);
+                                    trailing whitespace stripped and blank-line runs collapsed.
   md       FILE OUT HEADING...      Markdown ATX sections by exact heading text, including
                                     subsections; fenced code is skipped when scanning headings.
   pdfinfo  FILE                     print outline entries with page numbers and the page count.
@@ -119,6 +124,57 @@ def htmlid(path, out, ids):
     _write(out, parts)
 
 
+def _normalize(text):
+    """Strip trailing whitespace per line and collapse runs of blank lines to one."""
+    out, blank = [], 0
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if line:
+            blank = 0
+            out.append(line)
+        else:
+            blank += 1
+            if blank == 1:
+                out.append("")
+    return "\n".join(out).strip()
+
+
+def dtdd(path, out, ids):
+    doc = html.parse(str(path))
+    parts = []
+    for sid in ids:
+        els = doc.xpath(f'//*[@id="{sid}"]')
+        assert len(els) == 1, f"{sid}: {len(els)} matches"
+        dt = els[0]
+        assert dt.tag == "dt", f"{sid}: element is <{dt.tag}>, not <dt>"
+        dd = dt.getnext()
+        assert dd is not None and dd.tag == "dd", f"{sid}: no <dd> follows the <dt>"
+        head = etree.tostring(dt, method="text", encoding="unicode").replace("¶", "").strip()
+        body = etree.tostring(dd, method="text", encoding="unicode").strip()
+        assert body, f"{sid}: empty <dd>"
+        parts.append(f"[{sid}]\n{head}\n{body}")
+    _write(out, parts)
+
+
+def clause(path, out, specs):
+    import copy
+    doc = html.parse(str(path))
+    parts = []
+    for spec in specs:
+        sid, *excl = spec.split(",")
+        els = doc.xpath(f'//*[@id="{sid}"]')
+        assert len(els) == 1, f"{sid}: {len(els)} matches"
+        el = copy.deepcopy(els[0])
+        for x in excl:
+            subs = el.xpath(f'.//*[@id="{x}"]')
+            assert len(subs) == 1, f"{sid}: excluded id {x}: {len(subs)} matches inside the clause"
+            _remove_keep_tail(subs[0])
+        txt = _normalize(etree.tostring(el, method="text", encoding="unicode"))
+        assert txt, f"{sid}: empty after exclusions"
+        parts.append(f"[{sid}]\n{txt}")
+    _write(out, parts)
+
+
 def md_sections(path):
     """Map heading text -> section text (heading through the next heading of equal or higher level)."""
     lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
@@ -195,6 +251,10 @@ def main(argv):
         v3html(args[0], args[1], args[2:])
     elif mode == "htmlid":
         htmlid(args[0], args[1], args[2:])
+    elif mode == "dtdd":
+        dtdd(args[0], args[1], args[2:])
+    elif mode == "clause":
+        clause(args[0], args[1], args[2:])
     elif mode == "md":
         md(args[0], args[1], args[2:])
     elif mode == "pdfinfo":
