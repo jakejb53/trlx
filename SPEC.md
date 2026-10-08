@@ -15,6 +15,7 @@ trlx/              repo root
   pyproject.toml
   trlx/            library for trlx
   dataset/         library for dataset; imports nothing from trl or trlx
+  authoring/       agent-run scripts for dataset authoring, driven by dataset-authoring.toml; not packaged
   tests/           unittest
 ```
 
