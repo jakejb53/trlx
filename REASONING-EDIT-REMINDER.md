@@ -12,7 +12,7 @@ Read the untouched reasoning again. Change only exact defective spans and genuin
 
 If correctness requires new reasoning, reorganization, summarization, or broad replacement, do not edit it. Reject the generation and regenerate.
 
-The raw rendered token count has already been measured and is known. The token limit does not justify deleting sound reasoning. If the completed permitted edit cannot fit, reject the generation and regenerate.
+The raw rendered token count has already been measured and is known. The token limit does not justify deleting sound reasoning. If the completed permitted edit cannot fit, follow "Fitting the token limit" in DATASET-AUTHORING.md: regenerate when the reasoning does not demonstrate understanding or the prompt asked too much; otherwise cut the response from the end. In the reasoning remove only fluff; any other reasoning cut is presumed harmful and needs a span-specific justification that the reviewer adjudicates.
 
 After the complete candidate passes correctness, rendering, and likelihood validation, an adversarial subagent will compare the edited reasoning with the untouched original and objectively assess compliance with these instructions. Its ruling is binding. If it identifies a locally repairable deviation, revise only the identified spans, rerun validation and scoring, and resubmit the exact revised reasoning. Regenerate only when a compliant local correction is impossible.
 

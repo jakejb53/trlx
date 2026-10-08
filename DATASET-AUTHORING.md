@@ -60,12 +60,17 @@ settings.
 
 When the tool-call method is selected, write PROMPT to a scratch file and run
 `claude --model claude-opus-4-8 -p "$(cat FILE)" < /dev/null` from the
-repository root with a timeout, capturing stdout and stderr separately. PROMPT
+repository root with a timeout, capturing stdout and stderr separately
+(`authoring/make_review_prompt.py` assembles PROMPT and `authoring/review.sh`
+runs it). PROMPT
 must contain: the editing contract summary; the complete diff between the
 untouched and edited texts, or both texts in full when the diff is not
-self-explanatory; the editor's justification for each change; any retained
-passages the editor wants adjudicated; and the instruction to rule exactly
-`ACCEPT` or `REVISE` on the final line of the output. Treat any exit without a
+self-explanatory; the complete retained reasoning and response whenever any
+material was removed under "Fitting the token limit", so the reviewer can
+verify duplication and flow claims against the whole retained text; the
+editor's justification for each change; any retained passages the editor
+wants adjudicated; and the instruction to rule exactly `ACCEPT` or `REVISE`
+on the final line of the output. Treat any exit without a
 final-line ruling as a failed call. On a failed call, retry once with the same
 shape; if it fails again, stop that row, record the failure as the row's
 outcome under the agreed exhausted-retry policy, and report it. A REVISE ruling
@@ -232,7 +237,9 @@ teaches the model and which source material it includes. Keep that description
 current when the Context's instructional scope or sources change.
 
 Build and inspect it with the Context builder documented in
-`SPEC-context-packages.md`:
+`SPEC-context-packages.md`; `authoring/ctxbuild.py` wraps these commands for a
+build script and composes tool results in the provenance header format used in
+`contexts/`:
 
 ```sh
 python -m dataset.cli context create contexts/TOPIC.json
@@ -277,7 +284,9 @@ The agent does not need to load large sources into its own conversation. A local
 command process can retrieve and extract passages in memory, assert every
 expected section, and call `dataset.context_builder.add_tool_exchange` only
 after all assertions pass. Alternatively, produce a verified local result file
-and pass it with `--content-file`.
+and pass it with `--content-file`. `authoring/extract.py` performs structural
+extraction from htmlized and v3 RFC HTML, HTML by id, Markdown headings, and
+PDF page ranges; inspect its output before use.
 
 When rebuilding a Context from external sources, finish every fallible retrieval
 and extraction first. Assemble and validate the complete replacement in memory,
@@ -437,6 +446,7 @@ Rendering is a separate mandatory technical check before generation.
 Read the Context file directly, append the exact final user prompt, and include
 the exact approved system message only when nonblank. Submit that messages
 array to the configured tokenizer with the generation boundary enabled.
+`authoring/render_check.py` performs this check and prints the fields below.
 
 For the recorded remote tokenizer contract this ordinarily means:
 
@@ -602,7 +612,8 @@ Inspect the raw response's actual message keys before accessing them. Perform
 edits from the untouched response with one Python transformation using the
 observed field names and exact literal replacements. Every replacement must
 assert that its original span occurs exactly once. Do not apply transformations
-to an intermediate candidate.
+to an intermediate candidate. `authoring/edit.py` applies a JSON list of exact
+literal replacements this way and prints the diff.
 
 If the transformation command fails, return to the untouched response, correct
 the mechanical error, and rerun the same intended edit. Inspect the complete
@@ -643,12 +654,23 @@ Replace a whole passage only when local corrections cannot make it correct and c
 ## Validate
 
 - Verify substantive claims against authoritative sources or appropriate checks. Check API names/signatures, code, arithmetic, edge cases, and the prompt's constraints. Distinguish source review, successful compilation, and executed tests.
-- Count the complete rendered training example with the target tokenizer and training template: saved prompt, selected reasoning/response, and template/boundary tokens. Verify that reasoning is actually rendered. An endpoint count applies to training only when its tokenizer and rendering match.
+- Count the complete rendered training example with the target tokenizer and training template: saved prompt, selected reasoning/response, and template/boundary tokens. Verify that reasoning is actually rendered. An endpoint count applies to training only when its tokenizer and rendering match. `authoring/count_score.py` renders, counts, and with `--score` reports span mean log-probabilities under the saved probes.
 - If oversized, first remove repetition and unnecessary prose without losing correctness or required coverage. In batch mode, refine prompts within the approved scenarios autonomously; otherwise discuss narrowing the prompt. A changed prompt requires fresh generation, editing, and validation. Changes beyond an approved scenario require user approval.
 - When scoring is available, score both the original and final edited continuations. Record mean log-probability for reasoning and response separately and together, with the scoring masks and changes from baseline stated. For comparisons intended to isolate wording changes, hold the preceding context fixed and distinguish those measurements from whole-continuation scores. Report unavailable baselines explicitly.
 - Use edit size and likelihood only to choose among corrected candidates that meet the editing requirements. When necessary corrections admit multiple comparably small, correct formulations, use likelihood comparisons before selecting the correction, with preceding context held fixed. Likelihood does not authorize changing sound text or restoring errors. Final scores and retention percentages are measurements, not evidence that every edit was necessary.
 
 The authoring CLI does not tokenize or score likelihood. Use the saved validation APIs and reasoning-field mapping for the configured model; discover them again only when the user specifies a different model. For likelihood measurements, state which tokens are scored, including treatment of template and reasoning boundaries; choosing the eventual training loss settings is unnecessary. Report unavailable or unverified measurements explicitly.
+
+## Fitting the token limit
+
+A good generation is reasoning that demonstrates understanding of the topic and a response that follows from it. Editing serves two purposes: removing fluff (filler, hedging, drafting residue), especially from the reasoning, and minor correctness repairs (grammar, punctuation, spelling, formatting, errors fixable by changing a few tokens). Editing cannot turn a demonstration of non-understanding into one of understanding; that needs regeneration.
+
+When the edited example exceeds the full-sequence limit:
+
+1. If the reasoning does not demonstrate understanding, improve the Context that failed to teach the topic and regenerate.
+2. If the prompt asked for more than the model can answer accurately within the limit, narrow the prompt and regenerate.
+3. Otherwise, for a good generation that is slightly over, cut. Judge each cut by its effect on the demonstration of understanding and on the chain of thought that leads to the response. In the reasoning, remove only fluff: filler words, hedging, drafting residue, and repetition of a point already made. Any other reasoning cut is presumed harmful. It is permitted only when the editor can state, for that exact span, why removing it leaves both the demonstration of understanding and the chain of thought intact, and the reviewer must adjudicate that statement; when in doubt, do not cut reasoning. Cut the response instead: remove whole sections from the end, since the beginning matters more than the end for training. Remove earlier response material only when it is fluff or duplicates retained content. Do not rewrite retained text beyond a minimal fix to a reference to a removed section. The retained response must remain correct; reduced completeness is accepted.
+4. Re-score the cut candidate under the agreed likelihood policy and name the removed material for the reviewer.
 
 ## Review and save
 
