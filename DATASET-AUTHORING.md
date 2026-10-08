@@ -48,6 +48,30 @@ answer omits Context for this batch; a yes answer uses an approved existing
 Context or triggers a proposal for the required Context artifact under the
 repository's approval rules.
 
+Also ask in every authoring session: **"Do you want native subagents or
+subagents via a tool call?"** The answer selects how the adversarial reasoning
+reviewer and any other delegated review is dispatched. Native uses the harness
+subagent mechanism. Tool call runs a one-shot CLI process from the repository
+root; the default shape is `claude --model claude-opus-4-8 -p "PROMPT"`, with
+the contract and the exact texts inline in PROMPT, no file reads, and the
+ruling read from stdout. Use a different shape when the user supplies one. The
+ruling is binding under either method. Do not infer the choice from saved
+settings.
+
+When the tool-call method is selected, write PROMPT to a scratch file and run
+`claude --model claude-opus-4-8 -p "$(cat FILE)" < /dev/null` from the
+repository root with a timeout, capturing stdout and stderr separately. PROMPT
+must contain: the editing contract summary; the complete diff between the
+untouched and edited texts, or both texts in full when the diff is not
+self-explanatory; the editor's justification for each change; any retained
+passages the editor wants adjudicated; and the instruction to rule exactly
+`ACCEPT` or `REVISE` on the final line of the output. Treat any exit without a
+final-line ruling as a failed call. On a failed call, retry once with the same
+shape; if it fails again, stop that row, record the failure as the row's
+outcome under the agreed exhausted-retry policy, and report it. A REVISE ruling
+is resubmitted as a fresh call that states the prior ruling, confirms the
+correction was applied, and gives the complete remaining diff.
+
 Treat every existing Context as a candidate until its printed sufficiency
 challenge returns `READY` for the exact final prompt or named scenario set. A
 matching filename, description, prior use, or structural validity does not prove
