@@ -45,7 +45,7 @@ def main():
     window = cfg.context_window
     system = pathlib.Path(args.system_file).read_text(encoding="utf-8") if args.system_file else ""
     context = json.loads(pathlib.Path(args.context).read_text(encoding="utf-8"))
-    prompt = pathlib.Path(args.prompt).read_text(encoding="utf-8")
+    prompt = config.read_prompt(args.prompt)
 
     messages = ([{"role": "system", "content": system}] if system.strip() else []) + context
     messages.append({"role": "user", "content": prompt})

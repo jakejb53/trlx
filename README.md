@@ -980,8 +980,9 @@ python -m pip install '.[authoring]'
 | `gen.py` | One generation with the saved settings | `python authoring/gen.py --prompt-file prompt.txt --context-file contexts/TOPIC.json --out-dir gen --label row1` |
 | `count_score.py` | Token count and span log-probabilities | `python authoring/count_score.py prompt.txt reasoning.txt answer.txt --score` |
 | `edit.py` | Exact literal edits with uniqueness checks and a diff; `derive` builds the edit list from an edited copy | `python authoring/edit.py gen/row1.out edits.json edited/` |
-| `make_review_prompt.py` | Assemble the reviewer prompt | `python authoring/make_review_prompt.py gen/row1.out edited/ justifications.txt review.prompt` |
+| `make_review_prompt.py` | Assemble the reviewer prompt | `python authoring/make_review_prompt.py gen/row1.out edited/ justifications.txt review.prompt --prompt-file prompt.txt` |
 | `review.sh` | Run the tool-call reviewer and read its ruling | `authoring/review.sh review.prompt review1` |
+| `save.py` | Save one validated row and verify earlier rows and the saved fields | `python authoring/save.py prompt.txt edited/reasoning.txt edited/answer.txt` |
 
 Each script's `--help` documents its inputs, and `tests/test_authoring.py`
 covers their silent-failure points. Token counting and likelihood scoring use the

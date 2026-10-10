@@ -159,5 +159,238 @@ class ReuseTests(unittest.TestCase):
             reuse.verified_body({"role": "assistant", "content": ok["content"]})
 
 
+# A complete minimal dataset-authoring.toml; endpoints point at a closed port and
+# every test replaces the network or subprocess call before it would be made.
+_CONFIG = """destination = "{dest}"
+max_full_sequence_tokens = 4096
+[generation]
+endpoint = "http://127.0.0.1:9/v1"
+model = "test-model"
+api_key = ""
+system = ""
+timeout = 1
+retries = 0
+[generation.sampling]
+max_tokens = 16
+[probes]
+server_max_model_len = 1000
+[probes.tokenization]
+url = "http://127.0.0.1:9/tokenize"
+detokenize_url = "http://127.0.0.1:9/detokenize"
+reasoning_field = "reasoning"
+add_generation_prompt = false
+continue_final_message = false
+add_special_tokens = false
+reasoning_open = "<think>\\n"
+reasoning_close = "\\n</think>\\n\\n"
+assistant_end = "<|im_end|>\\n"
+[probes.scoring]
+url = "http://127.0.0.1:9/v1/completions"
+echo = true
+max_tokens = 0
+logprobs = 0
+add_special_tokens = false
+"""
+
+
+def _write_config(d, dest="unused.jsonl"):
+    p = pathlib.Path(d) / "cfg.toml"
+    p.write_text(_CONFIG.format(dest=dest), encoding="utf-8")
+    return str(p)
+
+
+class _Stop(Exception):
+    """Raised by a replaced call once the value under test has been captured."""
+
+
+class ConfigReaderTests(unittest.TestCase):
+    def test_readers_strip_only_surrounding_newlines(self):
+        cfg = _load("config")
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "t.txt"
+            p.write_text("\n\n Hello\nworld \n\n", encoding="utf-8")
+            self.assertEqual(cfg.read_prompt(p), " Hello\nworld ")
+            self.assertEqual(cfg.read_field(p), " Hello\nworld ")
+
+
+class PromptReadingTests(unittest.TestCase):
+    """Each tool must send the stripped prompt (and count_score the stripped fields)."""
+
+    def _files(self, d):
+        prompt = pathlib.Path(d) / "prompt.txt"
+        prompt.write_text("\nWhat now?\n\n", encoding="utf-8")
+        return prompt
+
+    def test_gen_request_uses_stripped_prompt(self):
+        import json
+        import sys
+        import types
+        from unittest import mock
+        gen = _load("gen")
+        with tempfile.TemporaryDirectory() as d:
+            prompt = self._files(d)
+            argv = ["gen.py", "--prompt-file", str(prompt), "--out-dir", d, "--label", "t",
+                    "--config", _write_config(d)]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(gen.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)):
+                self.assertEqual(gen.main(), 0)
+            request = json.loads((pathlib.Path(d) / "t.request.json").read_text(encoding="utf-8"))
+        self.assertEqual(request["user"], "What now?")
+
+    def test_render_check_sends_stripped_prompt(self):
+        import sys
+        from unittest import mock
+        rc = _load("render_check")
+        sent = {}
+
+        def fake_post(url, body, timeout=120):
+            sent.update(body)
+            raise _Stop
+
+        with tempfile.TemporaryDirectory() as d:
+            prompt = self._files(d)
+            ctx = pathlib.Path(d) / "ctx.json"
+            ctx.write_text("[]", encoding="utf-8")
+            argv = ["render_check.py", str(ctx), str(prompt), "--config", _write_config(d)]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(rc, "post", fake_post):
+                with self.assertRaises(_Stop):
+                    rc.main()
+        self.assertEqual(sent["messages"][-1], {"role": "user", "content": "What now?"})
+
+    def test_count_score_renders_stripped_prompt_and_fields(self):
+        import sys
+        from unittest import mock
+        cs = _load("count_score")
+        seen = {}
+
+        def fake_render(cfg, prompt, reasoning, answer):
+            seen.update(prompt=prompt, reasoning=reasoning, answer=answer)
+            raise _Stop
+
+        with tempfile.TemporaryDirectory() as d:
+            prompt = self._files(d)
+            reasoning = pathlib.Path(d) / "r.txt"
+            reasoning.write_text("Think.\n", encoding="utf-8")
+            answer = pathlib.Path(d) / "a.txt"
+            answer.write_text("\n\nAnswer.\n", encoding="utf-8")
+            argv = ["count_score.py", str(prompt), str(reasoning), str(answer), "--config", _write_config(d)]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(cs, "render", fake_render):
+                with self.assertRaises(_Stop):
+                    cs.main()
+        self.assertEqual(seen, {"prompt": "What now?", "reasoning": "Think.", "answer": "Answer."})
+
+
+class MakeReviewPromptTests(unittest.TestCase):
+    RAW = {"reasoning": "Line one.\nLine two.\nLine three.\n",
+           "answer": "Alpha.\nB\nC\nD\nE\nF\nUntouched closing sentence.\n"}
+
+    def _run(self, d, *extra, prompt=True):
+        import json
+        import subprocess
+        import sys
+        raw = pathlib.Path(d) / "raw.json"
+        raw.write_text(json.dumps(self.RAW), encoding="utf-8")
+        ed = pathlib.Path(d) / "edited"
+        ed.mkdir(exist_ok=True)
+        (ed / "reasoning.txt").write_text("Line one.\nLine two.\nLine three.\n", encoding="utf-8")
+        # Only the first line changes, so the closing sentence lies outside the
+        # diff's two context lines and must come from the complete answer section.
+        (ed / "answer.txt").write_text(self.RAW["answer"].replace("Alpha.", "Alpha fixed."), encoding="utf-8")
+        just = pathlib.Path(d) / "just.txt"
+        just.write_text("1. Fixed Alpha.\n", encoding="utf-8")
+        pfile = pathlib.Path(d) / "prompt.txt"
+        pfile.write_text("\n\nSaved prompt text.\n\n", encoding="utf-8")
+        out = pathlib.Path(d) / "out.prompt"
+        args = [sys.executable, str(ROOT / "make_review_prompt.py"), str(raw), str(ed), str(just), str(out), *extra]
+        if prompt:
+            args += ["--prompt-file", str(pfile)]
+        proc = subprocess.run(args, capture_output=True, text=True)
+        return proc, out
+
+    def test_packet_contains_prompt_and_complete_answer_with_and_without_cuts(self):
+        for cuts in ([], ["--cuts"]):
+            with tempfile.TemporaryDirectory() as d:
+                prior = pathlib.Path(d) / "prior.txt"
+                prior.write_text("PRIOR TEXT", encoding="utf-8")
+                proc, out = self._run(d, "--prior", str(prior), *cuts)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                p = out.read_text(encoding="utf-8")
+            self.assertIn("SAVED USER PROMPT (complete)\n\nSaved prompt text.\n\nCOMPLETE UNIFIED DIFF", p)
+            answer_section = p.split("EDITED ANSWER (complete)\n\n", 1)[1]
+            self.assertTrue(answer_section.startswith("Alpha fixed.\nB\nC\nD\nE\nF\nUntouched closing sentence.\n"))
+            self.assertIn("against the saved user prompt", p)
+            self.assertEqual("RULES FOR SIZE CUTS" in p, bool(cuts))
+            order = [p.index(s) for s in ("EDITING CONTRACT", "PRIOR RULING AND RESPONSE",
+                                          "SAVED USER PROMPT (complete)", "COMPLETE UNIFIED DIFF: REASONING")]
+            self.assertEqual(order, sorted(order))
+
+    def test_missing_prompt_file_fails_without_writing(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc, out = self._run(d, prompt=False)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--prompt-file", proc.stderr)
+            self.assertFalse(out.exists())
+
+
+class SaveTests(unittest.TestCase):
+    """save.py against the real `dataset save` command and a temporary destination."""
+
+    def _save(self, d, prompt, reasoning, answer):
+        import subprocess
+        import sys
+        base = pathlib.Path(d)
+        (base / "p.txt").write_text(prompt, encoding="utf-8")
+        (base / "a.txt").write_text(answer, encoding="utf-8")
+        r = "-"
+        if reasoning is not None:
+            (base / "r.txt").write_text(reasoning, encoding="utf-8")
+            r = str(base / "r.txt")
+        cfg = _write_config(d, dest=str(base / "dest.jsonl"))
+        return subprocess.run([sys.executable, str(ROOT / "save.py"), str(base / "p.txt"), r, str(base / "a.txt"),
+                               "--config", cfg], capture_output=True, text=True, cwd=ROOT.parent)
+
+    def _seed(self, d):
+        dest = pathlib.Path(d) / "dest.jsonl"
+        dest.write_text('{"messages":[{"role":"user","content":"x"},{"role":"assistant","content":"y"}]}\n',
+                        encoding="utf-8")
+        return dest, dest.read_bytes()
+
+    def test_new_row_saved_verified_and_duplicate_reported(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            dest, before = self._seed(d)
+            proc = self._save(d, "\nAsk.\n", "Think.\n", "Answer.\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            after = dest.read_bytes()
+            self.assertEqual(after[:len(before)], before)
+            rows = after.decode("utf-8").splitlines()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(json.loads(rows[1]),
+                             {"messages": [{"role": "user", "content": "Ask."},
+                                           {"role": "assistant", "content": "Answer."}],
+                              "reasoning": "Think."})
+            dup = self._save(d, "\nAsk.\n", "Think.\n", "Answer.\n")
+            self.assertEqual(dup.returncode, 3, dup.stdout + dup.stderr)
+            self.assertEqual(dest.read_bytes(), after)
+
+    def test_answer_only_row_has_no_reasoning_key(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            dest, _ = self._seed(d)
+            proc = self._save(d, "Ask.", None, "Only an answer.")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            row = json.loads(dest.read_bytes().decode("utf-8").splitlines()[-1])
+        self.assertNotIn("reasoning", row)
+        self.assertEqual(row["messages"][1]["content"], "Only an answer.")
+
+    def test_leading_whitespace_answer_rejected_before_saving(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest, before = self._seed(d)
+            proc = self._save(d, "Ask.", "Think.", " Bad.")
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("begins with whitespace", proc.stderr)
+            self.assertEqual(dest.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

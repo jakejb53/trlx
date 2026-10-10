@@ -31,7 +31,7 @@ def main():
     gen = cfg.get("generation")
     request = {
         "endpoint": gen["endpoint"], "model": gen["model"],
-        "user": pathlib.Path(args.prompt_file).read_text(encoding="utf-8"),
+        "user": config.read_prompt(args.prompt_file),
         "system": gen.get("system", ""),
         "sampling": cfg.get("generation.sampling"),
         "timeout": gen["timeout"], "retries": gen["retries"],

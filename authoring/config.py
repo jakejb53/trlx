@@ -50,3 +50,23 @@ def load(path=None):
     p = pathlib.Path(path) if path else DEFAULT_PATH
     with open(p, "rb") as f:
         return Config(tomllib.load(f), p)
+
+
+def read_prompt(path):
+    """Read a prompt file as the canonical user text.
+
+    Surrounding newlines are stripped, the same rule read_field applies to
+    reasoning and answer: the chat template strips them when rendering, so the
+    text generated from, scored, and saved must be the stripped form.
+    """
+    return pathlib.Path(path).read_text(encoding="utf-8").strip("\n")
+
+
+def read_field(path):
+    """Read an assistant field (reasoning or answer) as the canonical text.
+
+    Surrounding newlines are stripped because the chat template strips them.
+    count_score.py and save.py both read fields through this function, so the
+    text that is scored and the text that is saved cannot diverge.
+    """
+    return pathlib.Path(path).read_text(encoding="utf-8").strip("\n")

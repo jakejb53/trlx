@@ -19,7 +19,7 @@ trlx/              repo root
   tests/           unittest
 ```
 
-- Dependencies: trl, transformers, peft, accelerate, datasets, FastAPI, Uvicorn. Pinned to exact versions (trl 1.13.0 at time of writing).
+- Dependencies: trl, transformers, peft, accelerate, datasets, FastAPI, Uvicorn. Pinned to exact versions (trl 1.13.0 at time of writing). Optional `authoring` extra for `authoring/` source extraction: lxml, pypdf.
 - Prohibit unnecessary additional dependencies. CLI: argparse. TUI: curses. Config read: tomllib. Config write: own emitter. Endpoint HTTP: urllib. Web UI: FastAPI and Uvicorn, per `SPEC-webui.md`.
 - `trlx` and `dataset` are console entry points declared in `pyproject.toml`, installed onto PATH by `pip install`. Until the project is installed, both run from the repo root as `python -m trlx.cli` and `python -m dataset.cli`.
 - CLI/config secrets: `api_key` settings name environment variables, never keys. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings. `dataset ui` instead accepts credentials in the browser and persists them in localStorage per `SPEC-webui.md`; it does not load `.env`.
@@ -475,7 +475,7 @@ variable; neither command needs `run.toml`.
 
 ## 4. Tests
 
-`unittest`, standard library. Targeted at components that fail silently: config loader `None` and type rules, `heal`, `pairs`, metric reader, `lora_B` check, built-in rewards, replay trainer loss on a tiny model.
+`unittest`, standard library. Targeted at components that fail silently: config loader `None` and type rules, `heal`, `pairs`, metric reader, `lora_B` check, built-in rewards, replay trainer loss on a tiny model. `tests/test_authoring.py` covers the authoring scripts' silent-failure points: structural extraction, edit application, span location, hash-verified reuse, prompt and field reading, the review packet, and verified saving.
 
 ## 5. Verified facts
 

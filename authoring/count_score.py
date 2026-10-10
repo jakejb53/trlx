@@ -101,9 +101,9 @@ def main():
 
     cfg = config.load(args.config)
     tok = cfg.tokenization
-    prompt = pathlib.Path(args.prompt).read_text(encoding="utf-8")
-    reasoning = None if args.reasoning == "-" else pathlib.Path(args.reasoning).read_text(encoding="utf-8")
-    answer = pathlib.Path(args.answer).read_text(encoding="utf-8")
+    prompt = config.read_prompt(args.prompt)
+    reasoning = None if args.reasoning == "-" else config.read_field(args.reasoning)
+    answer = config.read_field(args.answer)
 
     count, rendered = render(cfg, prompt, reasoning, answer)
     limit = cfg.limit

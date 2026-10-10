@@ -58,24 +58,29 @@ ruling read from stdout. Use a different shape when the user supplies one. The
 ruling is binding under either method. Do not infer the choice from saved
 settings.
 
-When the tool-call method is selected, write PROMPT to a scratch file and run
-`claude --model claude-opus-4-8 -p "$(cat FILE)" < /dev/null` from the
-repository root with a timeout, capturing stdout and stderr separately
-(`authoring/make_review_prompt.py` assembles PROMPT and `authoring/review.sh`
-runs it). PROMPT
-must contain: the editing contract summary; the complete diff between the
-untouched and edited texts, or both texts in full when the diff is not
-self-explanatory; the complete retained reasoning and response whenever any
-material was removed under "Fitting the token limit", so the reviewer can
-verify duplication and flow claims against the whole retained text; the
+Under either method, `authoring/make_review_prompt.py` assembles PROMPT in a
+scratch file. PROMPT must contain: the editing contract summary; the saved
+user prompt; the complete diff between the untouched and edited texts, or both
+texts in full when the diff is not self-explanatory; the complete untouched and
+edited reasoning and the complete edited answer, plus the size-cut rules
+whenever material was removed under "Fitting the token limit", so the reviewer
+can verify duplication and flow claims against the whole retained text; the
 editor's justification for each change; any retained passages the editor
 wants adjudicated; and the instruction to rule exactly `ACCEPT` or `REVISE`
-on the final line of the output. Treat any exit without a
+on the final line of the output. Treat any review that ends without a
 final-line ruling as a failed call. On a failed call, retry once with the same
 shape; if it fails again, stop that row, record the failure as the row's
 outcome under the agreed exhausted-retry policy, and report it. A REVISE ruling
 is resubmitted as a fresh call that states the prior ruling, confirms the
 correction was applied, and gives the complete remaining diff.
+
+With the tool-call method, run `claude --model claude-opus-4-8 -p "$(cat FILE)"
+< /dev/null` from the repository root with a timeout, capturing stdout and
+stderr separately (`authoring/review.sh` runs it). The reviewer reads no files.
+
+With the native method, dispatch a fresh subagent that does not inherit the
+authoring conversation. It reads only the assembled PROMPT file, takes no other
+action, and ends with the same final-line ruling.
 
 Treat every existing Context as a candidate until its printed sufficiency
 challenge returns `READY` for the exact final prompt or named scenario set. A
@@ -89,7 +94,7 @@ For token counting, map the saved reasoning into the final assistant's recorded 
 
 If the user specifies a different model, establish its validation metadata after onboarding: inspect the applicable repository training configuration and rendering code, then the endpoint's available model metadata and tokenizer/template APIs. Use authorized local model resources when needed; repository access rules still apply. Establish the training tokenizer, chat template, and reasoning-field mapping from evidence; use the user-supplied full-sequence token limit. Training loss settings are not prerequisites for generating, validating, or saving examples. Do not assume an unrelated run configuration applies or that a served model alias proves matching training and endpoint rendering.
 
-Apart from the required generation-method question, ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving. If likelihood scoring or a baseline is unavailable, report it explicitly; autonomous saves must still satisfy the agreed logprob acceptance policy.
+Apart from the questions this guidance requires in every session (saved settings, topic, batch size, acceptance policy, generation method, and reviewer dispatch), ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving. If likelihood scoring or a baseline is unavailable, report it explicitly; autonomous saves must still satisfy the agreed logprob acceptance policy.
 
 Prefer focused, challenging problems. Follow the user's topic choices. Ensure the saved user prompt contains the facts needed to understand the response.
 
@@ -292,10 +297,10 @@ extraction from htmlized and v3 RFC HTML, HTML by id, definition entries (a
 `<dt>` with its `<dd>`), clauses with named subclauses removed, Markdown
 headings, and PDF page ranges; inspect its output before use.
 
-When rebuilding a Context from external sources, finish every fallible retrieval
-and extraction first. Assemble and validate the complete replacement in memory,
-then publish it once through the staged writer; do not leave a partially rebuilt
-Context when a later source or insertion fails.
+Build and repair a Context in place, one verified exchange at a time. A Context
+is used only after it passes validation, the provenance audit, the sufficiency
+challenge, and the rendering check, so a build interrupted by a failed retrieval
+or insertion is completed or repaired with further edits.
 
 Do not stream a fallible producer directly into a mutating builder command. A
 producer can fail after the builder sees EOF, causing an empty result to be
@@ -452,11 +457,9 @@ the exact approved system message only when nonblank. Submit that messages
 array to the configured tokenizer with the generation boundary enabled.
 `authoring/render_check.py` performs this check and prints the fields below.
 
-For the recorded remote tokenizer contract this ordinarily means:
-
-- `add_generation_prompt = true`
-- `continue_final_message = false`
-- `add_special_tokens = false`
+This check sends the recorded `[probes.tokenization]` flags, except that
+`add_generation_prompt` is always `true`; the recorded value applies to counting
+complete examples.
 
 Print:
 
@@ -651,7 +654,7 @@ An edit is permitted only to:
 - Remove dangling references to excluded system text, Context, tool calls,
   research steps, internal contracts, or prior authoring turns. Do not remove
   source references that remain meaningful and self-contained in the saved row.
-- Fit the verified token limit without losing required content.
+- Fit the verified token limit under "Fitting the token limit".
 
 A different valid design, greater robustness outside the stated assumptions, broader coverage, more formal terminology, or a formulation you prefer is not a defect. Preserve sound choices even when you would have chosen differently.
 
@@ -665,7 +668,7 @@ Replace a whole passage only when local corrections cannot make it correct and c
 
 - Verify substantive claims against authoritative sources or appropriate checks. Check API names/signatures, code, arithmetic, edge cases, and the prompt's constraints. Distinguish source review, successful compilation, and executed tests.
 - Count the complete rendered training example with the target tokenizer and training template: saved prompt, selected reasoning/response, and template/boundary tokens. Verify that reasoning is actually rendered. An endpoint count applies to training only when its tokenizer and rendering match. `authoring/count_score.py` renders, counts, and with `--score` reports span mean log-probabilities under the saved probes.
-- If oversized, first remove repetition and unnecessary prose without losing correctness or required coverage. In batch mode, refine prompts within the approved scenarios autonomously; otherwise discuss narrowing the prompt. A changed prompt requires fresh generation, editing, and validation. Changes beyond an approved scenario require user approval.
+- If oversized, follow "Fitting the token limit". In testing mode, discuss narrowing the prompt before regenerating. A changed prompt requires fresh generation, editing, and validation. Changes beyond an approved scenario require user approval.
 - When scoring is available, score both the original and final edited continuations. Record mean log-probability for reasoning and response separately and together, with the scoring masks and changes from baseline stated. For comparisons intended to isolate wording changes, hold the preceding context fixed and distinguish those measurements from whole-continuation scores. Report unavailable baselines explicitly.
 - Use edit size and likelihood only to choose among corrected candidates that meet the editing requirements. When necessary corrections admit multiple comparably small, correct formulations, use likelihood comparisons before selecting the correction, with preceding context held fixed. Likelihood does not authorize changing sound text or restoring errors. Final scores and retention percentages are measurements, not evidence that every edit was necessary.
 
@@ -706,4 +709,4 @@ Each example has exactly one user and one assistant message with string content.
 
 The destination must be a regular `.jsonl` file or a new path with an existing parent, not a directory or final symlink. Relative paths use the working directory. Save stages publication, preserves existing bytes, and skips exact duplicates based on user text, assistant content, and reasoning presence/text. It returns `{"added":N,"duplicates":N}`. No `--force` is needed; saves to one destination must be sequential across processes.
 
-After saving, verify the accepted fields and row count, and confirm existing examples are unchanged. Report the destination and total examples. Direct file writes are also permitted when explicitly authorized; preserve the same row contract and verification requirements.
+After saving, verify the accepted fields and row count, and confirm existing examples are unchanged. `authoring/save.py` saves one validated row and performs these checks. Report the destination and total examples. Direct file writes are also permitted when explicitly authorized; preserve the same row contract and verification requirements.
