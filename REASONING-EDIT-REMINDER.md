@@ -2,7 +2,9 @@
 
 At this moment you have one goal: complete the reasoning edit while preserving the target model's substantive reasoning.
 
-Make every necessary local correctness, grammar, and consistency repair. Remove response-composition instructions, abandoned drafts, repeated reasoning, circular deliberation, and word-count commentary. Preserve all sound substantive reasoning verbatim.
+Make every necessary local correctness, grammar, and consistency repair. Preserve all sound substantive reasoning verbatim.
+
+**Remove waste.** In every untouched generation, whether or not it fits the token limit, waste is a defect and is removed by default, at the exact span of any size: repetition of a result, rule, or display already established, except a table that is itself the derivation; abandoned or reversed drafts, except the span stating the corrected result; re-verification of an established result by the same route, and repeated non-converging attempts at one step, except the first check by a different route; rereading the prompt or setup with no new conclusion; narration about writing up the response (plans for the answer, composition instructions, formatting choices); hedge fragments such as "Wait,", "Actually,", or "Hmm", removed from passages that otherwise stay. Genuine uncertainty about the problem is not waste. Make the smallest connective repair after a removal. Retain a waste span only when removing it, even with a connective repair, would leave the retained reasoning incoherent, and state why. When a later span withdraws a correct result, the original is not waste; the withdrawal and what follows from it are errors.
 
 You are editing the model's reasoning, not writing your own. A clearer, shorter, more correct, or better-organized replacement is still a failed edit if sound original reasoning could have been preserved.
 

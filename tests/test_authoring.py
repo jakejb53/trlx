@@ -120,6 +120,34 @@ class EditTests(unittest.TestCase):
         self.assertEqual(raw["reasoning"], "a b a")
 
 
+class SpanReportTests(unittest.TestCase):
+    def _lab(self, text, **kw):
+        return {"field": "reasoning", "text": text, "category": "repetition", "reason": "r", **kw}
+
+    def test_spans_must_be_unique_and_disjoint_and_retention_needs_a_reason(self):
+        sr = _load("span_report")
+        fields = {"reasoning": "Wait, A. Wait, B. A again.", "answer": "x"}
+        with self.assertRaises(ValueError):  # a bare hedge occurs twice
+            sr.locate(fields, [self._lab("Wait, ", category="hedge")])
+        with self.assertRaises(ValueError):  # overlapping spans
+            sr.locate(fields, [self._lab("B. A"), self._lab(" A again.")])
+        with self.assertRaises(ValueError):  # retained without a reason
+            sr.locate(fields, [self._lab(" A again.", retained=True)])
+        with self.assertRaises(ValueError):  # unknown category
+            sr.locate(fields, [self._lab(" A again.", category="other")])
+
+    def test_anchored_hedge_and_retained_span_produce_round_tripping_removals(self):
+        sr = _load("span_report")
+        edit = _load("edit")
+        raw = {"reasoning": "Wait, A. Wait, B. A again. Keep me.", "answer": "x"}
+        labels = [self._lab("Wait, ", anchor="Wait, B.", category="hedge"),
+                  self._lab(" A again."),
+                  self._lab(" Keep me.", retained=True, retain_reason="needed")]
+        edits = sr.removal_edits(sr.locate(raw, labels))
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(edit.apply_edits(raw, edits)["reasoning"], "Wait, A. B. Keep me.")
+
+
 class CountScoreTests(unittest.TestCase):
     def test_spans_match_template_stripped_fields(self):
         cs = _load("count_score")

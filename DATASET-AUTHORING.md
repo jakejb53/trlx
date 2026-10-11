@@ -27,17 +27,18 @@ exhausted. The acceptance threshold defaults to a mean-logprob difference of
 `-0.30`; state that value before the run and use a different threshold when the
 user chooses one. Do not infer the other settings or supply defaults for them.
 
-To list available Contexts, enumerate every `contexts/*.json` file in filename
-order. For each JSON file, read the same-stem `.txt` file and display the
-filename with its complete description. List every Context, not only ones that
-appear relevant to the current topic. If `contexts/` contains no JSON files,
-state that no saved Contexts are available. If a matching description is
-missing or unreadable, report that defect instead of inventing a description;
-repair the inventory before presenting it as complete. Use this procedure both
-when the user requests the available Contexts and during onboarding.
+To inventory Contexts, check mechanically that every `contexts/*.json` has a
+readable same-stem `.txt` and every `.txt` has a matching `.json`. Report the
+total count and any defects; repair defects before relying on the inventory. Do
+not display descriptions during onboarding.
 
-After generation settings are resolved and before proposing scenarios, list all
-available Contexts with their descriptions using that procedure, then explicitly
+After the topic is known, print every Context filename in one compact list.
+Select candidates by searching filenames and `.txt` descriptions for the topic's
+terms, then display each candidate's complete description. Display other
+descriptions only when the user asks.
+
+After generation settings are resolved and before proposing scenarios, present the
+Context inventory using that procedure, then explicitly
 ask: **"Use Context-assisted generation for this batch?"** State that yes builds
 source-backed conversational Context, prints a mandatory sufficiency challenge,
 and performs a mandatory rendering/token check before generation; no uses the
@@ -611,7 +612,9 @@ Count the complete raw rendered example as the first step after a generation
 returns, so the size of any overrun is known before the review begins. An
 overrun is handled by "Fitting the token limit" after the review, not by
 regenerating on size alone. Then read `REASONING-EDIT-REMINDER.md` in full and
-reread the untouched reasoning from the raw response artifact. Complete the reasoning
+reread the untouched reasoning from the raw response artifact. Label every waste
+span in a JSON file and run `authoring/span_report.py`; its `--edits-out` removals
+start the edit list, and corrections and connective repairs are added to it. Complete the reasoning
 and answer edits, then run correctness checks, rendered-token validation, and
 likelihood scoring. Do not dispatch the adversarial reasoning reviewer unless
 the complete candidate passes those checks and the agreed likelihood threshold.
@@ -650,7 +653,7 @@ An edit is permitted only to:
 - Correct a demonstrably false claim, invalid calculation/code, or contradiction.
 - Satisfy an explicit prompt requirement, or supply something necessary to make a retained claim correct.
 - Repair a grammatical error, malformed formatting, or ambiguity that prevents a definite interpretation.
-- Remove instructions about composing the response, stale draft commentary, unresolved writing choices, repetition, abandoned deliberation, or duplicate answer drafts. Preserve genuine uncertainty about the problem.
+- **Remove waste.** In every untouched generation, whether or not it fits the token limit, waste is a defect and is removed by default, at the exact span of any size: repetition of a result, rule, or display already established, except a table that is itself the derivation; abandoned or reversed drafts, except the span stating the corrected result; re-verification of an established result by the same route, and repeated non-converging attempts at one step, except the first check by a different route; rereading the prompt or setup with no new conclusion; narration about writing up the response (plans for the answer, composition instructions, formatting choices); hedge fragments such as "Wait,", "Actually,", or "Hmm", removed from passages that otherwise stay. Genuine uncertainty about the problem is not waste. Make the smallest connective repair after a removal. Retain a waste span only when removing it, even with a connective repair, would leave the retained reasoning incoherent, and state why. When a later span withdraws a correct result, the original is not waste; the withdrawal and what follows from it are errors.
 - Remove dangling references to excluded system text, Context, tool calls,
   research steps, internal contracts, or prior authoring turns. Do not remove
   source references that remain meaningful and self-contained in the saved row.
@@ -679,6 +682,8 @@ The authoring CLI does not tokenize or score likelihood. Use the saved validatio
 A good generation is reasoning that demonstrates understanding of the topic and a response that follows from it. Editing serves two purposes: removing fluff (filler, hedging, drafting residue), especially from the reasoning, and minor correctness repairs (grammar, punctuation, spelling, formatting, errors fixable by changing a few tokens). Editing cannot turn a demonstration of non-understanding into one of understanding; that needs regeneration.
 
 When the edited example exceeds the full-sequence limit:
+
+If `span_report.py` shows that the reasoning remaining after waste removal exceeds the reasoning budget, cutting cannot fit the row: apply 1 or 2.
 
 1. If the reasoning does not demonstrate understanding, improve the Context that failed to teach the topic and regenerate.
 2. If the prompt asked for more than the model can answer accurately within the limit, narrow the prompt and regenerate.

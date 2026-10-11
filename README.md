@@ -979,6 +979,7 @@ python -m pip install '.[authoring]'
 | `render_check.py` | Mandatory rendering and budget check | `python authoring/render_check.py contexts/TOPIC.json prompt.txt` |
 | `gen.py` | One generation with the saved settings | `python authoring/gen.py --prompt-file prompt.txt --context-file contexts/TOPIC.json --out-dir gen --label row1` |
 | `count_score.py` | Token count and span log-probabilities | `python authoring/count_score.py prompt.txt reasoning.txt answer.txt --score` |
+| `span_report.py` | Validate waste labels, report waste tokens and the remaining reasoning against its budget, and write the removal edits | `python authoring/span_report.py prompt.txt gen/row1.out labels.json --edits-out edits.json` |
 | `edit.py` | Exact literal edits with uniqueness checks and a diff; `derive` builds the edit list from an edited copy | `python authoring/edit.py gen/row1.out edits.json edited/` |
 | `make_review_prompt.py` | Assemble the reviewer prompt | `python authoring/make_review_prompt.py gen/row1.out edited/ justifications.txt review.prompt --prompt-file prompt.txt` |
 | `review.sh` | Run the tool-call reviewer and read its ruling | `authoring/review.sh review.prompt review1` |
