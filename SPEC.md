@@ -475,7 +475,7 @@ variable; neither command needs `run.toml`.
 
 ## 4. Tests
 
-`unittest`, standard library. Targeted at components that fail silently: config loader `None` and type rules, `heal`, `pairs`, metric reader, `lora_B` check, built-in rewards, replay trainer loss on a tiny model. `tests/test_authoring.py` covers the authoring scripts' silent-failure points: structural extraction, edit application, span location, hash-verified reuse, prompt and field reading, the review packet, and verified saving.
+`unittest`, standard library. Targeted at components that fail silently: config loader `None` and type rules, `heal`, `pairs`, metric reader, `lora_B` check, built-in rewards, replay trainer loss on a tiny model. `tests/test_authoring.py` covers the authoring scripts' silent-failure points: structural extraction, edit application, span location, hash-verified reuse, prompt and field reading, the review packet, verified saving, waste-label validation and removal edits, and single-row replacement and deletion.
 
 ## 5. Verified facts
 

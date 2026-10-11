@@ -4,7 +4,7 @@ Follow this workflow. Repository approval and file-operation rules still apply.
 
 ## Session inputs
 
-Before any other setup investigation or endpoint probing, check for `dataset-authoring.toml` in the repository root. If it exists, read it, display its values, and ask one question about the saved settings: **"Use these values?"** On confirmation, use those values without repeating setup questions about them. Keep topic and number of examples out of the config; require both explicitly in the current session and ask for any missing value one at a time. Scenario-list approval remains part of the batch workflow.
+Before any other setup investigation or endpoint probing, check for `dataset-authoring.toml` in the repository root. If it exists, read it, display its values, and ask one question about the saved settings: **"Use these values? You may also specify that this is a row repair session."** If the user specifies a row repair session, read `ROW-REPAIR.md` in full and follow it; the session questions in this file other than the settings questions do not apply. If the file is absent, offer the same row repair option with the first setup question. On confirmation, use those values without repeating setup questions about them. Keep topic and number of examples out of the config; require both explicitly in the current session and ask for any missing value one at a time. Scenario-list approval remains part of the batch workflow.
 
 The agent reads this file; the CLI does not load it. `[generation]` supplies the `generate` stdin fields, with `user` added for each approved scenario. An empty `[generation.sampling]` sends no overrides. `context_file` supplies `--context-file`; an empty string omits it. `destination` supplies the save path. `max_full_sequence_tokens` limits each complete rendered training example, not raw generation. `max_concurrent_generations` caps simultaneous generation requests launched by the agent; saves remain sequential.
 
@@ -95,7 +95,7 @@ For token counting, map the saved reasoning into the final assistant's recorded 
 
 If the user specifies a different model, establish its validation metadata after onboarding: inspect the applicable repository training configuration and rendering code, then the endpoint's available model metadata and tokenizer/template APIs. Use authorized local model resources when needed; repository access rules still apply. Establish the training tokenizer, chat template, and reasoning-field mapping from evidence; use the user-supplied full-sequence token limit. Training loss settings are not prerequisites for generating, validating, or saving examples. Do not assume an unrelated run configuration applies or that a served model alias proves matching training and endpoint rendering.
 
-Apart from the questions this guidance requires in every session (saved settings, topic, batch size, acceptance policy, generation method, and reviewer dispatch), ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving. If likelihood scoring or a baseline is unavailable, report it explicitly; autonomous saves must still satisfy the agreed logprob acceptance policy.
+Apart from the questions this guidance requires in every authoring session (saved settings, topic, batch size, acceptance policy, generation method, and reviewer dispatch), ask only for unresolved choices, unavailable facts, or conflicts, stating what was checked and which validation depends on the answer. Once generation inputs and scenarios are approved, generation and editing may proceed while validation details are resolved. Complete required correctness and token-limit validation before saving. If likelihood scoring or a baseline is unavailable, report it explicitly; autonomous saves must still satisfy the agreed logprob acceptance policy.
 
 Prefer focused, challenging problems. Follow the user's topic choices. Ensure the saved user prompt contains the facts needed to understand the response.
 
@@ -614,7 +614,9 @@ overrun is handled by "Fitting the token limit" after the review, not by
 regenerating on size alone. Then read `REASONING-EDIT-REMINDER.md` in full and
 reread the untouched reasoning from the raw response artifact. Label every waste
 span in a JSON file and run `authoring/span_report.py`; its `--edits-out` removals
-start the edit list, and corrections and connective repairs are added to it. Complete the reasoning
+start the edit list, and corrections and connective repairs are added to it; edits
+must not overlap, so a connective repair at a removal is made in that removal's
+entry. Complete the reasoning
 and answer edits, then run correctness checks, rendered-token validation, and
 likelihood scoring. Do not dispatch the adversarial reasoning reviewer unless
 the complete candidate passes those checks and the agreed likelihood threshold.

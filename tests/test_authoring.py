@@ -420,5 +420,43 @@ class SaveTests(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), before)
 
 
+class ReplaceRowTests(unittest.TestCase):
+    def test_rewrite_changes_only_the_target_and_requires_a_unique_hash(self):
+        rr = _load("replace_row")
+        data = b"a\nb\nc\n"
+        h = rr.line_hash(b"b")
+        self.assertEqual(rr.rewrite(data, h, b"B")[0], b"a\nB\nc\n")
+        self.assertEqual(rr.rewrite(data, h)[0], b"a\nc\n")
+        with self.assertRaises(ValueError):  # the same line twice: ambiguous target
+            rr.rewrite(b"b\nb\n", h, b"B")
+        with self.assertRaises(ValueError):  # no such line
+            rr.rewrite(data, rr.line_hash(b"z"), b"B")
+
+    def test_replaced_line_matches_dataset_save_serialization(self):
+        import subprocess
+        import sys
+        sys.path.insert(0, str(ROOT.parent))
+        from dataset.io import append_examples
+        rr = _load("replace_row")
+        old = rr.build_example("p", "r", "a")
+        new = rr.build_example("p", "r é  ", "fixed")
+        with tempfile.TemporaryDirectory() as d:
+            base = pathlib.Path(d)
+            dest, ref = base / "dest.jsonl", base / "ref.jsonl"
+            append_examples(dest, [old, rr.build_example("q", "r", "a")])
+            append_examples(ref, [new])
+            (base / "p.txt").write_text("p", encoding="utf-8")
+            (base / "r.txt").write_text("r é  ", encoding="utf-8")
+            (base / "a.txt").write_text("fixed", encoding="utf-8")
+            target = rr.line_hash(dest.read_bytes().split(b"\n")[0])
+            proc = subprocess.run([sys.executable, str(ROOT / "replace_row.py"), target, str(base / "p.txt"),
+                                   str(base / "r.txt"), str(base / "a.txt"), "--destination", str(dest)],
+                                  capture_output=True, text=True, cwd=ROOT.parent)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = dest.read_bytes().split(b"\n")
+            self.assertEqual(lines[0], ref.read_bytes().rstrip(b"\n"))
+            self.assertEqual(len([x for x in lines if x]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
