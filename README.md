@@ -993,8 +993,8 @@ training only when that rendering matches the training template. See
 [SFT reasoning supervision](#sft-reasoning-supervision) for training on the
 saved reasoning field.
 
-Independent generations can run concurrently within the endpoint's capacity;
-the agent launches separate `generate` requests, and concurrency is orchestrated
+Independent generations can run concurrently within the endpoint's capacity and
+are processed as each one completes; the agent launches separate `generate` requests, and concurrency is orchestrated
 by the caller, not a batch option on `generate`. Keep saves to the same
 destination sequential, including saves from other processes or the browser.
 
