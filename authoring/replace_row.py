@@ -1,15 +1,17 @@
 """Replace or delete exactly one existing row of the destination dataset.
 
-Usage: python authoring/replace_row.py LINE_SHA256 PROMPT.txt REASONING.txt|- ANSWER.txt --destination PATH
+Usage: python authoring/replace_row.py LINE_SHA256 PROMPT.txt REASONING.txt|- ANSWER.txt --destination PATH [--config TOML]
        python authoring/replace_row.py LINE_SHA256 --delete --destination PATH
 
 LINE_SHA256 identifies the row by the SHA256 of its current line, taken as the
 line's UTF-8 bytes without the trailing LF. The run fails unless exactly one
 line has that hash, so a row that changed since it was read is never touched.
 Replacement inputs match save.py: texts are read with config.read_prompt and
-config.read_field, "-" means an answer-only row, and an answer that begins
-with whitespace is rejected. The new line uses the serialization of
-`dataset save` (json.dumps with ensure_ascii=False; keys messages, reasoning).
+config.read_field, "-" means an answer-only row (accepted only when
+`allow_answer_only_rows` is true in dataset-authoring.toml; an empty reasoning
+file is always an error), and an answer that begins with whitespace is
+rejected. The new line uses the serialization of `dataset save` (json.dumps
+with ensure_ascii=False; keys messages, reasoning).
 
 The complete new file is computed in memory and checked before publication:
 every other line is byte-identical and in order, the row count is unchanged
@@ -91,6 +93,7 @@ def main():
     ap.add_argument("--delete", action="store_true")
     ap.add_argument("--destination", required=True,
                     help="the session's destination JSONL; relative paths use the working directory")
+    ap.add_argument("--config", help="path to dataset-authoring.toml; read for the answer-only policy, not the destination")
     args = ap.parse_args()
     texts = [args.prompt, args.reasoning, args.answer]
     if args.delete == any(t is not None for t in texts) or (not args.delete and None in texts):
@@ -103,8 +106,10 @@ def main():
 
     new_line = example = None
     if not args.delete:
+        # The config is loaded only for a replacement: deletion has no row to check.
+        cfg = config.load(args.config)
         prompt = config.read_prompt(args.prompt)
-        reasoning = None if args.reasoning == "-" else config.read_field(args.reasoning)
+        reasoning = config.read_reasoning(args.reasoning, cfg)
         answer = config.read_field(args.answer)
         if answer != answer.lstrip():
             raise SystemExit("answer begins with whitespace; the editing contract requires removing it")

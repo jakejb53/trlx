@@ -199,6 +199,7 @@ class ReuseTests(unittest.TestCase):
 # A complete minimal dataset-authoring.toml; endpoints point at a closed port and
 # every test replaces the network or subprocess call before it would be made.
 _CONFIG = """destination = "{dest}"
+allow_answer_only_rows = {allow}
 max_full_sequence_tokens = 4096
 [generation]
 endpoint = "http://127.0.0.1:9/v1"
@@ -230,9 +231,9 @@ add_special_tokens = false
 """
 
 
-def _write_config(d, dest="unused.jsonl"):
+def _write_config(d, dest="unused.jsonl", allow_answer_only_rows=False):
     p = pathlib.Path(d) / "cfg.toml"
-    p.write_text(_CONFIG.format(dest=dest), encoding="utf-8")
+    p.write_text(_CONFIG.format(dest=dest, allow="true" if allow_answer_only_rows else "false"), encoding="utf-8")
     return str(p)
 
 
@@ -372,7 +373,7 @@ class MakeReviewPromptTests(unittest.TestCase):
 class SaveTests(unittest.TestCase):
     """save.py against the real `dataset save` command and a temporary destination."""
 
-    def _save(self, d, prompt, reasoning, answer):
+    def _save(self, d, prompt, reasoning, answer, allow_answer_only_rows=False):
         import subprocess
         import sys
         base = pathlib.Path(d)
@@ -382,7 +383,7 @@ class SaveTests(unittest.TestCase):
         if reasoning is not None:
             (base / "r.txt").write_text(reasoning, encoding="utf-8")
             r = str(base / "r.txt")
-        cfg = _write_config(d, dest=str(base / "dest.jsonl"))
+        cfg = _write_config(d, dest=str(base / "dest.jsonl"), allow_answer_only_rows=allow_answer_only_rows)
         return subprocess.run([sys.executable, str(ROOT / "save.py"), str(base / "p.txt"), r, str(base / "a.txt"),
                                "--config", cfg], capture_output=True, text=True, cwd=ROOT.parent)
 
@@ -414,11 +415,27 @@ class SaveTests(unittest.TestCase):
         import json
         with tempfile.TemporaryDirectory() as d:
             dest, _ = self._seed(d)
-            proc = self._save(d, "Ask.", None, "Only an answer.")
+            proc = self._save(d, "Ask.", None, "Only an answer.", allow_answer_only_rows=True)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             row = json.loads(dest.read_bytes().decode("utf-8").splitlines()[-1])
         self.assertNotIn("reasoning", row)
         self.assertEqual(row["messages"][1]["content"], "Only an answer.")
+
+    def test_answer_only_row_rejected_when_not_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest, before = self._seed(d)
+            proc = self._save(d, "Ask.", None, "Only an answer.")
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("allow_answer_only_rows", proc.stderr)
+            self.assertEqual(dest.read_bytes(), before)
+
+    def test_empty_reasoning_file_rejected_even_when_answer_only_allowed(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest, before = self._seed(d)
+            proc = self._save(d, "Ask.", "\n", "Answer.", allow_answer_only_rows=True)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("reasoning is empty", proc.stderr)
+            self.assertEqual(dest.read_bytes(), before)
 
     def test_leading_whitespace_answer_rejected_before_saving(self):
         with tempfile.TemporaryDirectory() as d:
@@ -459,12 +476,35 @@ class ReplaceRowTests(unittest.TestCase):
             (base / "a.txt").write_text("fixed", encoding="utf-8")
             target = rr.line_hash(dest.read_bytes().split(b"\n")[0])
             proc = subprocess.run([sys.executable, str(ROOT / "replace_row.py"), target, str(base / "p.txt"),
-                                   str(base / "r.txt"), str(base / "a.txt"), "--destination", str(dest)],
+                                   str(base / "r.txt"), str(base / "a.txt"), "--destination", str(dest),
+                                   "--config", _write_config(d)],
                                   capture_output=True, text=True, cwd=ROOT.parent)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             lines = dest.read_bytes().split(b"\n")
             self.assertEqual(lines[0], ref.read_bytes().rstrip(b"\n"))
             self.assertEqual(len([x for x in lines if x]), 2)
+
+    def test_answer_only_replacement_rejected_when_not_allowed(self):
+        import subprocess
+        import sys
+        sys.path.insert(0, str(ROOT.parent))
+        from dataset.io import append_examples
+        rr = _load("replace_row")
+        with tempfile.TemporaryDirectory() as d:
+            base = pathlib.Path(d)
+            dest = base / "dest.jsonl"
+            append_examples(dest, [rr.build_example("p", "r", "a")])
+            before = dest.read_bytes()
+            (base / "p.txt").write_text("p", encoding="utf-8")
+            (base / "a.txt").write_text("fixed", encoding="utf-8")
+            target = rr.line_hash(before.split(b"\n")[0])
+            proc = subprocess.run([sys.executable, str(ROOT / "replace_row.py"), target, str(base / "p.txt"),
+                                   "-", str(base / "a.txt"), "--destination", str(dest),
+                                   "--config", _write_config(d)],
+                                  capture_output=True, text=True, cwd=ROOT.parent)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("allow_answer_only_rows", proc.stderr)
+            self.assertEqual(dest.read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,10 @@ The saved row is the untouched text and the baseline. Edits follow "Edit the
 original" in `DATASET-AUTHORING.md`, including "Remove waste"; where it calls for
 the reviewer or regeneration, the user's ruling takes their place.
 
+When `allow_answer_only_rows` is false in `dataset-authoring.toml`, a row
+whose reasoning is entirely waste cannot be kept and cannot be repaired; the
+ruling is delete.
+
 ## Each row
 
 1. **Read.** Run the script in "Step 1 script", replacing `DESTINATION` and `N`. It writes
@@ -47,13 +51,19 @@ the reviewer or regeneration, the user's ruling takes their place.
    the fact or requirement it violates, and whether it was checked against a
    source or remains unverified. Do not fix anything yet. Draft how to validate
    the row's correctness with what is available.
-3. **Present and decide.** Show the prompt, reasoning, and answer verbatim
-   (fenced, per `DATASET-AUTHORING.md`), then the `span_report.py` output, each
-   label with its reason, the correctness findings, and the proposed
-   validation. Wait for the user's decision: keep, delete, or repair. Keep
-   leaves the row unchanged; delete runs step 8's delete command; repair
-   continues with step 4 using the validation plan as agreed or amended by the
-   user.
+3. **Present and decide.** Open with "Row N, step 3 of 8: decide whether to
+   repair", where N is the row's current line number. Then give conclusions
+   before anything else: accuracy (correct, or each defect with its severity
+   and whether a local edit fixes it); reasoning quality (whether it
+   demonstrates understanding, the waste share, whether it fits the budget
+   after removal); response quality (completeness against the prompt's
+   requests, waste); and a verdict with a recommendation and its one-line
+   reason. Then show the prompt, reasoning, and answer verbatim (fenced, per
+   `DATASET-AUTHORING.md`), the `span_report.py` output, each label with its
+   reason, the correctness findings, and the proposed validation. Ask:
+   "Repair, keep, or delete this row?" Keep leaves the row unchanged; delete
+   runs step 8's delete command; repair continues with step 4 using the
+   validation plan as agreed or amended by the user.
 4. **Validate.** Prefer execution; run code only in `$D` or a container. Record
    what was executed, what was checked against sources, and what remains
    unverified.
@@ -67,18 +77,22 @@ the reviewer or regeneration, the user's ruling takes their place.
    the candidate (`$D/prompt.txt $D/edited/reasoning.txt $D/edited/answer.txt`),
    and the saved reasoning with the edited answer. Report the token counts
    against the limit and the log-probability differences; no threshold applies.
-7. **Present and wait.** Report the waste removals, the correctness findings
-   and fixes, what was validated, the measurements, and the path of
-   `$D/diff.txt`, and show the candidate's prompt, reasoning, and answer
-   verbatim (fenced, per `DATASET-AUTHORING.md`). Replacing a row drops
-   trailing newlines its fields may end
-   with; the template ignores them. Wait for the user's ruling: replace, delete,
-   or leave the row unchanged.
-8. **Carry out the ruling.** If it changes the candidate, rebuild, re-measure,
-   present, and wait for approval. A prompt change also changes the candidate:
-   write the new prompt to `$D/edited/prompt.txt` and use it in place of
-   `$D/prompt.txt` when measuring and replacing. A ruling to replace or delete
-   is the approval; then run
+7. **Present and wait.** Open with "Row N, step 7 of 8: approve the row
+   update." State that the user chose repair at step 3, that steps 4 to 6
+   validated, edited, and measured the row, and that approval here authorizes
+   writing the candidate over the saved row. Then give conclusions: what was
+   validated by execution and by source, the edits made, the measurements
+   against the limit and the log-probability differences, the path of
+   `$D/diff.txt`, and a recommendation with its one-line reason. Then show the
+   candidate's prompt, reasoning, and answer verbatim (fenced, per
+   `DATASET-AUTHORING.md`). Replacing a row drops trailing newlines its fields
+   may end with; the template ignores them. Ask: "Approve this row update?"
+   If the user declines, ask: "Leave the original row in place or remove it?"
+8. **Carry out the ruling.** If the user asks for changes to the candidate,
+   rebuild, re-measure, and return to step 7. A prompt change also changes the
+   candidate: write the new prompt to `$D/edited/prompt.txt` and use it in
+   place of `$D/prompt.txt` when measuring and replacing. Approval of the
+   update, or a decision to remove the original, is the approval; then run
    `python authoring/replace_row.py $(cat $D/line.sha256) $D/prompt.txt $D/edited/reasoning.txt $D/edited/answer.txt --destination DESTINATION`
    or `python authoring/replace_row.py $(cat $D/line.sha256) --delete --destination DESTINATION`, and
    report its output. After a deletion, later rows move up one line. After any

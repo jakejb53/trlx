@@ -2,8 +2,10 @@
 
 Usage: python authoring/save.py PROMPT.txt REASONING.txt|- ANSWER.txt [--config TOML]
 
-Arguments match count_score.py; pass "-" for an answer-only row. Texts are read
-with config.read_prompt and config.read_field, the same readers count_score.py
+Arguments match count_score.py; pass "-" for an answer-only row, which is
+accepted only when `allow_answer_only_rows` is true in dataset-authoring.toml.
+An empty reasoning file is always an error. Texts are read with
+config.read_prompt and config.read_field, the same readers count_score.py
 uses, so the saved row is exactly the text that was scored. The destination is
 `destination` in dataset-authoring.toml.
 
@@ -41,7 +43,7 @@ def main():
     if not dest.is_absolute():
         dest = config.REPO / dest
     prompt = config.read_prompt(args.prompt)
-    reasoning = None if args.reasoning == "-" else config.read_field(args.reasoning)
+    reasoning = config.read_reasoning(args.reasoning, cfg)
     answer = config.read_field(args.answer)
     if answer != answer.lstrip():
         raise SystemExit("answer begins with whitespace; the editing contract requires removing it")

@@ -45,6 +45,13 @@ class Config:
     def context_window(self):
         return int(self.get("probes.server_max_model_len"))
 
+    @property
+    def allow_answer_only_rows(self):
+        value = self.get("allow_answer_only_rows")
+        if not isinstance(value, bool):
+            raise SystemExit(f"{self.path}: allow_answer_only_rows must be true or false, not {value!r}")
+        return value
+
 
 def load(path=None):
     p = pathlib.Path(path) if path else DEFAULT_PATH
@@ -70,3 +77,22 @@ def read_field(path):
     text that is scored and the text that is saved cannot diverge.
     """
     return pathlib.Path(path).read_text(encoding="utf-8").strip("\n")
+
+
+def read_reasoning(arg, cfg):
+    """Read a reasoning argument under the dataset's answer-only policy.
+
+    "-" declares an answer-only row and is the only way to declare one; it is
+    accepted only when `allow_answer_only_rows` is true. A reasoning file that
+    reads as empty is always an error, because an empty file is more likely a
+    mistake than a declaration. save.py and replace_row.py both go through this
+    function so the two write paths enforce one policy.
+    """
+    if arg == "-":
+        if not cfg.allow_answer_only_rows:
+            raise SystemExit(f"{cfg.path}: allow_answer_only_rows is false; an answer-only row cannot be saved")
+        return None
+    reasoning = read_field(arg)
+    if not reasoning:
+        raise SystemExit(f"{arg}: reasoning is empty; pass - to declare an answer-only row")
+    return reasoning
