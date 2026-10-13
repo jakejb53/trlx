@@ -72,11 +72,13 @@ ruling is delete.
    commands". After changing the labels, run step 2's `span_report.py` command
    first; after any change to the labels, `capitalize.json`, or fixes, run the
    build commands again. Read the edited text and re-run the correctness checks.
-6. **Measure.** Run `python authoring/count_score.py PROMPT REASONING ANSWER --score`
-   for the saved row (`$D/prompt.txt $D/raw.reasoning.txt $D/raw.answer.txt`),
-   the candidate (`$D/prompt.txt $D/edited/reasoning.txt $D/edited/answer.txt`),
-   and the saved reasoning with the edited answer. Report the token counts
-   against the limit and the log-probability differences; no threshold applies.
+6. **Measure.** Run
+   `python authoring/shift_report.py $D/prompt.txt $D/raw.reasoning.txt $D/raw.answer.txt $D/edited/reasoning.txt $D/edited/answer.txt`
+   and report its output verbatim: the candidate's rendered token count
+   against the limit and the shifts in mean log-probability, candidate minus
+   saved row, for reasoning, answer, combined, and the edited answer under the
+   saved reasoning. It prints no absolute log-probabilities; no threshold
+   applies.
 7. **Present and wait.** Open with "Row N, step 7 of 8: approve the row
    update." State that the user chose repair at step 3, that steps 4 to 6
    validated, edited, and measured the row, and that approval here authorizes

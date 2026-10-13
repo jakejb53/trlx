@@ -318,6 +318,86 @@ class PromptReadingTests(unittest.TestCase):
         self.assertEqual(seen, {"prompt": "What now?", "reasoning": "Think.", "answer": "Answer."})
 
 
+class ShiftReportTests(unittest.TestCase):
+    """shift_report.py must print shifts (candidate minus saved), never absolutes, and skip the
+    fixed-context scoring when the reasoning is unchanged."""
+
+    def _run(self, d, saved_r, edited_r, measures):
+        import io
+        import sys
+        from contextlib import redirect_stdout
+        from unittest import mock
+        sr = _load("shift_report")
+        base = pathlib.Path(d)
+        files = {}
+        for name, text in [("p", "Ask."), ("sr", saved_r), ("sa", "Saved answer."),
+                           ("er", edited_r), ("ea", "Edited answer.")]:
+            if text is None:
+                files[name] = "-"
+                continue
+            (base / f"{name}.txt").write_text(text, encoding="utf-8")
+            files[name] = str(base / f"{name}.txt")
+        calls = []
+
+        def fake_measure(cfg, prompt, reasoning, answer):
+            calls.append((reasoning, answer))
+            return measures[(reasoning, answer)]
+
+        argv = ["shift_report.py", files["p"], files["sr"], files["sa"], files["er"], files["ea"],
+                "--config", _write_config(d)]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sr, "measure", fake_measure), \
+                redirect_stdout(out):
+            code = sr.main()
+        return code, out.getvalue().splitlines(), calls
+
+    def test_shifts_are_candidate_minus_saved_with_fixed_context_line(self):
+        measures = {
+            ("Think.", "Saved answer."): (100, {"reasoning": (-0.8, 10), "answer": (-0.4, 20), "both": (-0.5333, 30)}),
+            ("Think more.", "Edited answer."): (110, {"reasoning": (-0.85, 12), "answer": (-0.41, 21), "both": (-0.57, 33)}),
+            ("Think.", "Edited answer."): (101, {"reasoning": (-0.8, 10), "answer": (-0.405, 21), "both": (-0.53, 31)}),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            code, lines, calls = self._run(d, "Think.\n", "Think more.\n", measures)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(lines, [
+            "candidate_rendered_tokens: 110 (limit 4096, FITS)",
+            "shift[reasoning]: -0.0500 (10 -> 12 tokens)",
+            "shift[answer]: -0.0100 (20 -> 21 tokens)",
+            "shift[both]: -0.0367 (30 -> 33 tokens)",
+            "shift[answer, saved reasoning]: -0.0050 (20 -> 21 tokens)",
+        ])
+        self.assertFalse(any("mean_logprob" in line for line in lines))
+
+    def test_unchanged_reasoning_skips_fixed_context_scoring_and_over_limit_exits_2(self):
+        measures = {
+            ("Think.", "Saved answer."): (100, {"reasoning": (-0.8, 10), "answer": (-0.4, 20), "both": (-0.5333, 30)}),
+            ("Think.", "Edited answer."): (5000, {"reasoning": (-0.8, 10), "answer": (-0.42, 22), "both": (-0.54, 32)}),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            code, lines, calls = self._run(d, "Think.\n", "\nThink.\n", measures)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(lines[0], "candidate_rendered_tokens: 5000 (limit 4096, OVER by 904)")
+        self.assertEqual(lines[1], "shift[reasoning]: +0.0000 (10 -> 10 tokens)")
+        self.assertEqual(lines[-1], "shift[answer, saved reasoning]: same as candidate (reasoning unchanged)")
+
+    def test_missing_reasoning_span_is_na(self):
+        measures = {
+            (None, "Saved answer."): (50, {"answer": (-0.4, 20)}),
+            ("Think.", "Edited answer."): (60, {"reasoning": (-0.9, 10), "answer": (-0.41, 21), "both": (-0.57, 31)}),
+            (None, "Edited answer."): (51, {"answer": (-0.405, 21)}),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            code, lines, calls = self._run(d, None, "Think.\n", measures)
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[1], "shift[reasoning]: n/a")
+        self.assertEqual(lines[2], "shift[answer]: -0.0100 (20 -> 21 tokens)")
+        self.assertEqual(lines[3], "shift[both]: n/a")
+        self.assertEqual(lines[4], "shift[answer, saved reasoning]: -0.0050 (20 -> 21 tokens)")
+
+
 class MakeReviewPromptTests(unittest.TestCase):
     RAW = {"reasoning": "Line one.\nLine two.\nLine three.\n",
            "answer": "Alpha.\nB\nC\nD\nE\nF\nUntouched closing sentence.\n"}
