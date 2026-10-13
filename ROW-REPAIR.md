@@ -32,10 +32,8 @@ the reviewer or regeneration, the user's ruling takes their place.
    `prompt.txt`, `raw.json`, `raw.reasoning.txt`, `raw.answer.txt`, and
    `line.sha256` into `authoring-work/repair/line-N-<hash prefix>/` and prints
    that directory. Keep these files: after a replacement they are the only copy
-   of the row. Show the prompt, reasoning, and answer verbatim and wait for the
-   user's decision: keep, delete, or repair. Repair continues with step 2; keep
-   leaves the row unchanged; delete runs step 8's delete command.
-2. **Remove waste.** Read `REASONING-EDIT-REMINDER.md`, then the whole row.
+   of the row.
+2. **Analyze.** Read `REASONING-EDIT-REMINDER.md`, then the whole row.
    Label the waste in `$D/labels.json`. Each repetition label's reason names the
    earlier passage it repeats. Each beyond-prompt label's reason names the
    prompt's requests and states that the section serves none of them. When a
@@ -45,8 +43,17 @@ the reviewer or regeneration, the user's ruling takes their place.
    the next word, even if its text is unique, and add the anchor to
    `$D/capitalize.json` (a list; `[]` if none). Then run
    `python authoring/span_report.py $D/prompt.txt $D/raw.json $D/labels.json --edits-out $D/removals.json`.
-3. **Agree on validation.** Propose how to validate the row's correctness with
-   what is available, and wait for the user's agreement.
+   Review the row for correctness: for each suspected defect, record the span,
+   the fact or requirement it violates, and whether it was checked against a
+   source or remains unverified. Do not fix anything yet. Draft how to validate
+   the row's correctness with what is available.
+3. **Present and decide.** Show the prompt, reasoning, and answer verbatim
+   (fenced, per `DATASET-AUTHORING.md`), then the `span_report.py` output, each
+   label with its reason, the correctness findings, and the proposed
+   validation. Wait for the user's decision: keep, delete, or repair. Keep
+   leaves the row unchanged; delete runs step 8's delete command; repair
+   continues with step 4 using the validation plan as agreed or amended by the
+   user.
 4. **Validate.** Prefer execution; run code only in `$D` or a container. Record
    what was executed, what was checked against sources, and what remains
    unverified.
@@ -63,7 +70,8 @@ the reviewer or regeneration, the user's ruling takes their place.
 7. **Present and wait.** Report the waste removals, the correctness findings
    and fixes, what was validated, the measurements, and the path of
    `$D/diff.txt`, and show the candidate's prompt, reasoning, and answer
-   verbatim. Replacing a row drops trailing newlines its fields may end
+   verbatim (fenced, per `DATASET-AUTHORING.md`). Replacing a row drops
+   trailing newlines its fields may end
    with; the template ignores them. Wait for the user's ruling: replace, delete,
    or leave the row unchanged.
 8. **Carry out the ruling.** If it changes the candidate, rebuild, re-measure,
@@ -74,7 +82,7 @@ the reviewer or regeneration, the user's ruling takes their place.
    `python authoring/replace_row.py $(cat $D/line.sha256) $D/prompt.txt $D/edited/reasoning.txt $D/edited/answer.txt --destination DESTINATION`
    or `python authoring/replace_row.py $(cat $D/line.sha256) --delete --destination DESTINATION`, and
    report its output. After a deletion, later rows move up one line. After any
-   ruling, including keep or delete at step 1, ask only whether to move on to
+   ruling, including keep or delete at step 3, ask only whether to move on to
    the next row.
 
 ## Step 1 script

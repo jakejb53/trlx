@@ -17,6 +17,13 @@ When saved values are not accepted or the file is absent, reuse established sess
 
 Autonomous batches are the normal authoring mode. One-at-a-time review is a testing mode. In both modes, every row is shown to the user verbatim and saved only after the user approves it.
 
+Verbatim display: wherever this file or `ROW-REPAIR.md` says to show text
+verbatim, show each field complete, in its own fenced block: a label line
+naming the field (`user`, `reasoning`, `assistant`), a fence line of tildes
+longer than any run of tildes starting a line in the field, the field's exact
+text, and the closing fence. Nothing else goes inside a fence. No field is
+summarized, truncated, or rendered.
+
 Before every autonomous run, ask how many scenarios the user wants in that
 batch. Do not reuse the size of an earlier batch, including when the user
 continues the same topic and settings.
