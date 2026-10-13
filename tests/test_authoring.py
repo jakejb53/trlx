@@ -147,6 +147,15 @@ class SpanReportTests(unittest.TestCase):
         self.assertEqual(len(edits), 2)
         self.assertEqual(edit.apply_edits(raw, edits)["reasoning"], "Wait, A. B. Keep me.")
 
+    def test_beyond_prompt_is_accepted_only_on_answer_labels(self):
+        sr = _load("span_report")
+        fields = {"reasoning": "R1. R2.", "answer": "Asked.\n\n## Extra\nNot asked."}
+        with self.assertRaises(ValueError):
+            sr.locate(fields, [self._lab(" R2.", category="beyond-prompt")])
+        located = sr.locate(fields, [{"field": "answer", "text": "\n\n## Extra\nNot asked.",
+                                      "category": "beyond-prompt", "reason": "r"}])
+        self.assertEqual(sr.removal_edits(located)[0]["new"], "")
+
 
 class CountScoreTests(unittest.TestCase):
     def test_spans_match_template_stripped_fields(self):

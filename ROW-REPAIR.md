@@ -32,11 +32,15 @@ the reviewer or regeneration, the user's ruling takes their place.
    `prompt.txt`, `raw.json`, `raw.reasoning.txt`, `raw.answer.txt`, and
    `line.sha256` into `authoring-work/repair/line-N-<hash prefix>/` and prints
    that directory. Keep these files: after a replacement they are the only copy
-   of the row.
+   of the row. Show the prompt, reasoning, and answer verbatim and wait for the
+   user's decision: keep, delete, or repair. Repair continues with step 2; keep
+   leaves the row unchanged; delete runs step 8's delete command.
 2. **Remove waste.** Read `REASONING-EDIT-REMINDER.md`, then the whole row.
    Label the waste in `$D/labels.json`. Each repetition label's reason names the
-   earlier passage it repeats. When a label's text is not unique, give it an
-   `anchor` that extends into the following words. When a removal leaves a
+   earlier passage it repeats. Each beyond-prompt label's reason names the
+   prompt's requests and states that the section serves none of them. When a
+   label's text is not unique, give it an `anchor` that extends into the
+   following words. When a removal leaves a
    sentence starting in lowercase, give that label an anchor that extends into
    the next word, even if its text is unique, and add the anchor to
    `$D/capitalize.json` (a list; `[]` if none). Then run
@@ -58,7 +62,8 @@ the reviewer or regeneration, the user's ruling takes their place.
    against the limit and the log-probability differences; no threshold applies.
 7. **Present and wait.** Report the waste removals, the correctness findings
    and fixes, what was validated, the measurements, and the path of
-   `$D/diff.txt`. Replacing a row drops trailing newlines its fields may end
+   `$D/diff.txt`, and show the candidate's prompt, reasoning, and answer
+   verbatim. Replacing a row drops trailing newlines its fields may end
    with; the template ignores them. Wait for the user's ruling: replace, delete,
    or leave the row unchanged.
 8. **Carry out the ruling.** If it changes the candidate, rebuild, re-measure,
@@ -68,8 +73,9 @@ the reviewer or regeneration, the user's ruling takes their place.
    is the approval; then run
    `python authoring/replace_row.py $(cat $D/line.sha256) $D/prompt.txt $D/edited/reasoning.txt $D/edited/answer.txt --destination DESTINATION`
    or `python authoring/replace_row.py $(cat $D/line.sha256) --delete --destination DESTINATION`, and
-   report its output. After a deletion, later rows move up one line. Then ask
-   for the next row.
+   report its output. After a deletion, later rows move up one line. After any
+   ruling, including keep or delete at step 1, ask only whether to move on to
+   the next row.
 
 ## Step 1 script
 

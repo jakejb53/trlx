@@ -10,10 +10,12 @@ for edit.py. LABELS.json is a list of waste spans, one object each:
   text             the exact waste text, of any size from a hedge word to a passage
   anchor           optional: a longer string containing text exactly once, used
                    when text alone is not unique in the field (hedge fragments)
-  category         one of CATEGORIES below
+  category         one of CATEGORIES below; "beyond-prompt" (a whole answer
+                   section that serves none of the prompt's requests) is
+                   accepted only on answer labels
   reason           one line
   retained         optional bool: kept because removal, even with a connective
-                   repair, would leave the retained reasoning incoherent
+                   repair, would leave the retained reasoning or answer incoherent
   retain_reason    required when retained is true
   error_introduced optional bool: the span withdraws a correct result
 
@@ -22,7 +24,7 @@ in the untouched field, every text occurs exactly once in its anchor, and no
 two spans overlap. Token counts use the scoring endpoint's echoed offsets over
 the complete rendered example, so they are counted in context. The reasoning
 budget is the token limit minus every rendered token outside the reasoning
-span; it assumes the untouched answer, so a later answer change moves it.
+span, after the answer's waste removals; a later answer correction moves it.
 
 --edits-out writes the removals of non-retained spans in edit.py's format
 (old = anchor or text, new = the same with the waste text deleted). Corrections
@@ -38,7 +40,10 @@ import config  # noqa: E402
 from count_score import post, render, spans  # noqa: E402
 
 CATEGORIES = ("repetition", "abandoned-draft", "same-route-reverification",
-              "rereading", "write-up-narration", "hedge")
+              "rereading", "write-up-narration", "hedge", "beyond-prompt")
+# A whole answer section that serves none of the prompt's requests is waste only in
+# the answer; reasoning may explore beyond the request, so the category is rejected there.
+ANSWER_ONLY = ("beyond-prompt",)
 
 
 def locate(fields, labels):
@@ -58,6 +63,8 @@ def locate(fields, labels):
             raise ValueError(f"{where}: text must be a nonempty string")
         if lab.get("category") not in CATEGORIES:
             raise ValueError(f"{where}: category must be one of {CATEGORIES}")
+        if lab["category"] in ANSWER_ONLY and field != "answer":
+            raise ValueError(f"{where}: category {lab['category']!r} applies only to the answer")
         if not isinstance(lab.get("reason"), str) or not lab["reason"].strip():
             raise ValueError(f"{where}: reason is required")
         if lab.get("retained") and not str(lab.get("retain_reason", "")).strip():
@@ -133,7 +140,6 @@ def main():
     offs = token_offsets(cfg, rendered)
     r0, r1 = sp["reasoning"]
     reasoning_tokens = count_in(offs, r0, r1)
-    budget = cfg.limit - (count - reasoning_tokens)
 
     removed = {"reasoning": 0, "answer": 0}
     by_cat, flagged = {}, []
@@ -157,8 +163,12 @@ def main():
     print(f"reasoning tokens: {reasoning_tokens}; waste removed: {removed['reasoning']} ({share:.0%}); "
           f"remaining: {remaining}")
     print(f"answer waste removed: {removed['answer']} tokens")
-    print(f"reasoning budget: {budget} (limit {cfg.limit} minus {count - reasoning_tokens} rendered tokens "
-          f"outside the reasoning, untouched answer); remaining reasoning "
+    # Answer compression happens before fitting, so the budget counts the answer
+    # after its waste removals; later answer corrections still move it.
+    outside = count - reasoning_tokens - removed["answer"]
+    budget = cfg.limit - outside
+    print(f"reasoning budget: {budget} (limit {cfg.limit} minus {outside} rendered tokens "
+          f"outside the reasoning, after answer waste removal); remaining reasoning "
           f"{'FITS' if remaining <= budget else 'EXCEEDS the budget by ' + str(remaining - budget)}")
     for lab in flagged:
         print(f"ERROR INTRODUCED: {lab['text'][:100]!r}: {lab['reason']}")

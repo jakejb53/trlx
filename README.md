@@ -917,8 +917,9 @@ session settings from `dataset-authoring.toml` (endpoint, model, destination,
 full-sequence token limit, and the tokenizer and scoring probes for the model),
 confirms them, and asks for the topic, the batch size, the likelihood acceptance
 policy, whether to use Context-assisted generation, and how to dispatch the
-reviewer. Approval of the scenario list then authorizes the whole batch without
-per-row approval.
+reviewer. Approval of the scenario list then authorizes generating and editing
+the whole batch; each finished row is shown to the user and saved only after the
+user approves it.
 
 ### How a row is made
 
@@ -936,9 +937,9 @@ per-row approval.
 4. **Review.** An adversarial reviewer compares the untouched and edited
    reasoning against the contract and rules `ACCEPT` or `REVISE`. The ruling is
    binding.
-5. **Save and verify.** `dataset save` appends the row; the agent confirms the
-   saved fields match the scored candidate byte for byte and that earlier rows
-   are unchanged.
+5. **Save and verify.** After the user approves the row, `dataset save` appends
+   it; the agent confirms the saved fields match the scored candidate byte for
+   byte and that earlier rows are unchanged.
 
 When an edited example still exceeds the token limit, the "Fitting the token
 limit" rule in DATASET-AUTHORING.md applies: regenerate with a better Context or a
