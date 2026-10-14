@@ -1,0 +1,100 @@
+# Four-layer proxy of DeepSeek-V4-Flash-0731 on two GPUs for the QAT gate.
+# Layers 0-3 of the real checkpoint (sliding-window, compressor+indexer,
+# compressor-only, hash and scored routing); MTP disabled. Backends avoid every
+# optional native dependency: torch dispatcher, torch_mm experts, sdpa attention.
+# The mock dataset supplies token ids only; stage 2 is a forward parity check.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 2
+  local_batch_size: 1
+  ckpt_every_steps: 1000
+  val_every_steps: 1000
+  max_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+    name_or_path: deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+    num_hidden_layers: 4
+    num_nextn_predict_layers: 0
+    use_cache: false
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: torch
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: deepseek/exports/proxy-checkpoints/
+  # Flash-0731 is quantized: FP8 projections and FP4 experts are dequantized at load.
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 2
+  sequence_parallel: false
+  activation_checkpointing: false
+  pipeline:
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: false
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 16
+  mean_len: 255
+  std_len: 0
+  vocab_size: 129280
+  max_sentence_len: 256
+  seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.mock.build_unpacked_dataset
+  num_sentences: 4
+  mean_len: 255
+  std_len: 0
+  vocab_size: 129280
+  max_sentence_len: 256
+  seed: 7
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]

@@ -12,5 +12,8 @@ data/
 dataset-authoring.toml
 contexts/
 endpoint-responses/
-.codex
 authoring-work/
+deepseek/automodel/
+deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/
+deepseek/exports/
+deepseek/venv/
