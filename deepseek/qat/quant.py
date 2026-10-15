@@ -17,6 +17,15 @@ tensors by ``deepseek.qat.roundtrip``:
 - element = round_to_nearest_even(clamp(value / scale, -format_max, format_max));
 - FP4 code = sign<<3 | exponent<<1 | mantissa, element 2k in the low nibble.
 
+FP4 scale selection for training (``scale_rule="min_error"``): the floor rule
+puts a released group's largest element (code 4) at the bottom of its scale bin,
+so any downward move halves the scale and saturates that element from 4s to 3s.
+``min_error`` also quantizes each group at twice the floor-rule scale and keeps
+whichever has the smaller float32 sum of squared errors, ties to the floor rule.
+Released groups have zero error at their own scale and are a fixed point of the
+rule; the forward, flip metric, and export all use it through
+``deepseek.qat.fakequant.quantize_fp4``.
+
 Everything is pure PyTorch and runs on CPU or GPU. Inputs are computed in
 float32 regardless of their storage dtype, as the reference kernels do.
 """
@@ -93,10 +102,14 @@ def fp8_block_scale(amax: torch.Tensor, amax_floor: float) -> tuple[torch.Tensor
 # FP4 group scale: 2**(floor(log2(amax)) - 2), the OCP MX rule the released
 # expert weights follow. Elements above 6*scale saturate. The exponent is
 # clamped at -127 so an all-zero group gets the smallest E8M0 value.
-def fp4_group_scale(amax: torch.Tensor, amax_floor: float) -> tuple[torch.Tensor, torch.Tensor]:
+def fp4_group_exponent(amax: torch.Tensor, amax_floor: float) -> torch.Tensor:
     if amax_floor > 0:
         amax = amax.clamp_min(amax_floor)
-    return _scale_pair((pow2_floor_exponent(amax) - 2).clamp_min(-127))
+    return (pow2_floor_exponent(amax) - 2).clamp_min(-127)
+
+
+def fp4_group_scale(amax: torch.Tensor, amax_floor: float) -> tuple[torch.Tensor, torch.Tensor]:
+    return _scale_pair(fp4_group_exponent(amax, amax_floor))
 
 
 # Round |q| onto the E2M1 grid {0, .5, 1, 1.5, 2, 3, 4, 6} with ties to even
@@ -144,27 +157,60 @@ def dequantize_fp8_blocks(codes: torch.Tensor, scales: torch.Tensor) -> torch.Te
     return (blocks * scales.float()[:, None, :, None]).reshape(out, inp)
 
 
-def quantize_fp4_rows(w: torch.Tensor, amax_floor: float = 0.0) -> tuple[torch.Tensor, torch.Tensor]:
+# E2M1 magnitudes of `groups` at scale `s` (one scale per group, broadcast over
+# the group axis), after the saturating clamp.
+def _fp4_magnitudes(groups: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    q = (groups / s[..., None]).clamp(-FP4_MAX, FP4_MAX)
+    return round_to_e2m1_magnitude(q.abs())
+
+
+FP4_SCALE_RULES = ("floor", "min_error")
+
+
+def quantize_fp4_rows(w: torch.Tensor, amax_floor: float = 0.0, scale_rule: str = "floor") -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2-D weight to packed E2M1 with UE8M0 scales per 32 input elements.
 
     Returns (packed[out, in/2] uint8 with element 2k in the low nibble,
     scales[out, in/32] float8_e8m0fnu). The sign bit follows the sign of the
     input even when the magnitude rounds to zero, as the hardware cast and the
     released checkpoint do, so -0.0 and small negatives become code 8.
+
+    ``scale_rule`` is ``"floor"`` (the released OCP MX rule) or ``"min_error"``
+    (module docstring): per group, the floor-rule scale or twice it, whichever
+    gives the smaller sum of squared errors, ties to the floor rule.
     """
     if w.ndim != 2 or w.shape[1] % FP4_GROUP:
         raise ValueError(f"FP4 quantization needs a 2-D shape with input dim divisible by {FP4_GROUP}, got {tuple(w.shape)}")
+    if scale_rule not in FP4_SCALE_RULES:
+        raise ValueError(f"unknown FP4 scale rule {scale_rule!r}; expected one of {FP4_SCALE_RULES}")
     _check_finite(w)
     out, inp = w.shape
     groups = w.float().reshape(out, inp // FP4_GROUP, FP4_GROUP)
     amax = groups.abs().amax(dim=-1)
-    s, s_e8m0 = fp4_group_scale(amax, amax_floor)
-    q = (groups / s[..., None]).clamp(-FP4_MAX, FP4_MAX)
-    magnitude = round_to_e2m1_magnitude(q.abs())
+    k0 = fp4_group_exponent(amax, amax_floor)
+    s, s_e8m0 = _scale_pair(k0)
+    magnitude = _fp4_magnitudes(groups, s)
+    if scale_rule == "min_error":
+        # Candidate at twice the scale. Errors are measured against the input in
+        # float32 per group; the doubled scale wins only when strictly better, so
+        # a group already exact at the floor-rule scale (every released group)
+        # keeps it. Where the floor rule saturates a group's largest element the
+        # doubled scale represents it exactly and wins.
+        sign = torch.where(torch.signbit(groups), -1.0, 1.0)
+        err0 = ((magnitude * sign) * s[..., None] - groups).square().sum(dim=-1)
+        s1, _ = _scale_pair(k0 + 1)
+        magnitude1 = _fp4_magnitudes(groups, s1)
+        err1 = ((magnitude1 * sign) * s1[..., None] - groups).square().sum(dim=-1)
+        use1 = err1 < err0
+        magnitude = torch.where(use1[..., None], magnitude1, magnitude)
+        k = torch.where(use1, k0 + 1, k0)
+        s, s_e8m0 = _scale_pair(k)
+        del err0, err1, magnitude1, s1
     codes = _magnitude_to_code(magnitude)
     # Sign bit from the input's sign bit, including -0.0: parity with the
     # reference cast, which the source checkpoint's negative-zero codes confirm.
-    codes = codes | (torch.signbit(q).to(torch.uint8) << 3)
+    # The input's sign bit equals the scaled value's since scales are positive.
+    codes = codes | (torch.signbit(groups).to(torch.uint8) << 3)
     flat = codes.reshape(out, inp)
     packed = flat[:, 0::2] | (flat[:, 1::2] << 4)
     return packed.contiguous(), s_e8m0

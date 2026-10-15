@@ -35,6 +35,16 @@ from deepseek.qat import quant as Q
 # temporaries to a few GB regardless of the local expert count.
 EXPERT_CHUNK = 16
 
+# The FP4 scale rule every training-path quantization uses: the forward here,
+# the flip metric in proxy_step, and export. One constant so they cannot drift.
+# "min_error" avoids the floor rule's knife edge (quant module docstring).
+FP4_SCALE_RULE = "min_error"
+
+
+def quantize_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project FP4 quantizer: quantize_fp4_rows under FP4_SCALE_RULE."""
+    return Q.quantize_fp4_rows(w, scale_rule=FP4_SCALE_RULE)
+
 
 def _fp8_dequant_quant(w: torch.Tensor) -> torch.Tensor:
     codes, scales = Q.quantize_fp8_blocks(w)
@@ -42,7 +52,7 @@ def _fp8_dequant_quant(w: torch.Tensor) -> torch.Tensor:
 
 
 def _fp4_dequant_quant(w: torch.Tensor) -> torch.Tensor:
-    packed, scales = Q.quantize_fp4_rows(w)
+    packed, scales = quantize_fp4(w)
     return Q.dequantize_fp4_rows(packed, scales).to(w.dtype)
 
 

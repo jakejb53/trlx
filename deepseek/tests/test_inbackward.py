@@ -1,0 +1,140 @@
+"""CPU tests for update-in-backward on plain parameters: the hooked path equals a
+normal step with the same clip coefficient, the stored norm is the exact global
+norm, the coefficient lags one step, gradients are freed, the scaling callback
+sees exactly one gradient, and a parameter without a gradient is an error."""
+
+import copy
+import math
+import unittest
+
+import torch
+from torch import nn
+
+from deepseek.qat.inbackward import InBackwardStepper
+from deepseek.qat.optim import LocalShardOptimizer
+
+MAX_NORM = 0.5
+LR = 1e-2
+
+
+def _model() -> nn.Module:
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Linear(16, 32), nn.Tanh(), nn.Linear(32, 8))
+
+
+def _loss(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return model(x).square().mean()
+
+
+def _global_norm(model: nn.Module) -> float:
+    return math.sqrt(sum(float(p.grad.float().square().sum()) for p in model.parameters()))
+
+
+class Equivalence(unittest.TestCase):
+    def setUp(self):
+        self.hooked = _model()
+        self.reference = copy.deepcopy(self.hooked)
+        self.opt_hooked = LocalShardOptimizer(list(self.hooked.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        self.opt_ref = torch.optim.AdamW(self.reference.parameters(), lr=LR, weight_decay=0.0)
+        self.seen = []
+        stepper_self = self
+
+        def scale_grads():
+            stepper_self.seen.append(sum(p.grad is not None for p in stepper_self.hooked.parameters()))
+
+        self.stepper = InBackwardStepper([self.hooked], self.opt_hooked, MAX_NORM, scale_grads)
+        torch.manual_seed(1)
+        self.batches = [torch.randn(4, 16) for _ in range(3)]
+
+    def test_matches_reference_with_lagged_coefficient(self):
+        coef = 1.0
+        for x in self.batches:
+            # Reference: ordinary backward, clip by the previous step's norm, step.
+            self.opt_ref.zero_grad()
+            _loss(self.reference, x).backward()
+            norm = _global_norm(self.reference)
+            for p in self.reference.parameters():
+                p.grad.mul_(coef)
+            self.opt_ref.step()
+
+            # Hooked: the step happens inside backward.
+            _loss(self.hooked, x).backward()
+            self.assertTrue(all(p.grad is None for p in self.hooked.parameters()), "gradients were not freed")
+            reported = self.stepper.end_step()
+            self.assertAlmostEqual(reported, norm, places=5)
+            self.assertAlmostEqual(self.stepper.coef, min(1.0, MAX_NORM / (norm + 1e-6)), places=6)
+            coef = self.stepper.coef
+
+            for a, b in zip(self.hooked.parameters(), self.reference.parameters()):
+                self.assertTrue(torch.equal(a, b))
+        self.assertEqual(self.stepper.step_count, 3)
+        # The scaling callback always ran with exactly one gradient alive.
+        self.assertEqual(set(self.seen), {1})
+        self.assertEqual(len(self.seen), 3 * len(list(self.hooked.parameters())))
+
+    def test_first_step_is_unclipped(self):
+        self.assertEqual(self.stepper.coef, 1.0)
+        _loss(self.hooked, self.batches[0]).backward()
+        norm = self.stepper.end_step()
+        self.assertGreater(norm, MAX_NORM, "test data must produce a norm above the limit")
+        self.assertLess(self.stepper.coef, 1.0)
+
+
+class PerClass(unittest.TestCase):
+    # Two clipping classes split by module name: each class gets its own norm
+    # and coefficient, and the parameters match a reference that clips per class.
+    def test_per_class_coefficients_and_parameters(self):
+        hooked = _model()
+        reference = copy.deepcopy(hooked)
+        opt_h = LocalShardOptimizer(list(hooked.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        opt_r = torch.optim.AdamW(reference.parameters(), lr=LR, weight_decay=0.0)
+        class_of = lambda name: "a" if name.startswith("0.") else "b"
+        tight = 0.05  # below both class norms throughout, so both coefficients are active
+        stepper = InBackwardStepper([hooked], opt_h, tight, lambda: None, class_of=class_of)
+        self.assertEqual(stepper.classes, ["a", "b"])
+        with self.assertRaises(AttributeError):
+            stepper.coef
+        coefs = {"a": 1.0, "b": 1.0}
+        torch.manual_seed(1)
+        for x in [torch.randn(4, 16) for _ in range(3)]:
+            opt_r.zero_grad()
+            _loss(reference, x).backward()
+            norms = {c: math.sqrt(sum(float(p.grad.float().square().sum()) for n, p in reference.named_parameters() if class_of(n) == c)) for c in coefs}
+            for n, p in reference.named_parameters():
+                p.grad.mul_(coefs[class_of(n)])
+            opt_r.step()
+
+            _loss(hooked, x).backward()
+            stepper.end_step()
+            for c in coefs:
+                self.assertAlmostEqual(stepper.last_norms[c], norms[c], places=5)
+                self.assertAlmostEqual(stepper.coefs[c], min(1.0, tight / (norms[c] + 1e-6)), places=6)
+            coefs = dict(stepper.coefs)
+            for a, b in zip(hooked.parameters(), reference.parameters()):
+                self.assertTrue(torch.equal(a, b))
+        # The two classes saw different norms, so the test exercised two coefficients.
+        self.assertNotAlmostEqual(stepper.coefs["a"], stepper.coefs["b"], places=3)
+
+
+class Failures(unittest.TestCase):
+    def test_parameter_without_gradient_is_an_error(self):
+        model = _model()
+        extra = nn.Linear(4, 4)
+        wrapper = nn.ModuleDict({"used": model, "unused": extra})
+        opt = LocalShardOptimizer(list(wrapper.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        stepper = InBackwardStepper([wrapper], opt, MAX_NORM, lambda: None)
+        _loss(model, torch.randn(2, 16)).backward()
+        with self.assertRaisesRegex(RuntimeError, "received no gradient"):
+            stepper.end_step()
+
+    def test_rejects_wrong_optimizer_and_bad_norm(self):
+        model = _model()
+        with self.assertRaises(TypeError):
+            InBackwardStepper([model], torch.optim.AdamW(model.parameters()), MAX_NORM, lambda: None)
+        opt = LocalShardOptimizer(list(model.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        with self.assertRaises(ValueError):
+            InBackwardStepper([model], opt, 0.0, lambda: None)
+
+
+if __name__ == "__main__":
+    unittest.main()

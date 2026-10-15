@@ -192,5 +192,65 @@ class Requantization(unittest.TestCase):
         self.assertTrue(torch.equal(_bits(c_bf), _bits(c_f)) and torch.equal(_bits(s_bf), _bits(s_f)))
 
 
+class MinErrorScaleRule(unittest.TestCase):
+    """scale_rule="min_error": floor-rule scale or twice it, whichever has the
+    smaller group sum of squared errors, ties to the floor rule."""
+
+    S = 2.0**-6
+
+    # One group on the floor-rule grid at scale S whose largest code is 4.
+    def _knife_edge_group(self) -> torch.Tensor:
+        torch.manual_seed(0)
+        codes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0])
+        w = codes[torch.randint(0, 6, (32,))] * self.S
+        w[0] = 4 * self.S
+        return w.unsqueeze(0)
+
+    def _dq(self, w, rule):
+        p, s = Q.quantize_fp4_rows(w, scale_rule=rule)
+        return Q.dequantize_fp4_rows(p, s), float(s.float()[0, 0])
+
+    def test_downward_nudge_keeps_scale_and_value(self):
+        w = self._knife_edge_group()
+        w[0, 0] -= 1e-5
+        floor_dq, floor_scale = self._dq(w, "floor")
+        self.assertEqual(floor_scale, self.S / 2)
+        self.assertEqual(float(floor_dq[0, 0]), 3 * self.S)  # saturated
+        dq, scale = self._dq(w, "min_error")
+        self.assertEqual(scale, self.S)
+        self.assertEqual(float(dq[0, 0]), 4 * self.S)
+
+    def test_genuine_shrink_takes_the_halved_scale_exactly(self):
+        w = self._knife_edge_group()
+        w[0, 0] = 3 * self.S  # representable at both S (code 3) and S/2 (code 6)
+        dq, scale = self._dq(w, "min_error")
+        self.assertEqual(scale, self.S / 2)  # tie -> floor rule, which is S/2 here
+        self.assertTrue(torch.equal(dq, w))
+
+    def test_release_grid_is_a_fixed_point(self):
+        torch.manual_seed(1)
+        raw = torch.randn(64, 256)
+        p0, s0 = Q.quantize_fp4_rows(raw, scale_rule="floor")
+        grid = Q.dequantize_fp4_rows(p0, s0)
+        p1, s1 = Q.quantize_fp4_rows(grid, scale_rule="min_error")
+        self.assertTrue(torch.equal(p1, p0))
+        self.assertTrue(torch.equal(s1.view(torch.uint8), s0.view(torch.uint8)))
+
+    def test_min_error_never_worse_than_floor(self):
+        torch.manual_seed(2)
+        w = torch.randn(32, 1024)
+        for rule in ("floor", "min_error"):
+            p, s = Q.quantize_fp4_rows(w, scale_rule=rule)
+            err = (Q.dequantize_fp4_rows(p, s) - w).square().reshape(32, -1, 32).sum(-1)
+            if rule == "floor":
+                floor_err = err
+        self.assertTrue(bool((err <= floor_err).all()))
+        self.assertTrue(bool((err < floor_err).any()), "random weights should have some saturated groups the doubled scale improves")
+
+    def test_unknown_rule_is_an_error(self):
+        with self.assertRaises(ValueError):
+            Q.quantize_fp4_rows(torch.zeros(1, 32), scale_rule="nearest")
+
+
 if __name__ == "__main__":
     unittest.main()

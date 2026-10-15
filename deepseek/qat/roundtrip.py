@@ -13,7 +13,7 @@ stores scale s with code 448, the same value. The scale-ratio histogram shows
 such differences as +1. Negative-zero FP4 codes and all-zero blocks are
 counted because the reference rule for them is not published.
 
-Usage: python -m deepseek.qat.roundtrip SNAPSHOT_DIR [--limit N] [--amax-floor F]
+Usage: python -m deepseek.qat.roundtrip SNAPSHOT_DIR [--limit N] [--amax-floor F] [--scale-rule floor|min_error]
 """
 
 import argparse
@@ -74,9 +74,9 @@ def check_fp8(name: str, weight: torch.Tensor, scale: torch.Tensor, floor: float
     _record_zero_blocks(zero, scale, st)
 
 
-def check_fp4(name: str, packed: torch.Tensor, scale: torch.Tensor, floor: float, st: ClassStats) -> None:
+def check_fp4(name: str, packed: torch.Tensor, scale: torch.Tensor, floor: float, st: ClassStats, scale_rule: str = "floor") -> None:
     dq = Q.dequantize_fp4_rows(packed, scale)
-    new_packed, scales = Q.quantize_fp4_rows(dq, amax_floor=floor)
+    new_packed, scales = Q.quantize_fp4_rows(dq, amax_floor=floor, scale_rule=scale_rule)
     _record(name, packed.view(torch.uint8), scale, new_packed, scales, dq,
             Q.dequantize_fp4_rows(new_packed, scales), st)
     st.negative_zero_codes += int((Q.unpack_fp4_codes(packed) == 8).sum())
@@ -118,6 +118,8 @@ def main(argv=None) -> int:
     parser.add_argument("snapshot", help="snapshot directory containing model.safetensors.index.json")
     parser.add_argument("--limit", type=int, default=0, help="check at most N tensors per class (0 = all)")
     parser.add_argument("--amax-floor", type=float, default=0.0, help="minimum block absmax before the scale rule")
+    parser.add_argument("--scale-rule", choices=Q.FP4_SCALE_RULES, default="floor",
+                        help="FP4 scale rule to requantize with; min_error is the training rule and must reproduce the release")
     args = parser.parse_args(argv)
 
     headers = read_headers(args.snapshot)
@@ -160,7 +162,7 @@ def main(argv=None) -> int:
         if kind == "fp8":
             check_fp8(name, weight, scale, args.amax_floor, stats["fp8"])
         else:
-            check_fp4(name, weight, scale, args.amax_floor, stats["fp4"])
+            check_fp4(name, weight, scale, args.amax_floor, stats["fp4"], args.scale_rule)
         now = time.monotonic()
         if now - last >= 10:
             print(f"  {i}/{len(todo)} after {now - start:.0f}s", file=sys.stderr, flush=True)

@@ -9,8 +9,14 @@ DTensor path would.
 
 ``LocalShardOptimizer`` builds the inner optimizer over shard views, and at each
 step copies every DTensor gradient's local tensor onto its view before stepping.
-It exposes ``param_groups`` for learning-rate reads. Optimizer state checkpoints
+``step_param`` does the same for a single parameter so ``deepseek.qat.inbackward``
+can step each parameter as its gradient arrives. It exposes ``param_groups`` for
+learning-rate reads. Optimizer state checkpoints
 are not supported; this is for gate runs.
+
+``MasterOptimizer`` is the FP32-master counterpart: torch AdamW over FP32 copies
+of the same chunks, written back to the BF16 shards after each step. Both expose
+``step`` and ``step_param``.
 """
 
 import torch
@@ -55,6 +61,7 @@ class LocalShardOptimizer(torch.optim.Optimizer):
                 chunks.append((view, sl))
                 locals_.append(view)
             self._entries.append((p, chunks))
+        self._chunks_by_param = {id(p): chunks for p, chunks in self._entries}
         self.inner = factory(params=locals_, **kwargs)
         # Register the original parameters so torch's Optimizer bookkeeping and
         # NeMo's param_groups reads see the model's parameters and the inner lr.
@@ -71,6 +78,28 @@ class LocalShardOptimizer(torch.optim.Optimizer):
                 view.grad = None if g is None else g[sl]
         return self.inner.step(closure)
 
+    # Step one parameter in isolation, for update-in-backward: its gradient is
+    # mapped onto its chunk views, the inner optimizer runs (every other chunk
+    # has no gradient and is skipped by the optimizer's usual None check), and
+    # the chunk gradients are released. The caller owns ``p.grad`` and frees it.
+    # A plain parameter's single chunk is the parameter itself, so its grad is
+    # already in place and the view assignment is a no-op.
+    @torch.no_grad()
+    def step_param(self, p: torch.Tensor) -> None:
+        chunks = self._chunks_by_param.get(id(p))
+        if chunks is None:
+            raise RuntimeError("step_param called with a parameter this optimizer does not own")
+        if p.grad is None:
+            raise RuntimeError("step_param called with a parameter that has no gradient")
+        g = p.grad.to_local().detach() if isinstance(p, DTensor) else p.grad
+        if isinstance(p, DTensor):
+            for view, sl in chunks:
+                view.grad = g[sl]
+        self.inner.step()
+        if isinstance(p, DTensor):
+            for view, _ in chunks:
+                view.grad = None
+
     def zero_grad(self, set_to_none: bool = True):
         for p, chunks in self._entries:
             p.grad = None
@@ -83,6 +112,98 @@ class LocalShardOptimizer(torch.optim.Optimizer):
 
     def load_state_dict(self, state_dict):
         raise NotImplementedError("LocalShardOptimizer does not support optimizer-state checkpoints")
+
+
+class MasterOptimizer(torch.optim.Optimizer):
+    """FP32 masters beside the model's BF16 parameters; see module docstring.
+
+    Each local shard is split along dim 0 like ``LocalShardOptimizer`` and every
+    chunk gets an FP32 master copy. A step copies the chunk's gradient to FP32,
+    runs torch AdamW on the masters, and writes ``bf16(master)`` back into the
+    shard view with round-to-nearest, so the model, the fake-quant hook, and the
+    export all see the BF16 image of the master. This is the FP32-master arm of
+    the stage 4 comparison: it differs from ``adamw8bit`` only in master and
+    optimizer-state precision; the forward is identical.
+    """
+
+    def __init__(self, params, max_chunk_elems: int = 1 << 28, **kwargs):
+        originals = [p for p in params]
+        if any(isinstance(p, dict) for p in originals):
+            raise TypeError("MasterOptimizer takes a flat parameter list, not param groups")
+        # (parameter, [(shard chunk view, master chunk)]).
+        self._entries: list[tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]] = []
+        masters: list[torch.Tensor] = []
+        for p in originals:
+            shard = p.to_local() if isinstance(p, DTensor) else p
+            if isinstance(p, DTensor) and shard.untyped_storage().data_ptr() != p._local_tensor.untyped_storage().data_ptr():
+                raise RuntimeError("local shard view does not share storage with its DTensor parameter")
+            shard = shard.detach()
+            chunks = []
+            for sl in _dim0_slices(shard, max_chunk_elems):
+                view = shard[sl]
+                master = view.detach().to(torch.float32).clone().requires_grad_(True)
+                chunks.append((view, master))
+                masters.append(master)
+            self._entries.append((p, chunks))
+        self._chunks_by_param = {id(p): chunks for p, chunks in self._entries}
+        # foreach=False keeps AdamW's temporaries per chunk (at most one chunk's
+        # worth of FP32 at a time) instead of per parameter list.
+        self.inner = torch.optim.AdamW(masters, foreach=False, **kwargs)
+        super().__init__(originals, dict(self.inner.defaults))
+        self.param_groups = self.inner.param_groups
+
+    # Copy one parameter's gradient onto its masters' grads (FP32).
+    @staticmethod
+    def _load_grad(p: torch.Tensor, chunks) -> None:
+        g = (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach()
+        # Chunks are consecutive dim-0 slices of the shard, so the gradient is
+        # walked in the same order with each chunk's row count.
+        rows = 0
+        for view, master in chunks:
+            n = view.shape[0]
+            master.grad = g[rows : rows + n].to(torch.float32)
+            rows += n
+
+    # Write the stepped masters back into the BF16 shard views and drop grads.
+    @staticmethod
+    def _write_back(chunks) -> None:
+        for view, master in chunks:
+            view.copy_(master)
+            master.grad = None
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        stepped = [(p, chunks) for p, chunks in self._entries if p.grad is not None]
+        for p, chunks in stepped:
+            self._load_grad(p, chunks)
+        out = self.inner.step(closure)
+        for _, chunks in stepped:
+            self._write_back(chunks)
+        return out
+
+    # Same contract as LocalShardOptimizer.step_param.
+    @torch.no_grad()
+    def step_param(self, p: torch.Tensor) -> None:
+        chunks = self._chunks_by_param.get(id(p))
+        if chunks is None:
+            raise RuntimeError("step_param called with a parameter this optimizer does not own")
+        if p.grad is None:
+            raise RuntimeError("step_param called with a parameter that has no gradient")
+        self._load_grad(p, chunks)
+        self.inner.step()
+        self._write_back(chunks)
+
+    def zero_grad(self, set_to_none: bool = True):
+        for p, chunks in self._entries:
+            p.grad = None
+            for _, master in chunks:
+                master.grad = None
+
+    def state_dict(self):
+        raise NotImplementedError("MasterOptimizer does not support optimizer-state checkpoints")
+
+    def load_state_dict(self, state_dict):
+        raise NotImplementedError("MasterOptimizer does not support optimizer-state checkpoints")
 
 
 # Recipe entry points. Explicit signatures, not **kwargs: NeMo injects a
@@ -102,3 +223,8 @@ def adamw4bit(params, lr, weight_decay, betas, bf16_stochastic_round, eps=1e-8):
 
     return LocalShardOptimizer(params, AdamW4bit, lr=lr, weight_decay=weight_decay, betas=tuple(betas),
                                eps=eps, bf16_stochastic_round=bf16_stochastic_round)
+
+
+def adamw_fp32_master(params, lr, weight_decay, betas, eps=1e-8):
+    """torch AdamW on FP32 masters of the local shards, written back as BF16."""
+    return MasterOptimizer(params, lr=lr, weight_decay=weight_decay, betas=tuple(betas), eps=eps)
