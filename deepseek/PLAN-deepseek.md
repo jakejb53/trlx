@@ -22,8 +22,7 @@ on the mechanism (routed experts train under QAT). Next, in order: stage 6 (expo
 and bit-identical reload, design below), the sequential experiment (stage 6), then
 stage 7 preparation. The dataset, optimizer, trainable set, and mechanism are
 decided and verified below. Every command runs from the repository root
-`/home/goon/trl/trlx`. Git is the operator's; the session that closed stage 5 left
-its changes uncommitted.
+`/home/goon/trl/trlx`.
 
 Run all unit tests (CPU, under a minute; the data tests need the snapshot):
 
@@ -49,9 +48,6 @@ PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-p
     --set optimizer.lr=1e-4 --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=10 \
     --set step_scheduler.global_batch_size=2 --set step_scheduler.local_batch_size=1 --out REPORT.json
 ```
-
-If a killed run leaves a GPU at 100% utilization with no process, run
-`deepseek/venv/bin/python -B recover_gpu.py <pci bus id>` (ids from `nvidia-smi`).
 
 Reports from this session are in `deepseek/exports/logs/`: `proxy-stage2.log`,
 `proxy-stage3-run5.json` (stage 3 acceptance), `proxy-stage3-diag.json` (stage 3
@@ -334,7 +330,7 @@ Results (`proxy-stage3-run5.json`, `proxy-stage3-diag.json`):
   (13% of FP4 codes are zero and half their masters went slightly negative).
   Real FP4 value changes are about 0.6%, nearly all from knife-edge groups whose
   scale halved (see Verified facts; this was first recorded as "doubled" and
-  corrected in stage 4). The flip metric must compare values (Handoff 1).
+  corrected in stage 4). The flip metric must compare values.
 - Master deltas (sampled `wq_b` and `gate_and_up_projs` per layer): 21 to 24% of
   masters changed; about 10% of deltas exceed 2x the learning rate and 0.6%
   exceed 20x, none 200x. The largest, 9.8e-4, are stochastic-rounding jumps of
@@ -370,7 +366,7 @@ The optimizer and its wiring are done (stage 3).
   unclipped): all 41 target masters bit-identical on rank 0 and the rank-1 aggregate
   digest identical; identical loss and flips; norms 25.700846943 (NeMo) and
   25.700847638 (stepper). Reports `deepseek/exports/logs/proxy-stage4-eq-reference.json`
-  and `proxy-stage4-eq-inbackward.json`. Peak memory unchanged (Handoff 4).
+  and `proxy-stage4-eq-inbackward.json`. Peak memory unchanged (Handoff 2).
 
 - FP32-master comparison. `deepseek.qat.optim.adamw_fp32_master` holds FP32 masters
   per shard chunk beside the BF16 parameters and writes `bf16(master)` back after

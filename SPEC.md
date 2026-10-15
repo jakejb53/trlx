@@ -21,7 +21,7 @@ trlx/              repo root
 
 - Dependencies: trl, transformers, peft, accelerate, datasets, FastAPI, Uvicorn. Pinned to exact versions (trl 1.13.0 at time of writing). Optional `authoring` extra for `authoring/` source extraction: lxml, pypdf.
 - Prohibit unnecessary additional dependencies. CLI: argparse. TUI: curses. Config read: tomllib. Config write: own emitter. Endpoint HTTP: urllib. Web UI: FastAPI and Uvicorn, per `SPEC-webui.md`.
-- `trlx` and `dataset` are console entry points declared in `pyproject.toml`, installed onto PATH by `pip install`. Until the project is installed, both run from the repo root as `python -m trlx.cli` and `python -m dataset.cli`.
+- `trlx`, `dataset`, and `recover-gpu` are console entry points declared in `pyproject.toml`, installed onto PATH by `pip install`. Until the project is installed, they run from the repo root as `python -m trlx.cli`, `python -m dataset.cli`, and `python -m trlx.recover_gpu`. `recover-gpu` is a helper for a GPU left at full utilization with no process: without arguments it lists every GPU by its `nvidia-smi` number with utilization, memory use, and compute-process count; given a number it clears that GPU by creating and destroying a CUDA context on it.
 - CLI/config secrets: `api_key` settings name environment variables, never keys. Both tools load `KEY=value` lines from `.env` in the working directory at startup; a variable already set in the environment wins. The file carries secrets only, never operational settings. `dataset ui` instead accepts credentials in the browser and persists them in localStorage per `SPEC-webui.md`; it does not load `.env`.
 
 ### 1.1 Destructive operations and --force

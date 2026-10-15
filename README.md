@@ -641,24 +641,20 @@ contents and frame locals and retain credential redaction.
 ### Recovering stuck GPU activity
 
 If a failed run has exited but a GPU still reports high utilization with no compute
-processes, [recover_gpu.py](recover_gpu.py) can restore idle operation by running a
-tiny CUDA kernel, synchronizing, and explicitly destroying its temporary context.
-It requires Python and an NVIDIA driver with an Ampere-or-newer GPU; it does not
-reset hardware or stop monitoring services.
+processes, the installed `recover-gpu` command can restore idle operation by running
+a tiny CUDA kernel, synchronizing, and explicitly destroying its temporary context.
+It requires an NVIDIA driver with an Ampere-or-newer GPU; it does not reset hardware
+or stop monitoring services.
 
-From the repository root, identify the affected GPU's PCI bus ID:
-
-```sh
-nvidia-smi --query-gpu=index,pci.bus_id,utilization.gpu,memory.used --format=csv
-nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv
-```
-
-Replace `PCI_BUS_ID` below with that address (for example, `0000:21:00.0`), then
-verify utilization returns to idle:
+Run it without arguments to list every GPU with its utilization, memory use, and
+running compute processes. The stuck GPU is the one at high utilization with zero
+processes. Pass its number, the same number `nvidia-smi` and monitoring tools show,
+then list again to confirm it returned to idle:
 
 ```sh
-timeout --signal=TERM --kill-after=5s 45s python -u recover_gpu.py PCI_BUS_ID
-nvidia-smi --query-gpu=index,utilization.gpu,memory.used,power.draw,pstate --format=csv
+recover-gpu
+timeout --signal=TERM --kill-after=5s 45s recover-gpu GPU
+recover-gpu
 ```
 
 ## Tutorial: checkpoints, resume, and results

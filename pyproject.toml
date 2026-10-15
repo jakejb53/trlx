@@ -29,6 +29,7 @@ authoring = [
 [project.scripts]
 trlx = "trlx.cli:main"
 dataset = "dataset.cli:main"
+recover-gpu = "trlx.recover_gpu:main"
 
 [tool.setuptools]
 packages = ["trlx", "dataset"]
