@@ -233,8 +233,9 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
 
 ## Decisions
 
-- Full-parameter QAT is the only path pursued until exhausted. LoRA-QAT is measured
-  in the proxy gate as a fallback, not developed further unless full-parameter fails.
+- Full-parameter QAT is the only path pursued until exhausted. The LoRA-QAT gate arm
+  was dropped before measurement (stage 5) and is not developed further unless
+  full-parameter fails.
 - Training hardware: 8x B200 (180 GB each) for the full model. The 8x RTX PRO 6000
   with 1.5 TB host RAM is the fallback and needs custom host-offloaded FP32 masters.
 - Development, unit tests, and the four-layer proxy gate run on the owned 2x RTX PRO

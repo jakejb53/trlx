@@ -12,8 +12,7 @@ Post-train `deepseek-ai/DeepSeek-V4-Flash-0731` (snapshot
 identical to the source in every file, tensor name, shape, dtype, shard layout,
 and scale grid, except the payloads of trained tensors and their scales. No
 adapter, no PEFT metadata, no optimizer state. It loads and generates through the
-same Transformers and vLLM paths as the source on the same hardware; the 2x RTX
-PRO 6000 (192 GB) pair is the reference.
+same Transformers and vLLM paths as the source on the same hardware.
 
 ## 2. Method
 
@@ -44,11 +43,15 @@ Quantization-aware training on the full trainable set.
 - FP4 training rule `min_error`: per group, the floor-rule scale or twice it,
   whichever has the smaller float32 sum of squared errors, ties to the floor
   rule. Stateless. Source groups have zero error at their own scale, so the
-  fixed point holds. Used everywhere training quantizes FP4.
+  fixed point holds. Used everywhere the project quantizes FP4: the training
+  forward, the flip metric, and export. The floor rule is the
+  source-reproduction rule only.
 - E8M0 scales are built from exponent integers so that `2**-127` is
   representable. FP4 sign bits follow the input sign bit, including `-0.0`.
 - `deepseek/qat/roundtrip.py` is the acceptance test: dequantize and requantize
-  every quantized tensor of a snapshot and compare values and bits.
+  every quantized tensor of a snapshot and compare values and bits. Against an
+  export it runs with `--scale-rule min_error`; under the floor rule, groups
+  published at the doubled scale are value-exact but not bit-exact.
 
 ## 4. Scope
 
@@ -61,9 +64,6 @@ Quantization-aware training on the full trainable set.
   unselected routed experts, and every buffer.
 - Engine: NeMo AutoModel 0.8.0, the source copy in `deepseek/automodel/`, for
   the model definition, FSDP2, expert parallelism, and grouped expert execution.
-- Hardware: the full model trains on 8x B200; the 8x RTX PRO 6000 host is the
-  fallback. The four-layer proxy, unit tests, and development run on the owned
-  2x RTX PRO 6000.
 - Excluded: router, correction-bias, indexer, MTP, and DSpark training;
   conversion to NVFP4 or any other format; any output that is not a fixed point
   of the source quantizers.
@@ -152,7 +152,7 @@ are regenerable and may be deleted.
   A replaced payload must match the source entry's shape, dtype, and byte count.
   Every other payload and every non-weight file is copied byte for byte.
 - `deepseek/qat/proxy_export.py` quantizes every trained target with the
-  release quantizers, gathers expert codes and scales to rank 0 over the expert
+  training quantizers (section 3), gathers expert codes and scales to rank 0 over the expert
   mesh, materializes dense tensors in full, and replaces only tensors whose
   bytes differ from the source. The source is the recipe's model path, so a run
   trained on an export exports from that export and every link in a chain is a
@@ -163,8 +163,9 @@ are regenerable and may be deleted.
 - Reload (`deepseek.qat.proxy` against the export): the fixed-point and
   source-parity checks pass, and hooked logits on fixed probe token ids equal
   the saved ones bit for bit.
-- Runtime: the published artifact loads through Transformers and vLLM on the
-  reference pair and completes deterministic forward and generation probes.
+- Runtime: the published artifact loads through Transformers and vLLM on
+  hardware that serves the source and completes deterministic forward and
+  generation probes.
 
 ## 11. Failure and cancellation
 
@@ -177,9 +178,7 @@ failed run publishes nothing.
 
 `deepseek/venv/` is created from `deepseek/automodel/uv.lock` with base
 dependencies only (torch 2.10.0+cu130, transformers 5.18.0, torchao 0.18.0,
-NeMo editable); no `cuda` or `moe` extras. A Docker image is built only for the
-B200 host, from the lockfile of the venv that passed the proxy gate, and is not
-tested locally. The optimizer's row restriction relies on torchao allocating
+NeMo editable); no `cuda` or `moe` extras. The optimizer's row restriction relies on torchao allocating
 optimizer state lazily on the first step; re-verify on any torchao upgrade.
 
 ## 13. Deferred extensions
@@ -187,7 +186,8 @@ optimizer state lazily on the first step; re-verify on any torchao upgrade.
 - Publication alternatives if expert QAT does not deliver, ranked in
   `PLAN-deepseek.md`: dense-only QAT, FP8 as the expert publication format,
   stochastic rounding at publication, misaligned grids.
-- LoRA-QAT, measured in the proxy gate as a fallback only.
+- LoRA-QAT. Its gate arm was dropped before measurement: a LoRA delta after
+  tens of steps is about 1e-4 per weight, below both grids' half-cells.
 - Methods other than SFT.
 - Integration as a `trlx` method.
 
@@ -199,7 +199,7 @@ weaken the preservation guarantees above.
 - Steady-state memory plan for the full model with the selected trainable set.
 - The dense-slowing knob as a recipe setting, with a warmup for any parameter
   class entering training.
-- The container for the B200 host.
+- The container for the training host.
 - The training dataset, and its distance from the model's own policy.
 - An evaluation on prompts outside the SFT distribution.
 - The expert score function (`token_scores` or `gate_scores`), and whether the
