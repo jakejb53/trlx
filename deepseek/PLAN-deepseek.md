@@ -13,8 +13,6 @@ error-selected scales (Decisions); every released tensor is a fixed point of `Q`
 A straight-through estimator carries gradients to the masters. Publication
 is a snapshot of `Q(master)`. There is no post-training requantization step.
 
-`SPEC-deepseek.md` is superseded by this plan and has not been revised.
-
 ## Handoff
 
 Read this first when resuming. Stages 0 to 6 are complete: routed experts train
@@ -79,7 +77,7 @@ Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
 `stage6-experts/` and `stage6-sequential/` (stage 6), 156 GB each; all can be
 deleted and regenerated.
 
-Open items, in order:
+Handoff items, in order:
 
 1. `deepseek/qat/proxy_step.py` keeps host copies of sampled masters; the full set
    (26 GB per rank) exceeded this host's 122 GB alongside NeMo's load staging. Keep
@@ -126,7 +124,7 @@ Open items, in order:
    71 GB per rank at `ep_size` 8 for all experts, about 7 GB at 10%), which may
    return the 8x RTX PRO 6000 host from fallback to primary. Caveat: ESFT is a
    BF16 result; its rates and quality numbers say nothing about flips. Steps 1 to
-   3 are complete:
+   4 are complete:
    1. Routing concentration (`deepseek/qat/route_scores.py`, report
       `route-scores-engineering.json`): a forward over the 142 training rows
       (421,631 tokens) with a hook on each `mlp.gate` (`forward(x, token_mask,

@@ -1,284 +1,208 @@
-# Proposed DeepSeek-V4 LoRA integration
+# DeepSeek-V4-Flash-0731 full-parameter QAT
 
-Status: proposed; not part of the current `trlx` contract.
+Status: active. Replaces the LoRA-and-merge proposal, which was rejected because
+small deltas vanish when rounded back onto the source's quantization grids.
+`PLAN-deepseek.md` holds stages, measurements, decisions with their evidence, and
+the handoff. This file holds the contract.
 
 ## 1. Goal
 
-`trlx` post-trains an official DeepSeek-V4-Flash Hugging Face checkpoint with
-LoRA and publishes a standalone merged checkpoint in the same external format
-as that source checkpoint. The result has no runtime adapter dependency and
-loads through the same Transformers and vLLM model paths as the source.
+Post-train `deepseek-ai/DeepSeek-V4-Flash-0731` (snapshot
+`7872f01b1d1fe23eabc4c98b48bffcef5a386062`) and publish a standalone checkpoint
+identical to the source in every file, tensor name, shape, dtype, shard layout,
+and scale grid, except the payloads of trained tensors and their scales. No
+adapter, no PEFT metadata, no optimizer state. It loads and generates through the
+same Transformers and vLLM paths as the source on the same hardware; the 2x RTX
+PRO 6000 (192 GB) pair is the reference.
 
-The training representation is not constrained. The base may be dequantized
-for training provided publication restores every output tensor to the source
-tensor's role, name, shape, dtype, quantization geometry, and scale format.
+## 2. Method
 
-## 2. Initial scope
+Quantization-aware training on the full trainable set.
 
-- SFT with a frozen official DeepSeek-V4-Flash base and trainable LoRA adapters.
-- Official dated revisions whose metadata names `DeepseekV4ForCausalLM` and
-  whose tensor formats pass the compatibility checks in section 5.
-- NeMo AutoModel as the training engine.
-- FSDP2 and the tensor, pipeline, context, data, and expert parallel layouts
-  supported by the selected NeMo version.
-- LoRA on explicitly supported attention, compressor, and other non-routed-
-  expert projections.
-- Adapter checkpoints for resume and a merged official-format checkpoint at
-  successful completion.
+- Every loss-bearing forward uses `dequant(Q(master))` for each trained tensor,
+  where `Q` is the source format's quantizer (section 3). A straight-through
+  estimator carries gradients to the masters.
+- Every released tensor is a fixed point of `Q`: quantizing a source tensor
+  reproduces its values exactly. A trained tensor therefore changes in the
+  published artifact only where its master drifted across a cell boundary.
+- Publication is a snapshot of `Q(master)`. There is no post-training
+  requantization, merge, or conversion step.
 
-The initial scope excludes full-weight training, reward-model training,
-routed-expert LoRA, router or mutable-buffer training, MTP/DSpark training,
-and conversion to NVIDIA ModelOpt NVFP4 or another checkpoint format.
+## 3. Quantizers
 
-## 3. Ownership
+`deepseek/qat/quant.py` implements both formats exactly, in pure PyTorch.
 
-`trlx` owns:
+- FP8 E4M3, 128x128 blocks, E8M0 scale `2**ceil(log2(absmax / 448))`, never
+  saturating. Value-exact fixed point on every source tensor. Bit encoding may
+  differ from the source only on blocks whose largest code is exactly 224, where
+  the source stores scale `2s` with code 224 and the rule stores `s` with 448,
+  the same value.
+- FP4 E2M1, groups of 32 along the input axis, packed two codes per byte with
+  element `2k` in the low nibble, E8M0 scale. Release rule: floor,
+  `2**(floor(log2 absmax) - 2)`, saturating at 6. Bit-exact fixed point on every
+  source tensor.
+- FP4 training rule `min_error`: per group, the floor-rule scale or twice it,
+  whichever has the smaller float32 sum of squared errors, ties to the floor
+  rule. Stateless. Source groups have zero error at their own scale, so the
+  fixed point holds. Used everywhere training quantizes FP4.
+- E8M0 scales are built from exponent integers so that `2**-127` is
+  representable. FP4 sign bits follow the input sign bit, including `-0.0`.
+- `deepseek/qat/roundtrip.py` is the acceptance test: dequantize and requantize
+  every quantized tensor of a snapshot and compare values and bits.
 
-- Configuration resolution, input validation, dataset preparation, review,
-  run allocation, supervision, cancellation, diagnostics, and terminal output.
-- The source checkpoint identity and compatibility report.
-- Translation of approved settings into an engine request.
-- Normalization of engine events and metrics into `log.txt` and
-  `metrics.jsonl`.
-- Adapter artifact collection and resume identity.
-- Streaming merge, source-format requantization, publication, and final
-  verification.
+## 4. Scope
 
-NeMo AutoModel owns:
+- SFT on reasoning conversations (section 7).
+- Trainable: FP8 and FP4 weights of the 43 backbone layers, except the indexer's
+  `wq_b`. Routed experts train only when selected for the run (section 8); the
+  selection may be all experts.
+- Frozen, byte for byte: MTP, DSpark, embeddings, head, router gates and
+  correction biases, hyper-connection parameters, norms, compressor, indexer,
+  unselected routed experts, and every buffer.
+- Engine: NeMo AutoModel 0.8.0, the source copy in `deepseek/automodel/`, for
+  the model definition, FSDP2, expert parallelism, and grouped expert execution.
+- Hardware: the full model trains on 8x B200; the 8x RTX PRO 6000 host is the
+  fallback. The four-layer proxy, unit tests, and development run on the owned
+  2x RTX PRO 6000.
+- Excluded: router, correction-bias, indexer, MTP, and DSpark training;
+  conversion to NVFP4 or any other format; any output that is not a fixed point
+  of the source quantizers.
 
-- Model execution and the dequantized training representation.
-- Distributed model placement and collectives.
-- Forward, backward, gradient checkpointing, optimizer, and scheduler work.
-- LoRA injection for the approved target list.
-- Distributed training checkpoints and HF-compatible adapter export.
+## 5. Ownership
 
-The integration uses NeMo's supported invocation boundary. `trlx` does not
-copy NeMo model, parallelism, or kernel implementations into this repository.
+`deepseek/qat` owns, and imports nothing from `trlx`:
 
-## 4. Engine configuration and protocol
+- Quantizers, round-trip check, exporter, and export verifier.
+- Fake-quant hooks, the freeze of NeMo's router-bias update, the optimizer over
+  local shards, update-in-backward, expert selection, the data bridge, recipe
+  overrides, and the training, parity, scoring, and export entry points.
+- Reports, probe logits, replaced-tensor lists, and exports.
 
-The run configuration explicitly selects the external engine:
+NeMo owns model construction and dequantized loading, distributed placement and
+collectives, forward, backward, activation checkpointing, expert-gradient
+scaling, and the training loop. Two NeMo behaviours are disabled after recipe
+setup because the recipe cannot express it: the per-step router correction-bias
+update (`deepseek/qat/freeze.py`) and, under update-in-backward, NeMo's own
+gradient clip. No NeMo model, parallelism, or kernel code is copied into
+`deepseek/qat`.
 
-```toml
-[engine]
-name = "nemo_automodel"
-command = ["/absolute/path/to/python", "-m", "trlx_nemo_worker"]
+## 6. Source checkpoint compatibility
 
-[engine.distributed]
-fsdp2 = true
-tp_size = 1
-pp_size = 1
-cp_size = 1
-ep_size = 1
-```
+The snapshot's safetensors index must be complete with no missing or duplicate
+keys. Every tensor is BF16, FP8 E4M3 with an E8M0 `<base>.scale`, packed FP4 I8
+with an E8M0 `<base>.scale`, or a small F32/I64 tensor. Block and group geometry
+derive from tensor and scale shapes: FP8 scales are `[out/128, in/128]`, FP4
+scales `[out, in/32]` over `[out, in/2]` codes. The round-trip check (section 3)
+must pass. Inside NeMo, expert tensors are transposed views of the HF `[out, in]`
+layout, so the FP4 group runs along the first non-expert axis; the fake-quant
+hooks and exporter account for this.
 
-`command` is an argv list, not a shell string. Every key is required when the
-block is present. The operator owns installation of a compatible NeMo
-environment; the project dependency pins remain unchanged.
+## 7. Dataset
 
-Before allocating or rewinding a run, `trlx` executes a read-only engine probe
-that reports the engine, NeMo, PyTorch, Transformers, PEFT, CUDA, and kernel
-versions and validates the requested topology. Missing capabilities and
-unsupported combinations are fatal.
+`deepseek/qat/data.py` encodes each row with the snapshot's own
+`encoding/encoding_dsv4.py` in thinking mode, with the row's separate `reasoning`
+string as the assistant message's reasoning content, and tokenizes with the
+snapshot tokenizer. Output is NeMo's shifted format: `input_ids[:-1]`,
+`labels[1:]` with prompt positions `-100`, `attention_mask`, and the pad id. The
+prompt is everything through `<think>`; reasoning, `</think>`, the answer, and
+EOS are supervised. A row above `max_tokens` is an error, never truncated. The
+holdout is the last N rows in file order.
 
-The engine worker receives one versioned JSON request describing resolved
-paths, model identity, prepared datasets, LoRA settings, trainer settings,
-parallel topology, output paths, and resume state. It emits versioned JSONL
-events to stdout and raw diagnostics to stderr. Unknown request or event keys
-are errors. Secrets are passed by environment-variable name and never written
-to requests, snapshots, logs, or engine configuration.
+## 8. Training
 
-The engine process belongs to the run's worker process group and follows the
-existing cancellation and bounded failure-cleanup contract. A worker failure
-preserves its structured cause and engine stderr in `log.txt`.
+- Fake quantization (`deepseek/qat/fakequant.py`): each target module's forward
+  runs under `torch.nn.utils.stateless._reparametrize_module` with
+  `dequant(Q(w))` swapped in; backward is identity. Parameters, FSDP2 wrapping,
+  and the optimizer are untouched. DTensor parameters are quantized on the local
+  shard and re-wrapped.
+- Masters: BF16 with stochastic-rounding updates. Optimizer: torchao
+  `AdamW8bit`, block 256, run by `deepseek/qat/optim.py` over each parameter's
+  local shard in chunks of at most 2^28 elements along dim 0. Chunk views share
+  storage with the DTensor.
+- Update-in-backward (`deepseek/qat/inbackward.py`): every trainable parameter
+  is stepped from its post-accumulate-grad hook and its gradient freed. The exact
+  global norm is accumulated as gradients arrive and reduced once per step; the
+  previous step's clip coefficient scales the current step; the first step is
+  unclipped. Requires one microbatch per step and `tp = pp = cp = 1` with the
+  data- and expert-parallel groups spanning the world. Expert-gradient scaling
+  remains NeMo's.
+- Expert selection: `deepseek/qat/route_scores.py` scores every routed expert by
+  the frozen base model's routing over the training rows (`token_scores`, share
+  of routed top-k slots; `gate_scores`, summed gate weight) and selects per
+  layer in descending score until cumulative `top_p`. The optimizer restricts
+  each expert parameter to views of its selected local rows before the first
+  step, so unselected rows get no update and no optimizer state; unselected
+  rows of each expert gradient are zeroed before the norm.
+- Integrity: every run snapshots the quantized codes and scales of every target
+  and a digest of every frozen parameter and buffer before training, and checks
+  them after. A changed frozen tensor, or any code or scale change in an
+  unselected expert, fails the run.
 
-## 5. Source checkpoint compatibility
+## 9. Artifacts
 
-The supervisor resolves the exact source revision and records its repository
-ID or local path, commit, model type, architecture, configuration digest,
-weight-index digest, tensor inventory, and tokenizer digest.
+A training run (`deepseek.qat.proxy_step`) writes its report to `--out`; with
+`--export DIR` it also writes probe logits to `<out stem>-logits-rank{r}.pt`, the
+replaced tensor names to `<out stem>-replaced.txt`, and the checkpoint to `DIR`.
+Reports live in `deepseek/exports/logs/`, exports in `deepseek/exports/`. Exports
+are regenerable and may be deleted.
 
-Compatibility requires:
+## 10. Export and verification
 
-- Architecture `DeepseekV4ForCausalLM`.
-- A complete safetensors index with no missing or duplicate tensor keys.
-- Every tensor classified as BF16, FP8 E4M3 plus its inverse-scale tensor,
-  packed E2M1 FP4 plus its inverse-scale tensor, or an explicitly supported
-  integer/buffer type.
-- FP8 block geometry and FP4 scale geometry derivable unambiguously from the
-  tensor and scale shapes.
-- UE8M0 or other scale dtypes explicitly recognized by the merger.
-- Every requested LoRA target mapped losslessly between source HF names,
-  NeMo names, and exported PEFT names.
-- No requested target inside routed-expert packed tensors in the initial
-  implementation.
-
-An unknown architecture field, tensor format, quantization layout, target,
-conversion mapping, or source revision fails before training. There is no
-fallback to logical-BF16 size estimates or a different model artifact.
-
-## 6. Dataset preparation
-
-`trlx` remains authoritative for dataset loading, splitting, replay selection,
-reasoning inclusion, reasoning-only labels, packing eligibility, source
-fingerprints, and assessment. The engine consumes a run-owned prepared
-representation and does not reload the operator's source datasets.
-
-The prepared representation contains the exact token IDs and labels selected
-by `trlx`, plus fields required for source identity and supported engine
-collation. NeMo must not reapply a chat template, independently truncate rows,
-resplit data, or change labels. Startup profiling and engine-observed row and
-trained-token counts must agree before the first optimizer update.
-
-## 7. LoRA target contract
-
-The initial target set is an explicit allowlist resolved against the loaded
-model. It may contain supported attention, compressor, shared non-expert, and
-output projections. Bare `all-linear` is rejected for this backend because it
-does not state whether packed routed-expert parameters are intended.
-
-Every target must have:
-
-- A unique HF source tensor or supported tensor group.
-- A unique NeMo module and parameter mapping.
-- A unique exported PEFT key and target metadata entry.
-- A supported merge and source-format requantization path.
-
-The preflight report lists every resolved target, source tensor format, adapter
-shape, trainable count, and merge path. Zero targets, partially resolved target
-groups, unsupported expert targets, and trainable non-adapter parameters are
-fatal. Router correction biases and other mutable base buffers remain frozen
-and must match the source after training and resume.
-
-## 8. Training artifacts and resume
-
-The run directory additionally contains:
-
-```text
-<run>/
-  engine-request.json
-  engine-compatibility.json
-  engine-checkpoints/
-  adapter/                 final HF-compatible adapter
-  merge-report.json
-  merged/                  standalone official-format checkpoint
-```
-
-Engine checkpoints contain the adapter, optimizer, scheduler, random-number,
-sampler, and distributed state required for exact continuation. They do not
-publish a second copy of the dequantized base model.
-
-Resume requires the same source-checkpoint identity, prepared-data identity,
-target mapping, LoRA settings, engine compatibility identity, and distributed
-state schema. Existing `trlx` rewind rules apply. A completed or partial merge
-is never a resume source.
-
-## 9. Merge and requantization
-
-Merge reads the immutable source checkpoint and final adapter, stages a
-complete output, and publishes only after all structural and numerical checks
-pass. It operates shard by shard and tensor by tensor; it must not materialize
-the whole model in host or device memory.
-
-For each source tensor:
-
-- An untouched tensor is copied without numerical conversion and its tensor
-  payload digest must equal the source digest.
-- An adapted BF16 tensor is dequantized if necessary, updated by its LoRA
-  delta in at least FP32 accumulation, cast back to BF16, and written under the
-  original key.
-- An adapted FP8 tensor is dequantized, updated by its LoRA delta in at least
-  FP32 accumulation, and requantized to the source E4M3 format using the
-  source block geometry and scale dtype.
-- Packed FP4 expert tensors and scales are untouched in the initial scope.
-
-Requantization recomputes scales from the merged tensor; it never reuses stale
-source scales. Rounding, saturation, zero-block, non-finite, and power-of-two
-UE8M0 rules are explicit and deterministic. An updated tensor whose shape is
-not divisible by its source block geometry is an error.
-
-The output preserves the source weight-index mapping, shard names, tensor key
-set, configuration, tokenizer, generation configuration, encoding resources,
-and other required repository files. Only adapted tensor payloads, their scale
-payloads, and provenance metadata may differ. No LoRA keys or PEFT metadata
-remain in `merged/`.
-
-The merge report records source and adapter identities, every changed tensor,
-source and output formats, scale geometry, saturation counts, non-finite
-counts, payload digests, and publication paths. Existing force, overlap,
-staging, and recovery rules apply.
-
-## 10. Verification
-
-Verification has four required stages:
-
-1. **Structure:** output files, configuration, tokenizer, index, keys, shapes,
-   dtypes, and scale grids satisfy the source-format contract.
-2. **Preservation:** every untouched tensor payload is identical to the source;
-   every changed tensor is named in the merge report; the output contains no
-   adapter state.
-3. **Numerics:** on fixed calibration inputs, compare the dequantized
-   base-plus-adapter reference with the merged/requantized output using logits,
-   token loss, and generated tokens. Non-finite values and unreported output
-   changes are fatal.
-4. **Runtime:** load the published artifact through the supported Transformers
-   and vLLM paths and complete deterministic forward and generation probes.
-
-Quantization makes exact logit equality impossible. Acceptance thresholds for
-logit error, loss change, and generation agreement are versioned verification
-inputs established by calibration against an unchanged round-trip control.
-The control dequantizes and requantizes the source without an adapter; adapter
-verification must distinguish merge error from that baseline quantization
-error. Thresholds are recorded in the snapshot and merge report and may not be
-silently relaxed.
-
-Verification also proves that at least one adapted tensor changed, adapter
-effects survive requantization, and representative prompts differ from the
-unmodified source when the dequantized reference differs.
+- `deepseek/qat/export.py` writes every shard with its header copied verbatim.
+  A replaced payload must match the source entry's shape, dtype, and byte count.
+  Every other payload and every non-weight file is copied byte for byte.
+- `deepseek/qat/proxy_export.py` quantizes every trained target with the
+  release quantizers, gathers expert codes and scales to rank 0 over the expert
+  mesh, materializes dense tensors in full, and replaces only tensors whose
+  bytes differ from the source. The source is the recipe's model path, so a run
+  trained on an export exports from that export and every link in a chain is a
+  complete checkpoint.
+- `deepseek/qat/verify_export.py` hashes two checkpoint trees and names every
+  differing shard, tensor, and file; `--expect` asserts that the differing set
+  is exactly the replaced list.
+- Reload (`deepseek.qat.proxy` against the export): the fixed-point and
+  source-parity checks pass, and hooked logits on fixed probe token ids equal
+  the saved ones bit for bit.
+- Runtime: the published artifact loads through Transformers and vLLM on the
+  reference pair and completes deterministic forward and generation probes.
 
 ## 11. Failure and cancellation
 
-Expected engine, checkpoint, conversion, quantization, storage, and validation
-failures produce contextual `TrlxError` reports without Python tracebacks on
-the terminal. Reports identify the operation, rank, source tensor or row,
-affected path, and retained recovery artifact where applicable.
+Export is staged and publishes only a complete tree; replacing an existing
+destination requires `--force`. An export error is recorded in the report and
+fails the run without raising, so every rank reaches the final collective. A
+failed run publishes nothing.
 
-Cancellation stops training cooperatively through the engine worker group.
-Merge cancellation stops before publication and retains only an identified
-staged recovery directory. Cancellation never publishes a partial merged
-checkpoint.
+## 12. Dependencies and versions
 
-## 12. Dependency and version policy
-
-The NeMo engine environment and merger compatibility matrix are explicit and
-versioned. A newer model, NeMo, Transformers, PEFT, PyTorch, CUDA, or kernel
-version is unsupported until its compatibility probes and reference tests
-pass. Compatibility is based on observed capabilities and tensor contracts,
-not version ordering alone.
-
-`trlx` does not install or update the external engine automatically. The
-operator-provided engine command is invoked only for a run that explicitly
-selects it.
+`deepseek/venv/` is created from `deepseek/automodel/uv.lock` with base
+dependencies only (torch 2.10.0+cu130, transformers 5.18.0, torchao 0.18.0,
+NeMo editable); no `cuda` or `moe` extras. A Docker image is built only for the
+B200 host, from the lockfile of the venv that passed the proxy gate, and is not
+tested locally. The optimizer's row restriction relies on torchao allocating
+optimizer state lazily on the first step; re-verify on any torchao upgrade.
 
 ## 13. Deferred extensions
 
-- Routed-expert LoRA and official E2M1 FP4 merge/requantization.
-- Router, correction-bias, indexer, MTP, or DSpark training.
-- Full-weight DeepSeek-V4 training.
-- DPO, KTO, GRPO, RLOO, reward, and distillation through the NeMo engine.
-- Pipeline-specific quality evaluation or generation during training.
-- Automatic conversion to ModelOpt NVFP4 or another non-source format.
+- Publication alternatives if expert QAT does not deliver, ranked in
+  `PLAN-deepseek.md`: dense-only QAT, FP8 as the expert publication format,
+  stochastic rounding at publication, misaligned grids.
+- LoRA-QAT, measured in the proxy gate as a fallback only.
+- Methods other than SFT.
+- Integration as a `trlx` method.
 
-Each extension requires a separate target, checkpoint, merge, verification,
-and resume contract. It must not weaken the initial preservation guarantees.
+Each requires its own training, export, and verification contract and must not
+weaken the preservation guarantees above.
 
 ## 14. Open decisions
 
-- The first approved LoRA target allowlist.
-- Whether the external engine runs in a host environment or a configured
-  container boundary.
-- The engine request/event schema and distribution mechanism.
-- Calibration datasets and numerical acceptance thresholds for each supported
-  checkpoint revision.
-- Whether successful training always performs merge and verification or
-  permits an explicit adapter-only completion mode.
+- Steady-state memory plan for the full model with the selected trainable set.
+- The dense-slowing knob as a recipe setting, with a warmup for any parameter
+  class entering training.
+- The container for the B200 host.
+- The training dataset, and its distance from the model's own policy.
+- An evaluation on prompts outside the SFT distribution.
+- The expert score function (`token_scores` or `gate_scores`), and whether the
+  full-model selection is taken from `top_p` or measured from per-expert
+  gradient-sign consistency and flip fraction.
+- Whether to combine selection with dense slowing.
