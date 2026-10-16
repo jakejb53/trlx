@@ -17,19 +17,22 @@ is a snapshot of `Q(master)`. There is no post-training requantization step.
 
 ## Handoff
 
-Read this first when resuming. Stages 0 to 5 are complete; stage 5's verdict is a go
-on the mechanism (routed experts train under QAT). Next, in order: stage 6 (export
-and bit-identical reload, design below), the sequential experiment (stage 6), then
-stage 7 preparation. The dataset, optimizer, trainable set, and mechanism are
-decided and verified below. Every command runs from the repository root
-`/home/goon/trl/trlx`.
+Read this first when resuming. Stages 0 to 6 are complete: routed experts train
+under QAT (stage 5), and a trained proxy exports to a complete source-layout
+checkpoint that reloads bit-identically, twice in a chain (stage 6). Next: the
+frequency-split run (Handoff 4), then stage 7 preparation (Handoff 5). The dataset,
+optimizer, trainable set, and mechanism are decided and verified below. Every
+command runs from the repository root `/home/goon/trl/trlx`. Launch GPU runs from
+a plain terminal with `nohup`: the post-training report phase drives host memory
+low enough that an agent session's background-process reaper has killed a run.
 
 Run all unit tests (CPU, under a minute; the data tests need the snapshot):
 
 ```sh
 deepseek/venv/bin/python -B -m unittest deepseek.tests.test_quant deepseek.tests.test_export \
     deepseek.tests.test_fakequant deepseek.tests.test_data deepseek.tests.test_freeze \
-    deepseek.tests.test_inbackward deepseek.tests.test_optim deepseek.tests.test_proxy_step
+    deepseek.tests.test_inbackward deepseek.tests.test_optim deepseek.tests.test_proxy_step \
+    deepseek.tests.test_proxy_export
 ```
 
 Reproduce the stage 3 one-step check (about 5 minutes, both GPUs):
@@ -49,10 +52,11 @@ PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-p
     --set step_scheduler.global_batch_size=2 --set step_scheduler.local_batch_size=1 --out REPORT.json
 ```
 
-Reports from this session are in `deepseek/exports/logs/`: `proxy-stage2.log`,
-`proxy-stage3-run5.json` (stage 3 acceptance), `proxy-stage3-diag.json` (stage 3
-diagnostics). `deepseek/exports/identity/` and `deepseek/exports/one-tensor/` are
-the two stage 1 exports, 156 GB each, and can be deleted.
+Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
+`proxy-stage3-*.json`, `proxy-stage4-*.json`, `proxy-stage5-*.json`,
+`proxy-stage6-*`). Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
+`stage6-experts/` and `stage6-sequential/` (stage 6), 156 GB each; all can be
+deleted and regenerated.
 
 Open items, in order:
 
@@ -64,19 +68,34 @@ Open items, in order:
    budget must come from multi-step measurements, and the update-in-backward saving
    itself is still unmeasured (sample allocated memory at end of backward with and
    without it).
-3. Gate runs save no weights; stage 6 adds the export path.
-4. Direction under discussion, not decided: sequential training, experts first with
-   dense frozen, then a short dense phase on the export (Stage 6, sequential
-   experiment). Reasoning: dense first collapses the expert gradient (phase B/C);
-   independent training of the two classes then composition double-counts the
-   dataset's shift and pairs attention with experts it never saw; dense stops when
-   it has fit instead of flipping cells on noise.
+3. Gate runs save weights with `proxy_step --export DIR` (stage 6).
+4. Next run: the frequency split (`proxy_step --in-backward --dense-every 4`,
+   report `proxy-split-dense4.json`). Joint training at 1e-4 for 100 steps with dense
+   parameters updated on 1 step in 4 (gradients discarded on the other steps, Adam
+   moments untouched, per-class clipping implied) and experts every step. Premise (stage 5 phase C): a joint
+   run starves experts because dense fits the data in about 30 steps and removes
+   the gradient-sign consistency experts need to cross cells; slowing dense keeps
+   the signal alive. Under Adam, 1 in N at rate r and every step at r/N drift the
+   same expected distance, so this is the per-class rate with every dense update
+   at the proven 1e-4. N = 4 is the FP4/FP8 cell-size ratio. Pass: expert values
+   changed at step 100 well above the joint arm's 1.45% and toward the experts-only
+   4.84%, with dense values also changing and held-out falling after the first
+   validation. Dense will not reach the ceiling in 25 updates; that is not the
+   question. Fail: experts stay near 1.45%, which contradicts the phase C reading
+   and needs rethinking before stage 7. A pass shows direction only: the optimum N,
+   a constant versus flip-rate-keyed dynamic ratio, and rate versus frequency are
+   stage 7 tuning questions the proxy cannot rank, since it measures flips and
+   curve shapes, not quality. The per-class signals available for a controller are
+   gradient norm and flip fraction, not loss. Experts-first sequencing (stage 6
+   sequential experiment) is measured and not pursued further.
 5. Stage 7 preparation list, each a separate decision: steady-state memory plan;
-   per-class learning rate (`optim.py` param groups plus a recipe key); a schedule
-   into and out of the flip regime; the container from the gate-passing lockfile;
-   the dataset; an evaluation on prompts outside the SFT distribution, since
-   held-out loss on same-distribution rows cannot separate dense fitting the data
-   from experts generalizing from it (stage 5).
+   the dense-slowing lever as a recipe setting (per-class rate via `optim.py` param
+   groups, or the step frequency) with a warmup for any class entering training
+   (stage 6: a fresh Adam state at 1e-4 lifted held-out 5.24 to 5.67 in ten steps);
+   the container from the gate-passing lockfile; the dataset; an evaluation on
+   prompts outside the SFT distribution, since held-out loss on same-distribution
+   rows cannot separate dense fitting the data from experts generalizing from it
+   (stage 5).
 
 Alternatives if QAT of the experts does not deliver, ranked by the operator, with
 the physics that ranks them. The released expert weights sit at the centers of
@@ -181,16 +200,22 @@ deepseek/
     quant.py          exact FP8/FP4 quantizers and dequantizers; FP4 min_error scale rule
     roundtrip.py      read-only checkpoint round-trip check
     export.py         layout-preserving exporter
-    verify_export.py  shard/tensor/file diff of two checkpoints
+    verify_export.py  shard/tensor/file diff of two checkpoints; --expect @FILE
     fakequant.py      straight-through fake-quant hooks on the NeMo model
     freeze.py         disables NeMo's router correction-bias update
     data.py           reasoning-conversation dataset bridge (NeMo shifted format)
     optim.py          torchao optimizer over local shards; FP32-master AdamW; step_param
-    inbackward.py     update-in-backward stepper with lagged clipping, optional per-class norms
-    proxy.py          stage 2 parity check (torchrun entry)
-    proxy_step.py     stage 3 to 5 training check and diagnostics (torchrun entry);
+    inbackward.py     update-in-backward stepper with lagged clipping, optional per-class norms,
+                      per-class update period (frequency split)
+    overrides.py      --set/--unset recipe overrides shared by the torchrun entries
+    proxy_export.py   trained-target export: quantize, gather experts to rank 0,
+                      replace only tensors whose bytes differ from the source
+    proxy.py          parity check and export reload (torchrun entry); --set/--unset,
+                      --expect-logits PREFIX; shared probe token ids
+    proxy_step.py     stage 3 to 6 training check and diagnostics (torchrun entry);
                       --in-backward, --per-class-clip, --set/--unset recipe overrides,
-                      --trainable-subset, held-out capture with per-class flip totals
+                      --trainable-subset, --dense-every N, held-out capture with per-class flip totals,
+                      --export DIR [--force] with probe logits and replaced list beside --out
     proxy-4layer.yaml stage 2 recipe (mock token ids)
     proxy-train.yaml  training recipe: data bridge, freeze config, optimizer
   tests/                                       unittest, run from the repo root
@@ -279,7 +304,8 @@ frozen); shared-expert `gate_proj`, `up_proj`, `down_proj`;
 views of HF `[out, in]` layout (`gate_and_up_projs[e] = cat(w1.T, w3.T)`,
 `down_projs[e] = w2.T`), so the FP4 group runs along the first non-expert axis.
 
-Results on both ranks: 37 targets per rank; fake-quantized tensors equal the
+Results on both ranks: 37 target modules per rank (41 parameter tensors, 40
+trainable plus the frozen indexer); fake-quantized tensors equal the
 loaded tensors bit for bit; loaded dense tensors and every local expert equal the
 snapshot's dequantized tensors bit for bit, so NeMo's dequantization agrees with
 stage 0 in both orientations; hooked, unhooked, and post-uninstall logits on
@@ -486,39 +512,79 @@ cannot absorb the dataset alone (the full model, dense 6.3B of 290B) and a datas
 with more in it than 142 rows. Stage 6 needs an export path at the end of a
 `proxy_step` run, since gate runs save no weights.
 
-### Stage 6: proxy export and reload (next)
+### Stage 6: proxy export and reload (complete)
 
 Export the trained proxy with stage 1, verify that only trained targets differ,
 reload in a fresh process, and reproduce the final training forward bit for bit.
 
-Design:
+- `deepseek/qat/proxy_export.py`: every rank quantizes its trained targets with the
+  project quantizers (`fakequant.quantize_fp4`, `quant.quantize_fp8_blocks`); expert
+  codes and scales are gathered to rank 0 over the expert mesh (one-dimensional,
+  spanning the world, global expert `e = rank * E_local + i`); dense tensors are
+  materialized in full. Names: dense through `proxy.hf_names`, experts to
+  `layers.{L}.ffn.experts.{e}.{w1,w3,w2}.{weight,scale}`. Rank 0 compares every
+  candidate's bytes with the source and replaces only those that differ, so the
+  replaced list is the exact `verify_export --expect` set and the report's
+  changed-against-source count is a measurement. The source is the recipe's
+  `pretrained_model_name_or_path`, so a train-on-export run exports from that
+  export and the chain stays a complete checkpoint at every link.
+- `proxy_step.py --export DIR [--force]` (requires `--out`): after the report checks,
+  records hooked logits in eval mode on the shared probe ids (`proxy.probe_token_ids`,
+  batch 2, seq 256, seed 0) to `<out stem>-logits-rank{r}.pt`, exports, and writes
+  the replaced names to `<out stem>-replaced.txt`. An `ExportError` is recorded in
+  the report and fails the run without raising, so other ranks reach the final
+  all-reduce.
+- `proxy.py --snapshot EXPORT --set model.config.pretrained_model_name_or_path=EXPORT
+  --set model.config.name_or_path=EXPORT --expect-logits PREFIX`: the existing
+  fixed-point and source-parity checks run against the export; the hooked logits must
+  equal the saved ones bit for bit. `deepseek/qat/overrides.py` holds `--set/--unset`
+  for both entries.
+- `deepseek/tests/test_proxy_export.py`: 9 tests (naming, half order, local expert
+  quantization against HF matrices, rank-order assembly and dtypes, dense mapping,
+  byte-equal skip including uint8 against I8, `--expect @FILE`).
 
-- `proxy_step.py --export DIR`: after training, every rank quantizes its trained
-  targets as `quantized_state` does (the project quantizer, `fakequant.quantize_fp4`
-  and `quant.quantize_fp8_blocks`). Rank 0 gathers expert shards over the
-  expert-parallel group (expert index offset per `proxy._ep_offset`; about 14 GB of
-  host memory for the 4-layer proxy) and materializes dense tensors, maps names
-  (dense and indexer through `proxy.hf_names`; experts to
-  `layers.{L}.ffn.experts.{e}.{w1,w3,w2}.weight` and `.scale`, w1/w3 in the order
-  `quantized_state` emits the gate/up halves), and writes through `export.py`. The
-  export is a complete checkpoint: every untrained tensor copied byte for byte.
-- Before export, the run records logits on fixed token ids under the hooks and saves
-  them beside the report.
-- `verify_export.py` against the snapshot: every differing tensor must be a trained
-  target; the count is reported (some trained tensors may be unchanged at low rates,
-  so `--expect` is derived from the measured differences, not assumed).
-- Reload: a fresh process builds the recipe with the export as
-  `pretrained_model_name_or_path`, installs the hooks, runs the same token ids, and
-  compares logits bit for bit. The export holds `Q(master)` exactly, a fixed point of
-  the quantizer, so equality is the expected result, not a tolerance.
+Results (`deepseek/exports/logs/proxy-stage6-*`):
 
-Sequential experiment (after the export path works): experts-only at 1e-4 for 100
-steps with `--export`, then dense-only on that export for 30 to 100 steps, compared
-with dense-only from base (4.135) and the joint arm (4.172) on flip fractions and
-loss curves. This measures how much dense work remains once experts have learned the
-data, and is the first train, export, train-on-export rehearsal of the production
-shape. Fresh optimizer state at the boundary; `LocalShardOptimizer` has no state
-checkpoint by design.
+- Experts-only at 1e-4, 100 steps, `--export deepseek/exports/stage6-experts`:
+  held-out 16.18 to 5.242 (phase B: 5.24); 8 trained targets, 6,144 candidate
+  tensors, 5,888 replaced, 256 unchanged, every one a scale (`min_error` keeps the
+  source scale until a flip crosses a bin). Export 181 s. `verify_export` against
+  `$SNAP` with `--expect @proxy-stage6-experts-replaced.txt`: exactly those 5,888
+  differ. Reload: fixed point and source parity against the export clean on both
+  ranks; probe logits equal the saved ones bit for bit, zero differing elements.
+- Sequential experiment: dense-only at 1e-4 for 100 steps on that export,
+  `--export deepseek/exports/stage6-sequential`. Step-zero held-out 5.242 (equals the
+  experts-only end, a third confirmation that export and reload are exact). 32
+  trained targets, 64 of 64 candidates replaced. Differ against `stage6-experts`:
+  exactly those 64. Reload: bit-identical logits again. Held-out: 5.24, 5.67 at
+  step 9, then 5.40, 5.00, 4.78, 4.69, 4.73, 4.78, 4.81, 4.80, 4.75, 4.62.
+- Reading. Dense changed 53.9% of its values on the experts export against 54.3%
+  from base and 54.1% joint: the dense flip fraction does not depend on how much
+  loss remains, because Adam normalizes gradient scale and the learning rate sets
+  drift per step. This refutes the premise that dense would stop once experts had
+  fit (former Handoff 4). The 4.62 endpoint against dense-only's 4.14 is a fact
+  with a named confound, not a ranking: a fresh Adam state at 1e-4 moves every
+  dense master by about one learning rate per step at first and lifted held-out
+  from 5.24 to 5.67 in ten steps, so any class entering training needs a warmup.
+  Whether experts plus dense beats dense alone remains unanswerable on this proxy
+  (stage 5).
+
+```sh
+deepseek/venv/bin/python -B -m unittest deepseek.tests.test_proxy_export
+# train with export (experts-only arm shown; see Handoff for the override lists)
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 \
+    -m deepseek.qat.proxy_step --config deepseek/qat/proxy-train.yaml --in-backward \
+    --trainable-subset experts --set 'freeze_config.unfreeze_modules=[{glob: "model.layers.*.mlp.experts"}]' \
+    --set optimizer.lr=1e-4 --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=10 \
+    --set step_scheduler.global_batch_size=2 --set step_scheduler.local_batch_size=1 \
+    --out deepseek/exports/logs/REPORT.json --export deepseek/exports/EXPORT
+deepseek/venv/bin/python -B -m deepseek.qat.verify_export $SNAP deepseek/exports/EXPORT \
+    --expect @deepseek/exports/logs/REPORT-replaced.txt
+deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config deepseek/qat/proxy-4layer.yaml \
+    --snapshot deepseek/exports/EXPORT --set model.config.pretrained_model_name_or_path=deepseek/exports/EXPORT \
+    --set model.config.name_or_path=deepseek/exports/EXPORT --expect-logits deepseek/exports/logs/REPORT
+# train on an export: add the two model-path overrides to the proxy_step command
+```
 
 ### Stage 7: full model on 8x B200 or B300 (planned)
 
@@ -531,9 +597,10 @@ the steady-state peak adds activations, `min_error` fake-quant temporaries durin
 recompute, and torchao step temporaries, and must be measured on a multi-step run
 (Handoff 2). A B300 host is available if the B200 budget is too tight. The
 preparation decisions are listed in Handoff 5. Expert flips arrive tens of steps
-after dense changes at the same rate (stage 5), so production runs need more steps
-than a dense recipe, a per-class rate, or the sequential arrangement (Handoff 4);
-the flip fraction is the leading indicator to watch, not the loss.
+after dense changes at the same rate (stage 5), and a joint run at one rate starves
+them once dense fits (phase C), so production runs need more steps than a dense
+recipe and dense slowed relative to experts (Handoff 4, 5); the flip fraction is
+the leading indicator to watch, not the loss.
 
 ## Verified facts
 

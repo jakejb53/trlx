@@ -10,10 +10,19 @@ wrapping match training), loads the real checkpoint, and checks:
 3. logits parity: on fixed token ids, the hooked and unhooked forwards produce
    bit-identical logits, and uninstalling restores the unhooked logits.
 
+Pointed at an export (``--snapshot`` and the model-path overrides naming the
+export), the same checks prove the export reloads exactly; ``--expect-logits``
+additionally compares the hooked logits bit for bit with those a ``proxy_step
+--export`` run saved before writing it.
+
 Any failure exits nonzero. Launch from the repo root:
 
   deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy \
       --config deepseek/qat/proxy-4layer.yaml --snapshot $SNAP
+  deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy \
+      --config deepseek/qat/proxy-4layer.yaml --snapshot EXPORT \
+      --set model.config.pretrained_model_name_or_path=EXPORT --set model.config.name_or_path=EXPORT \
+      --expect-logits REPORT_PREFIX
 """
 
 import argparse
@@ -30,8 +39,27 @@ from torch.distributed.tensor import DTensor
 from deepseek.qat import fakequant as FQ
 from deepseek.qat import quant as Q
 from deepseek.qat.export import read_shard_header
+from deepseek.qat.overrides import add_override_arguments, apply_overrides
 
 SHARED = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+
+# The fixed probe input every parity and reload check shares. proxy_step saves
+# logits on these ids before an export; this script recomputes them on the
+# reloaded export. One definition so the two sides cannot drift.
+PROBE_BATCH = 2
+PROBE_SEQ = 256
+PROBE_SEED = 0
+
+
+def probe_token_ids(vocab: int, batch: int = PROBE_BATCH, seq: int = PROBE_SEQ, seed: int = PROBE_SEED) -> torch.Tensor:
+    """Deterministic random token ids on CPU for the logits probe."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randint(0, vocab, (batch, seq), generator=gen)
+
+
+def logits_path(prefix: str, rank: int) -> str:
+    """Where a rank's probe logits are saved: beside the report named by `prefix`."""
+    return f"{prefix}-logits-rank{rank}.pt"
 
 
 # NeMo target name -> HF names of the source tensors it was built from.
@@ -57,7 +85,8 @@ class Source:
             self.weight_map = json.load(f)["weight_map"]
         self._open: dict[str, object] = {}
 
-    def _tensor(self, name: str) -> torch.Tensor:
+    def tensor(self, name: str) -> torch.Tensor:
+        """The stored tensor as written in the shard: codes, scales, or plain weights, no conversion."""
         shard = self.weight_map[name]
         if shard not in self._open:
             if len(self._open) > 4:
@@ -66,13 +95,13 @@ class Source:
         return self._open[shard].get_tensor(name)
 
     def dense(self, name: str) -> torch.Tensor:
-        w = self._tensor(name)
-        s = self._tensor(name[: -len(".weight")] + ".scale")
+        w = self.tensor(name)
+        s = self.tensor(name[: -len(".weight")] + ".scale")
         return Q.dequantize_fp8_blocks(w, s)
 
     def expert(self, layer: int, e: int, which: str) -> torch.Tensor:
         base = f"layers.{layer}.ffn.experts.{e}.{which}"
-        return Q.dequantize_fp4_rows(self._tensor(base + ".weight"), self._tensor(base + ".scale"))
+        return Q.dequantize_fp4_rows(self.tensor(base + ".weight"), self.tensor(base + ".scale"))
 
 
 def _local(t: torch.Tensor) -> torch.Tensor:
@@ -141,10 +170,13 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--config", required=True)
     parser.add_argument("--snapshot", required=True)
-    parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--seq", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=PROBE_BATCH)
+    parser.add_argument("--seq", type=int, default=PROBE_SEQ)
+    parser.add_argument("--seed", type=int, default=PROBE_SEED)
     parser.add_argument("--skip-source-check", action="store_true")
+    add_override_arguments(parser)
+    parser.add_argument("--expect-logits", default=None, metavar="PREFIX",
+                        help="compare hooked logits bit for bit with PREFIX-logits-rank{rank}.pt saved by proxy_step --export")
     args = parser.parse_args(argv)
 
     from nemo_automodel.components.config.loader import load_yaml_config
@@ -152,6 +184,7 @@ def main(argv=None) -> int:
 
     t0 = time.monotonic()
     cfg = load_yaml_config(args.config)
+    overrides = apply_overrides(cfg, args.set, args.unset)
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -159,6 +192,7 @@ def main(argv=None) -> int:
     model.eval()
     device = next(model.parameters()).device
     report = {"rank": rank, "setup_seconds": round(time.monotonic() - t0, 1)}
+    report["overrides"] = overrides
     report["param_dtypes"] = sorted({str(p.dtype) for p in model.parameters()})
 
     state = FQ.install(model)
@@ -169,8 +203,7 @@ def main(argv=None) -> int:
         report["source_mismatches"] = check_source(state, Source(args.snapshot), rank)
 
     vocab = int(model.config.vocab_size)
-    gen = torch.Generator().manual_seed(args.seed)
-    input_ids = torch.randint(0, vocab, (args.batch, args.seq), generator=gen).to(device)
+    input_ids = probe_token_ids(vocab, args.batch, args.seq, args.seed).to(device)
     FQ.uninstall(state)
     plain = logits(model, input_ids)
     state = FQ.install(model)
@@ -182,6 +215,23 @@ def main(argv=None) -> int:
     report["logits_hooked_max_abs_diff"] = float((plain - hooked).abs().max())
     report["logits_hooked_differing"] = int((plain != hooked).sum())
     report["logits_restored_equal"] = bool(torch.equal(plain, restored))
+
+    # Reload check: the export holds Q(master) exactly, a fixed point of the
+    # quantizer, so the saved logits must be reproduced bit for bit; a missing
+    # file or a shape mismatch is a failure, not a skipped check.
+    if args.expect_logits is not None:
+        path = logits_path(args.expect_logits, rank)
+        if not os.path.exists(path):
+            raise SystemExit(f"--expect-logits: {path} does not exist")
+        saved = torch.load(path, map_location="cpu")
+        got = hooked.cpu()
+        report["expected_logits_path"] = path
+        report["logits_saved_shape"] = list(saved.shape)
+        if saved.shape != got.shape:
+            raise SystemExit(f"--expect-logits: saved logits {tuple(saved.shape)} do not match probe {tuple(got.shape)}")
+        report["logits_match_saved"] = bool(torch.equal(saved, got))
+        report["logits_saved_max_abs_diff"] = float((saved - got).abs().max())
+        report["logits_saved_differing"] = int((saved != got).sum())
     report["elapsed_seconds"] = round(time.monotonic() - t0, 1)
 
     ok = (
@@ -189,6 +239,7 @@ def main(argv=None) -> int:
         and not report.get("source_mismatches")
         and report["logits_hooked_equal"]
         and report["logits_restored_equal"]
+        and report.get("logits_match_saved", True)
     )
     report["ok"] = ok
     print(json.dumps(report, indent=1), flush=True)

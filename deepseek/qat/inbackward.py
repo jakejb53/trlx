@@ -22,6 +22,13 @@ Requirements, checked at construction: one microbatch per step (accumulation
 would require holding gradients), and a topology where a single all-reduce over
 the world group yields the global norm (``tp = pp = cp = 1`` and the
 data-parallel and expert-parallel groups both span the world).
+
+Update period per class (``every``): a class with period N is stepped only on
+steps whose index is a multiple of N; on the other steps its gradient still
+counts toward the norm and is then freed without an optimizer call, so the
+class's Adam moments are untouched. This is the frequency-split lever: under
+Adam, 1 step in N at rate r drifts the same expected distance as every step at
+r/N, with every applied update at the full rate.
 """
 
 import math
@@ -62,6 +69,7 @@ class InBackwardStepper:
         scale_grads: Callable[[], None],
         reduce_group=None,
         class_of: Callable[[str], str] | None = None,
+        every: dict[str, int] | None = None,
     ):
         # Duck-typed: LocalShardOptimizer and MasterOptimizer both provide step_param.
         if not callable(getattr(optimizer, "step_param", None)):
@@ -87,6 +95,15 @@ class InBackwardStepper:
                 if q.requires_grad:
                     self._class_by_param[id(q)] = class_of(name) if class_of is not None else "all"
         self.classes: list[str] = sorted(set(self._class_by_param.values()))
+        # Update period per class; absent means every step. A period for a class
+        # that does not exist is a configuration error, not a silent no-op.
+        self.every: dict[str, int] = {}
+        for cls, n in (every or {}).items():
+            if cls not in self.classes:
+                raise ValueError(f"update period given for unknown class {cls!r}; classes are {self.classes}")
+            if not (isinstance(n, int) and n >= 1):
+                raise ValueError(f"update period for class {cls!r} must be a positive integer, got {n!r}")
+            self.every[cls] = n
         self.coefs: dict[str, float] = {c: 1.0 for c in self.classes}
         self.last_norms: dict[str, float] = {}
         self.last_norm: float | None = None  # global norm over all classes
@@ -129,10 +146,13 @@ class InBackwardStepper:
             event = torch.cuda.Event()
             event.record()
         self._sq_parts.append((cls, sq, event))
-        coef = self.coefs[cls]
-        if coef != 1.0:
-            g.mul_(coef)
-        self.optimizer.step_param(p)
+        # A class off its update period contributes to the norm above and is
+        # otherwise skipped: no optimizer call, so its moments do not advance.
+        if self.step_count % self.every.get(cls, 1) == 0:
+            coef = self.coefs[cls]
+            if coef != 1.0:
+                g.mul_(coef)
+            self.optimizer.step_param(p)
         p.grad = None
         self._stepped.add(id(p))
 
@@ -181,8 +201,10 @@ class InBackwardStepper:
 # Build a stepper for a NeMo training recipe after ``recipe.setup()``. Checks the
 # topology the single all-reduce relies on and disables the recipe's own clip
 # (``max_grad_norm = None``), since the YAML cannot express "no clipping": an
-# absent or null key falls back to 1.0 in the recipe.
-def from_recipe(recipe, max_norm: float, per_class: bool = False) -> InBackwardStepper:
+# absent or null key falls back to 1.0 in the recipe. ``dense_every`` sets the
+# dense update period; it needs the dense/expert classifier and therefore
+# implies per-class clipping (a no-effect lever, stage 5 phase C).
+def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: int = 1) -> InBackwardStepper:
     from nemo_automodel.components.training.utils import (
         get_expert_tp_replication_factor,
         scale_grads_and_clip_grad_norm,
@@ -221,6 +243,9 @@ def from_recipe(recipe, max_norm: float, per_class: bool = False) -> InBackwardS
         )
 
     recipe.max_grad_norm = None
+    if dense_every < 1:
+        raise ValueError(f"dense_every must be a positive integer, got {dense_every}")
     # Dense (attention, shared experts) and routed experts clipped separately.
-    class_of = (lambda name: "expert" if ".mlp.experts" in name else "dense") if per_class else None
-    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of)
+    class_of = (lambda name: "expert" if ".mlp.experts" in name else "dense") if (per_class or dense_every > 1) else None
+    every = {"dense": dense_every} if dense_every > 1 else None
+    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every)

@@ -1,7 +1,8 @@
 """CPU tests for update-in-backward on plain parameters: the hooked path equals a
 normal step with the same clip coefficient, the stored norm is the exact global
 norm, the coefficient lags one step, gradients are freed, the scaling callback
-sees exactly one gradient, and a parameter without a gradient is an error."""
+sees exactly one gradient, a class on an update period skips its optimizer call
+without touching its moments, and a parameter without a gradient is an error."""
 
 import copy
 import math
@@ -114,6 +115,51 @@ class PerClass(unittest.TestCase):
                 self.assertTrue(torch.equal(a, b))
         # The two classes saw different norms, so the test exercised two coefficients.
         self.assertNotAlmostEqual(stepper.coefs["a"], stepper.coefs["b"], places=3)
+
+
+class UpdatePeriod(unittest.TestCase):
+    # Class "a" updates on 1 step in 2, class "b" every step. The reference skips
+    # the optimizer for class "a" on the other steps by dropping its gradients, which
+    # leaves torch AdamW's moments and step counters for those parameters untouched;
+    # the hooked parameters must match it exactly on every step, and the norm must
+    # still include the skipped class's gradient.
+    def test_skipped_steps_match_reference_and_leave_moments_alone(self):
+        hooked = _model()
+        reference = copy.deepcopy(hooked)
+        opt_h = LocalShardOptimizer(list(hooked.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        opt_r = torch.optim.AdamW(reference.parameters(), lr=LR, weight_decay=0.0)
+        class_of = lambda name: "a" if name.startswith("0.") else "b"
+        loose = 1e9  # clipping off, so the comparison isolates the update period
+        stepper = InBackwardStepper([hooked], opt_h, loose, lambda: None, class_of=class_of, every={"a": 2})
+        torch.manual_seed(1)
+        a_params = [p for n, p in reference.named_parameters() if class_of(n) == "a"]
+        for step, x in enumerate([torch.randn(4, 16) for _ in range(4)]):
+            opt_r.zero_grad()
+            _loss(reference, x).backward()
+            norm = _global_norm(reference)
+            if step % 2:
+                for p in a_params:
+                    p.grad = None
+            opt_r.step()
+
+            _loss(hooked, x).backward()
+            self.assertTrue(all(p.grad is None for p in hooked.parameters()), "gradients were not freed")
+            self.assertAlmostEqual(stepper.end_step(), norm, places=5)
+            for a, b in zip(hooked.parameters(), reference.parameters()):
+                self.assertTrue(torch.equal(a, b), f"mismatch at step {step}")
+        # Class "a" stepped twice (steps 0 and 2); class "b" four times.
+        a_state = [opt_r.state[p]["step"] for p in a_params]
+        self.assertTrue(all(float(s) == 2 for s in a_state))
+        self.assertEqual(stepper.step_count, 4)
+
+    def test_rejects_unknown_class_and_bad_period(self):
+        model = _model()
+        opt = LocalShardOptimizer(list(model.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        class_of = lambda name: "a" if name.startswith("0.") else "b"
+        with self.assertRaisesRegex(ValueError, "unknown class"):
+            InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, every={"c": 2})
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, every={"a": 0})
 
 
 class Failures(unittest.TestCase):

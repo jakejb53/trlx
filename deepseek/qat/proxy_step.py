@@ -22,12 +22,20 @@ built. Launch from the repo root:
 
 ``--in-backward`` steps each parameter inside backward with lagged clipping
 (``deepseek.qat.inbackward``) instead of the recipe's post-backward clip and step.
+
+``--export DIR`` (stage 6) records the hooked logits on the shared probe token
+ids after training, saved as ``<out stem>-logits-rank{rank}.pt``, then writes
+the trained targets as a complete checkpoint in the layout of the recipe's
+``pretrained_model_name_or_path`` (``deepseek.qat.proxy_export``). The names of
+the replaced tensors go to ``<out stem>-replaced.txt`` for ``verify_export
+--expect @FILE``. Requires ``--out``; ``--force`` replaces an existing DIR.
 """
 
 import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 
@@ -38,7 +46,11 @@ from torch.distributed.tensor import DTensor
 from deepseek.qat import fakequant as FQ
 from deepseek.qat import quant as Q
 from deepseek.qat import inbackward
+from deepseek.qat import proxy_export
+from deepseek.qat.export import ExportError
 from deepseek.qat.freeze import freeze_gate_bias
+from deepseek.qat.overrides import add_override_arguments, apply_overrides
+from deepseek.qat.proxy import logits as hooked_logits, logits_path, probe_token_ids
 
 
 # One dense and one expert chunk from the inner optimizer's parameter list, by size.
@@ -123,50 +135,30 @@ def value_changes(before: tuple[torch.Tensor, torch.Tensor], after: tuple[torch.
     return total
 
 
-# Apply --set KEY=VALUE (YAML scalar) and --unset KEY to a loaded NeMo config
-# before the recipe is built, so one recipe file serves every arm of a
-# comparison. Returns what was applied for the report. Bad syntax or an
-# --unset of a key the recipe does not have is a usage error, not a silent no-op.
-def apply_overrides(cfg, sets: list[str], unsets: list[str]) -> dict:
-    import yaml
-    from nemo_automodel.components.config.loader import ConfigNode
-
-    applied: dict = {"set": {}, "unset": []}
-    for item in sets:
-        key, sep, raw = item.partition("=")
-        if not sep or not key:
-            raise SystemExit(f"--set expects KEY=VALUE, got {item!r}")
-        cfg.set_by_dotted(key, yaml.safe_load(raw))
-        applied["set"][key] = raw
-    for key in unsets:
-        parts = key.split(".")
-        node = cfg
-        for part in parts[:-1]:
-            node = node.__dict__.get(part)
-            if not isinstance(node, ConfigNode):
-                raise SystemExit(f"--unset {key}: {part!r} is not a section of the recipe")
-        if parts[-1] not in node.__dict__:
-            raise SystemExit(f"--unset {key}: key not present in the recipe")
-        del node.__dict__[parts[-1]]
-        applied["unset"].append(key)
-    return applied
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--config", required=True)
     parser.add_argument("--out", default=None, help="write the rank-0 report here as JSON")
     parser.add_argument("--in-backward", action="store_true",
                         help="step each parameter inside backward with lagged clipping at the recipe's max_norm")
-    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
-                        help="override a dotted recipe key with a YAML scalar before building (repeatable)")
-    parser.add_argument("--unset", action="append", default=[], metavar="KEY",
-                        help="delete a dotted recipe key before building (repeatable)")
+    add_override_arguments(parser)
     parser.add_argument("--per-class-clip", action="store_true",
                         help="with --in-backward: clip dense (attention, shared experts) and routed experts by separate norms")
+    parser.add_argument("--dense-every", type=int, default=1, metavar="N",
+                        help="with --in-backward: update dense parameters on 1 step in N (gradients discarded otherwise, "
+                             "Adam moments untouched); experts update every step; implies --per-class-clip")
     parser.add_argument("--trainable-subset", choices=("all", "dense", "experts"), default="all",
                         help="which targets the recipe is expected to train (ablations freeze the rest via --set); the exact-set check uses it")
+    parser.add_argument("--export", default=None, metavar="DIR",
+                        help="after training, export the trained targets as a complete checkpoint in the source layout (requires --out)")
+    parser.add_argument("--force", action="store_true", help="replace an existing --export directory")
     args = parser.parse_args(argv)
+    if args.export is not None and not args.out:
+        parser.error("--export requires --out: probe logits and the replaced-tensor list are saved beside the report")
+    if args.dense_every < 1:
+        parser.error(f"--dense-every must be a positive integer, got {args.dense_every}")
+    if args.dense_every > 1 and not args.in_backward:
+        parser.error("--dense-every needs --in-backward: the update period lives in the stepper")
 
     from nemo_automodel.components.config.loader import load_yaml_config
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -174,6 +166,11 @@ def main(argv=None) -> int:
     t0 = time.monotonic()
     cfg = load_yaml_config(args.config)
     overrides = apply_overrides(cfg, args.set, args.unset)
+    # The export copies untouched tensors from the checkpoint the model loads,
+    # so a train-on-export run exports from that export, not the original snapshot.
+    snapshot = cfg.model.config.pretrained_model_name_or_path
+    if args.export is not None and not os.path.isfile(os.path.join(snapshot, "model.safetensors.index.json")):
+        raise SystemExit(f"--export: the recipe's model path {snapshot} has no model.safetensors.index.json to export from")
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -192,8 +189,9 @@ def main(argv=None) -> int:
     # NeMo reports once its clip is disabled.
     stepper = None
     if args.in_backward:
-        stepper = inbackward.from_recipe(recipe, recipe.max_grad_norm, per_class=args.per_class_clip)
-        report["per_class_clip"] = args.per_class_clip
+        stepper = inbackward.from_recipe(recipe, recipe.max_grad_norm, per_class=args.per_class_clip, dense_every=args.dense_every)
+        report["per_class_clip"] = args.per_class_clip or args.dense_every > 1
+        report["dense_every"] = args.dense_every
         original_step = recipe._run_train_optim_step
 
         def stepping(batches, max_grad_norm=None):
@@ -389,6 +387,34 @@ def main(argv=None) -> int:
         and not report["target_not_trainable"]
         and total_value_changes > 0
     )
+
+    # Stage 6: probe logits under the hooks, then export. The probe runs in
+    # eval mode on the shared token ids so `proxy --expect-logits` on the
+    # reloaded export reproduces it bit for bit. Every rank saves its own
+    # logits and joins the export collectives; rank 0 alone writes. A refused
+    # or failed export is recorded and fails the run instead of raising, so
+    # the other ranks still reach the final all-reduce rather than hanging.
+    if args.export is not None:
+        prefix = os.path.splitext(args.out)[0]
+        model.eval()
+        ids = probe_token_ids(int(model.config.vocab_size)).to(next(model.parameters()).device)
+        torch.save(hooked_logits(model, ids).cpu(), logits_path(prefix, rank))
+        report["probe_logits_path"] = logits_path(prefix, rank)
+        t2 = time.monotonic()
+        try:
+            exported = proxy_export.export_trained(state, target_params, snapshot, args.export, force=args.force)
+        except ExportError as e:
+            print(f"export failed: {e}", file=sys.stderr, flush=True)
+            report["export_error"] = str(e)
+            ok = False
+        else:
+            if rank == 0:
+                replaced_file = f"{prefix}-replaced.txt"
+                with open(replaced_file, "w", encoding="utf-8") as f:
+                    f.write("".join(f"{n}\n" for n in exported.pop("replaced")))
+                exported["replaced_file"] = replaced_file
+                exported["export_seconds"] = round(time.monotonic() - t2, 1)
+                report["export"] = exported
     report["ok"] = ok
     report["elapsed_seconds"] = round(time.monotonic() - t0, 1)
     if rank == 0:

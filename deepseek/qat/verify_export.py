@@ -9,7 +9,9 @@ asserted to differ only in its reported tensors.
 Usage: python -m deepseek.qat.verify_export SOURCE_DIR OTHER_DIR [--expect NAME ...]
 
 With ``--expect``, exit 0 only when the set of differing tensors equals the
-given names exactly and nothing else differs.
+given names exactly and nothing else differs. ``@FILE`` anywhere on the command
+line expands to that file's lines, one argument per line, so a long replaced
+list (``proxy_step --export`` writes one) is passed as ``--expect @FILE``.
 """
 
 import argparse
@@ -66,7 +68,7 @@ def _walk(root: str) -> list[str]:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], fromfile_prefix_chars="@")
     parser.add_argument("source")
     parser.add_argument("other")
     parser.add_argument("--expect", nargs="*", default=None, help="tensor names expected to differ, and nothing else")
