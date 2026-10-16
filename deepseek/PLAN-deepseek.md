@@ -55,9 +55,27 @@ PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-p
     --set step_scheduler.global_batch_size=2 --set step_scheduler.local_batch_size=1 --out REPORT.json
 ```
 
+Handoff 5 runs (both GPUs). Routing scores and `top_p` selection (about 6 minutes);
+the ESFT arm (about 40 minutes); the joint arm with the per-expert flip table:
+
+```sh
+deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.route_scores \
+    --config deepseek/qat/proxy-train.yaml --top-p 0.2 --out deepseek/exports/logs/route-scores-engineering.json
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 \
+    -m deepseek.qat.proxy_step --config deepseek/qat/proxy-train.yaml --in-backward \
+    --expert-selection deepseek/exports/logs/route-scores-engineering.json \
+    --set optimizer.lr=1e-4 --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=10 \
+    --set step_scheduler.global_batch_size=2 --set step_scheduler.local_batch_size=1 --out REPORT.json
+# per-expert table against routing share: replace --expert-selection with
+#   --expert-shares deepseek/exports/logs/route-scores-engineering.json
+# frequency split: add --dense-every 4
+```
+
 Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
 `proxy-stage3-*.json`, `proxy-stage4-*.json`, `proxy-stage5-*.json`,
-`proxy-stage6-*`). Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
+`proxy-stage6-*`) plus `proxy-split-dense4.json` (Handoff 4),
+`route-scores-engineering.json`, `proxy-esft-top02.json`, and
+`proxy-joint-perexpert.json` (Handoff 5). Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
 `stage6-experts/` and `stage6-sequential/` (stage 6), 156 GB each; all can be
 deleted and regenerated.
 
@@ -688,18 +706,26 @@ deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config dee
 ### Stage 7: full model on 8x B200 or B300 (planned)
 
 Docker image from the gate-passing venv lockfile with a verifier script run first.
-One update, bounded convergence run, export, fresh-process equality, Transformers
-and vLLM probes on the RTX PRO 6000 pair. Memory plan with `ep_size: 8`: each rank
-owns 32 experts per layer outside FSDP; BF16 masters plus 8-bit Adam is about 141 GB
-per GPU before activations, 4-bit about 106 GB. These are resident-state figures;
-the steady-state peak adds activations, `min_error` fake-quant temporaries during
-recompute, and torchao step temporaries, and must be measured on a multi-step run
-(Handoff 2). A B300 host is available if the B200 budget is too tight. The
+Routing scores over the training data on the training host, then selection, then
+one update, bounded convergence run, export, fresh-process equality, Transformers
+and vLLM probes on the RTX PRO 6000 pair. Memory plan with `ep_size: 8` and
+ESFT-style selection (Handoff 5): each rank owns 32 experts per layer outside FSDP
+as dequantized BF16, about 72 GB of weights per rank for the full model, which now
+dominates; 8-bit moments are under 2 GB for dense and a few GB for the selected
+experts (about 71 GB per rank if every expert were trained, the pre-selection
+figure of 141 GB per GPU with all experts no longer applies). Weights fall further
+only if unselected experts could stay in MXFP4, which NeMo's one-tensor-per-layer
+expert layout does not allow. These are resident-state figures; the steady-state
+peak adds activations, `min_error` fake-quant temporaries during recompute, and
+torchao step temporaries, and must be measured on a multi-step run (Handoff 2).
+With selection the 8x RTX PRO 6000 (96 GB) host is borderline on activations rather
+than ruled out; the B200 is comfortable, and a B300 host is available. The
 preparation decisions are listed in Handoff 6. Expert flips arrive tens of steps
 after dense changes at the same rate (stage 5), and a joint run at one rate starves
-them once dense fits (phase C), so production runs need more steps than a dense
-recipe and dense slowed relative to experts (Handoff 4, 5, 6); the flip fraction is
-the leading indicator to watch, not the loss.
+them once dense fits (phase C). Selection is the primary remedy: the task-routed
+experts flip at full dense speed (Handoff 5.3). Dense slowing is a tuning knob
+(Handoff 4). Production runs need more steps than a dense recipe, and the per-layer
+and per-expert flip fractions are the leading indicators to watch, not the loss.
 
 ## Verified facts
 
@@ -754,6 +780,11 @@ the leading indicator to watch, not the loss.
   expert; hash-routing gates (`num_hash_layers: 3`) have no correction bias.
   Expert gradients are divided by the data-parallel over expert-shard ratio before
   clipping, and the optimizer and scheduler step after clipping.
+- torchao 0.18 `_AdamBase` allocates `exp_avg` and `exp_avg_sq` lazily inside
+  `step`, on the first step a parameter arrives with a gradient; construction and
+  `add_param_group` allocate nothing. `LocalShardOptimizer.restrict_rows` relies on
+  this to swap a parameter's chunk views before the first step and refuses once
+  any state exists. Re-verify on a torchao upgrade.
 - Safetensors shards: headers are compact JSON padded with spaces to 8 bytes,
   tensor order equals offset order, no gaps; `json.dumps` with `(",", ":")`
   reproduces them.
