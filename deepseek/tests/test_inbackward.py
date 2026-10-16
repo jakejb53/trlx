@@ -2,7 +2,8 @@
 normal step with the same clip coefficient, the stored norm is the exact global
 norm, the coefficient lags one step, gradients are freed, the scaling callback
 sees exactly one gradient, a class on an update period skips its optimizer call
-without touching its moments, and a parameter without a gradient is an error."""
+without touching its moments, a row selection steps only the selected rows and
+excludes the rest from the norm, and a parameter without a gradient is an error."""
 
 import copy
 import math
@@ -160,6 +161,54 @@ class UpdatePeriod(unittest.TestCase):
             InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, every={"c": 2})
         with self.assertRaisesRegex(ValueError, "positive integer"):
             InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, every={"a": 0})
+
+
+class RowSelection(unittest.TestCase):
+    # rows_of selects rows 0..7 of the first Linear's weight: the hooked model
+    # matches a reference that zeroes the other rows' gradients before its
+    # step (AdamW with a zero gradient and zero moments leaves a row unchanged
+    # only if it never had state, so the reference drops those rows from its
+    # optimizer entirely), and the reported norm excludes the unselected rows.
+    def test_selected_rows_only(self):
+        hooked = _model()
+        reference = copy.deepcopy(hooked)
+        rows = list(range(8))
+        opt_h = LocalShardOptimizer(list(hooked.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        ref_params = list(reference.parameters())
+        w0 = ref_params[0]
+        w0_rows = nn.Parameter(w0.detach()[rows].clone())
+        opt_r = torch.optim.AdamW([w0_rows] + ref_params[1:], lr=LR, weight_decay=0.0)
+        rows_of = lambda name: rows if name == "0.weight" else None
+        stepper = InBackwardStepper([hooked], opt_h, 1e9, lambda: None, rows_of=rows_of)
+        torch.manual_seed(1)
+        for x in [torch.randn(4, 16) for _ in range(3)]:
+            opt_r.zero_grad()
+            _loss(reference, x).backward()
+            g0 = w0.grad.clone()
+            w0.grad = None
+            w0_rows.grad = g0[rows]
+            norm = math.sqrt(float(g0[rows].float().square().sum()) + sum(float(p.grad.float().square().sum()) for p in ref_params[1:]))
+            opt_r.step()
+            with torch.no_grad():
+                w0[rows] = w0_rows
+            _loss(hooked, x).backward()
+            self.assertAlmostEqual(stepper.end_step(), norm, places=5)
+            for a, b in zip(hooked.parameters(), reference.parameters()):
+                self.assertTrue(torch.equal(a, b))
+        # State for the 8 row views plus the three unrestricted parameters.
+        self.assertEqual(len(opt_h.inner.state), len(rows) + len(ref_params) - 1)
+
+    def test_requires_restrict_rows(self):
+        model = _model()
+
+        class NoRestrict:
+            param_groups = [{"params": [], "lr": LR}]
+
+            def step_param(self, p):
+                pass
+
+        with self.assertRaises(TypeError):
+            InBackwardStepper([model], NoRestrict(), MAX_NORM, lambda: None, rows_of=lambda n: [0])
 
 
 class Failures(unittest.TestCase):

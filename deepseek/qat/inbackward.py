@@ -23,6 +23,14 @@ would require holding gradients), and a topology where a single all-reduce over
 the world group yields the global norm (``tp = pp = cp = 1`` and the
 data-parallel and expert-parallel groups both span the world).
 
+Row selection (``rows_of``): for a parameter whose name maps to a list of local
+dim-0 rows, only those rows are stepped and hold optimizer state
+(``LocalShardOptimizer.restrict_rows``), and the other rows' gradients are zeroed
+before the norm so the class norm counts trained rows only. This freezes
+unselected experts inside NeMo's stacked expert parameters for ESFT-style
+selection; the selection is computed by the caller, which knows the global
+expert index of each local row.
+
 Update period per class (``every``): a class with period N is stepped only on
 steps whose index is a multiple of N; on the other steps its gradient still
 counts toward the norm and is then freed without an optimizer call, so the
@@ -70,6 +78,7 @@ class InBackwardStepper:
         reduce_group=None,
         class_of: Callable[[str], str] | None = None,
         every: dict[str, int] | None = None,
+        rows_of: Callable[[str], list[int] | None] | None = None,
     ):
         # Duck-typed: LocalShardOptimizer and MasterOptimizer both provide step_param.
         if not callable(getattr(optimizer, "step_param", None)):
@@ -90,10 +99,23 @@ class InBackwardStepper:
         # each class has its own norm and coefficient, so a class with large
         # gradients does not throttle the drift of a class with small ones.
         self._class_by_param: dict[int, str] = {}
+        # Row masks for parameters with a selection: True rows are stepped.
+        # The optimizer is restricted here, before any step, so unselected rows
+        # never receive optimizer state.
+        self._row_mask: dict[int, torch.Tensor] = {}
         for mp in model_parts:
             for name, q in mp.named_parameters():
                 if q.requires_grad:
                     self._class_by_param[id(q)] = class_of(name) if class_of is not None else "all"
+                    rows = rows_of(name) if rows_of is not None else None
+                    if rows is not None:
+                        if not callable(getattr(optimizer, "restrict_rows", None)):
+                            raise TypeError(f"row selection needs an optimizer with restrict_rows, got {type(optimizer).__name__}")
+                        optimizer.restrict_rows(q, rows)
+                        local = _local(q)
+                        mask = torch.zeros(local.shape[0], dtype=torch.bool, device=local.device)
+                        mask[rows] = True
+                        self._row_mask[id(q)] = mask
         self.classes: list[str] = sorted(set(self._class_by_param.values()))
         # Update period per class; absent means every step. A period for a class
         # that does not exist is a configuration error, not a silent no-op.
@@ -140,6 +162,10 @@ class InBackwardStepper:
         self._scale_grads()
         g = _local(p.grad)
         cls = self._class_by_param[id(p)]
+        # Unselected rows contribute nothing to the norm and are never stepped.
+        mask = self._row_mask.get(id(p))
+        if mask is not None:
+            g.mul_(mask.view(-1, *([1] * (g.ndim - 1))).to(g.dtype))
         sq = _sum_sq(g)
         event = None
         if sq.is_cuda:
@@ -204,7 +230,8 @@ class InBackwardStepper:
 # absent or null key falls back to 1.0 in the recipe. ``dense_every`` sets the
 # dense update period; it needs the dense/expert classifier and therefore
 # implies per-class clipping (a no-effect lever, stage 5 phase C).
-def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: int = 1) -> InBackwardStepper:
+def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: int = 1,
+                rows_of: Callable[[str], list[int] | None] | None = None) -> InBackwardStepper:
     from nemo_automodel.components.training.utils import (
         get_expert_tp_replication_factor,
         scale_grads_and_clip_grad_norm,
@@ -248,4 +275,5 @@ def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: i
     # Dense (attention, shared experts) and routed experts clipped separately.
     class_of = (lambda name: "expert" if ".mlp.experts" in name else "dense") if (per_class or dense_every > 1) else None
     every = {"dense": dense_every} if dense_every > 1 else None
-    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every)
+    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every,
+                             rows_of=rows_of)

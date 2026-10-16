@@ -68,12 +68,56 @@ class LocalShardOptimizer(torch.optim.Optimizer):
         super().__init__(originals, dict(self.inner.defaults))
         self.param_groups = self.inner.param_groups
 
+    # Restrict a parameter's stepped rows to `rows` (local dim-0 indices): its
+    # chunks become one view per selected row, so the other rows are never
+    # stepped and never get optimizer state. This is how ESFT-style expert
+    # selection freezes unselected experts inside NeMo's stacked expert
+    # parameters. Must run before any step, while the inner optimizer holds no
+    # state, so the replaced views leave nothing behind; each row of every
+    # target is a multiple of torchao's 256-element state block. An empty
+    # selection freezes every row of this shard (a rank holding none of a
+    # layer's selected experts).
+    @torch.no_grad()
+    def restrict_rows(self, p: torch.Tensor, rows: list[int]) -> None:
+        old = self._chunks_by_param.get(id(p))
+        if old is None:
+            raise RuntimeError("restrict_rows called with a parameter this optimizer does not own")
+        if len(self.inner.state):
+            raise RuntimeError("restrict_rows must be called before the first optimizer step")
+        shard = (p.to_local() if isinstance(p, DTensor) else p).detach()
+        n = shard.shape[0]
+        if any(not (0 <= r < n) for r in rows) or len(set(rows)) != len(rows):
+            raise ValueError(f"restrict_rows needs distinct row indices in [0, {n}), got {rows}")
+        new = [(shard[r].requires_grad_(True), r) for r in sorted(rows)]
+        old_views = {id(v) for v, _ in old}
+        params = self.inner.param_groups[0]["params"]
+        kept = [q for q in params if id(q) not in old_views]
+        if len(kept) != len(params) - len(old):
+            raise RuntimeError("inner optimizer parameter list does not match the chunk views")
+        self.inner.param_groups[0]["params"] = kept + [v for v, _ in new]
+        for i, (q, chunks) in enumerate(self._entries):
+            if q is p:
+                self._entries[i] = (p, new)
+        self._chunks_by_param[id(p)] = new
+
+    # A parameter whose only chunk is itself needs no gradient mapping: its grad
+    # is already where the inner optimizer reads it. Every other layout (a
+    # DTensor's shard chunks, or row views after restrict_rows) maps the
+    # gradient onto the views.
+    @staticmethod
+    def _is_self_chunk(p: torch.Tensor, chunks) -> bool:
+        return len(chunks) == 1 and chunks[0][0] is p
+
+    @staticmethod
+    def _local_grad(p: torch.Tensor) -> torch.Tensor:
+        return p.grad.to_local().detach() if isinstance(p, DTensor) else p.grad.detach()
+
     @torch.no_grad()
     def step(self, closure=None):
         for p, chunks in self._entries:
-            if not isinstance(p, DTensor):
+            if self._is_self_chunk(p, chunks):
                 continue
-            g = None if p.grad is None else p.grad.to_local().detach()
+            g = None if p.grad is None else self._local_grad(p)
             for view, sl in chunks:
                 view.grad = None if g is None else g[sl]
         return self.inner.step(closure)
@@ -82,8 +126,6 @@ class LocalShardOptimizer(torch.optim.Optimizer):
     # mapped onto its chunk views, the inner optimizer runs (every other chunk
     # has no gradient and is skipped by the optimizer's usual None check), and
     # the chunk gradients are released. The caller owns ``p.grad`` and frees it.
-    # A plain parameter's single chunk is the parameter itself, so its grad is
-    # already in place and the view assignment is a no-op.
     @torch.no_grad()
     def step_param(self, p: torch.Tensor) -> None:
         chunks = self._chunks_by_param.get(id(p))
@@ -91,19 +133,20 @@ class LocalShardOptimizer(torch.optim.Optimizer):
             raise RuntimeError("step_param called with a parameter this optimizer does not own")
         if p.grad is None:
             raise RuntimeError("step_param called with a parameter that has no gradient")
-        g = p.grad.to_local().detach() if isinstance(p, DTensor) else p.grad
-        if isinstance(p, DTensor):
+        mapped = not self._is_self_chunk(p, chunks)
+        if mapped:
+            g = self._local_grad(p)
             for view, sl in chunks:
                 view.grad = g[sl]
         self.inner.step()
-        if isinstance(p, DTensor):
+        if mapped:
             for view, _ in chunks:
                 view.grad = None
 
     def zero_grad(self, set_to_none: bool = True):
         for p, chunks in self._entries:
             p.grad = None
-            if isinstance(p, DTensor):
+            if not self._is_self_chunk(p, chunks):
                 for view, _ in chunks:
                     view.grad = None
 

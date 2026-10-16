@@ -19,8 +19,11 @@ is a snapshot of `Q(master)`. There is no post-training requantization step.
 
 Read this first when resuming. Stages 0 to 6 are complete: routed experts train
 under QAT (stage 5), and a trained proxy exports to a complete source-layout
-checkpoint that reloads bit-identically, twice in a chain (stage 6). Next: the
-frequency-split run (Handoff 4), then stage 7 preparation (Handoff 5). The dataset,
+checkpoint that reloads bit-identically, twice in a chain (stage 6). The frequency
+split (Handoff 4) passed: slowing dense restores expert flips. ESFT-style expert
+selection (Handoff 5) is implemented and measured: selected experts flip at the
+split arm's rate with dense at full speed, unselected experts stay byte-identical,
+peak memory 48 GB against 70. Next: stage 7 preparation (Handoff 6). The dataset,
 optimizer, trainable set, and mechanism are decided and verified below. Every
 command runs from the repository root `/home/goon/trl/trlx`. Launch GPU runs from
 a plain terminal with `nohup`: the post-training report phase drives host memory
@@ -32,7 +35,7 @@ Run all unit tests (CPU, under a minute; the data tests need the snapshot):
 deepseek/venv/bin/python -B -m unittest deepseek.tests.test_quant deepseek.tests.test_export \
     deepseek.tests.test_fakequant deepseek.tests.test_data deepseek.tests.test_freeze \
     deepseek.tests.test_inbackward deepseek.tests.test_optim deepseek.tests.test_proxy_step \
-    deepseek.tests.test_proxy_export
+    deepseek.tests.test_proxy_export deepseek.tests.test_route_scores
 ```
 
 Reproduce the stage 3 one-step check (about 5 minutes, both GPUs):
@@ -69,33 +72,124 @@ Open items, in order:
    itself is still unmeasured (sample allocated memory at end of backward with and
    without it).
 3. Gate runs save weights with `proxy_step --export DIR` (stage 6).
-4. Next run: the frequency split (`proxy_step --in-backward --dense-every 4`,
-   report `proxy-split-dense4.json`). Joint training at 1e-4 for 100 steps with dense
+4. Frequency split (complete; `proxy_step --in-backward --dense-every 4`, report
+   `proxy-split-dense4.json`). Joint training at 1e-4 for 100 steps with dense
    parameters updated on 1 step in 4 (gradients discarded on the other steps, Adam
-   moments untouched, per-class clipping implied) and experts every step. Premise (stage 5 phase C): a joint
-   run starves experts because dense fits the data in about 30 steps and removes
-   the gradient-sign consistency experts need to cross cells; slowing dense keeps
-   the signal alive. Under Adam, 1 in N at rate r and every step at r/N drift the
-   same expected distance, so this is the per-class rate with every dense update
-   at the proven 1e-4. N = 4 is the FP4/FP8 cell-size ratio. Pass: expert values
-   changed at step 100 well above the joint arm's 1.45% and toward the experts-only
-   4.84%, with dense values also changing and held-out falling after the first
-   validation. Dense will not reach the ceiling in 25 updates; that is not the
-   question. Fail: experts stay near 1.45%, which contradicts the phase C reading
-   and needs rethinking before stage 7. A pass shows direction only: the optimum N,
-   a constant versus flip-rate-keyed dynamic ratio, and rate versus frequency are
-   stage 7 tuning questions the proxy cannot rank, since it measures flips and
-   curve shapes, not quality. The per-class signals available for a controller are
-   gradient norm and flip fraction, not loss. Experts-first sequencing (stage 6
-   sequential experiment) is measured and not pursued further.
-5. Stage 7 preparation list, each a separate decision: steady-state memory plan;
-   the dense-slowing lever as a recipe setting (per-class rate via `optim.py` param
-   groups, or the step frequency) with a warmup for any class entering training
-   (stage 6: a fresh Adam state at 1e-4 lifted held-out 5.24 to 5.67 in ten steps);
-   the container from the gate-passing lockfile; the dataset; an evaluation on
-   prompts outside the SFT distribution, since held-out loss on same-distribution
-   rows cannot separate dense fitting the data from experts generalizing from it
-   (stage 5).
+   moments untouched, per-class clipping implied) and experts every step. Premise
+   (stage 5 phase C): a joint run starves experts because dense fits the data in
+   about 30 steps and removes the gradient-sign consistency experts need to cross
+   cells; slowing dense keeps the signal alive. Under Adam, 1 in N at rate r and
+   every step at r/N drift the same expected distance, so this is the per-class
+   rate with every dense update at the proven 1e-4; N = 4 is the FP4/FP8 cell-size
+   ratio. Result: expert values changed 2.79% at step 100 (joint 1.45%, joint with
+   per-class clip 1.79%, experts-only 4.84%), first flips at step 30 instead of
+   50, dense 47.4% (54% at every step), held-out 16.18 to 5.13 (joint 4.17,
+   experts-only 5.24), expert gradient norm 4.75 to 1.36 (phase C: to 0.81), peak
+   70.0 GB. Pass: the signal-lifetime mechanism is confirmed and slowing dense is
+   a working lever. It is demoted to a stage 7 tuning knob (the optimum N, rate
+   versus frequency, and a flip-rate-keyed dynamic ratio are quality questions the
+   proxy cannot rank), because it is a blunt instrument: it slows every dense
+   parameter to keep signal alive for every expert, including the long tail the
+   task never routes to, whose masters random-walk under Adam at about one
+   learning rate per step and would flip cells on noise at production step counts
+   (about 3e-3 expected wander over a thousand steps at 1e-4, the median FP4
+   half-cell). Experts-first sequencing (stage 6) is measured and not pursued.
+5. Decided direction: ESFT-style expert selection (Wang et al. 2024, code in
+   `deepseek/ESFT/`, DeepSeek-V2-Lite under HF Transformers; the method, not the
+   code, transfers). Score every routed expert by the base model's routing on the
+   training rows (`token_scores`: share of routed top-k slots; `gate_scores`:
+   summed gate weight), select per layer in descending score until cumulative
+   `top_p`, train only the selected experts, freeze the rest byte for byte. Same
+   ownership as ours: frozen router and correction bias, selection stable because
+   routing is frozen, publication contract unchanged. Two wins: selected experts
+   are the ones with enough task tokens to build consistent gradient sign and
+   cross FP4 cells (the surgical form of what the frequency split does bluntly),
+   and 8-bit optimizer state shrinks with the trainable set (full model: about
+   71 GB per rank at `ep_size` 8 for all experts, about 7 GB at 10%), which may
+   return the 8x RTX PRO 6000 host from fallback to primary. Caveat: ESFT is a
+   BF16 result; its rates and quality numbers say nothing about flips. Steps 1 to
+   3 are complete:
+   1. Routing concentration (`deepseek/qat/route_scores.py`, report
+      `route-scores-engineering.json`): a forward over the 142 training rows
+      (421,631 tokens) with a hook on each `mlp.gate` (`forward(x, token_mask,
+      cp_mesh)` returns `(weights, indices, aux_loss)`; 256 experts, top-6),
+      accumulating ESFT's two scores. Experts covering 20/50/80% of routed slots:
+      hash layers 0 to 2 about 25/85/175 (uniform would be 51/128/205), scored
+      layer 3 8/42/115 with the top expert at 4.2% of slots, 10.7x uniform. No
+      expert has zero slots. `top_p` 0.2 selects 25, 25, 25, 8 = 83 of 1,024.
+      Selection concentrates signal on scored layers, 40 of the full model's 43;
+      the proxy over-represents hash layers, so layer 3 is the transferable number.
+   2. Selection in the proxy stack: `proxy_step --expert-selection SCORES.json`
+      (needs `--in-backward`). `LocalShardOptimizer.restrict_rows` rebuilds an
+      expert parameter's chunks as one view per selected local row before the
+      first step (no step, no 8-bit state for the rest; an empty selection
+      freezes the shard); the stepper maps global ids to local rows through the
+      expert-parallel offset, calls it at construction, and zeroes unselected
+      rows of each expert gradient before the norm; the flip totals report the
+      selected experts per layer summed over ranks; any code or scale change in
+      an unselected expert fails the run.
+   3. Arm (`proxy-esft-top02.json`): selected experts plus dense, joint at 1e-4,
+      100 steps, global clip. Held-out 16.18 to 4.12 (joint 4.17, dense-only
+      4.135: no loss from selection, the margin is within one seed). Selected
+      experts' values changed: layer 3 2.22%, hash layers 1.49 to 1.77%, against
+      1.45% over all experts in the joint arm and 2.79% in the split arm; dense
+      54.3%. Zero unselected experts changed; frozen set clean. Peak 48.3 GB
+      (joint 70.0, dense-only 45.7): expert optimizer state fell from 26 GB per
+      rank to about 2 GB. The run's training phase was 3,182 s against 2,318 s
+      because the per-layer flip accounting dequantized every FP4 entry twice at
+      each validation; fixed (one dequantization per entry): the per-expert run
+      below trained in 2,346 s.
+   4. Per-expert flips against routing share (`proxy-joint-perexpert.json`: the
+      joint arm rerun with `--expert-shares`, reproducing 4.172 and 1.45%; the
+      report's `experts` table holds values changed, elements, and share per
+      global expert). Scored layer 3, experts ranked by share: ranks 1 to 8
+      (`top_p` 0.2) flipped 2.02%, 9 to 42 (to 0.5) 2.13%, 43 to 115 (to 0.8)
+      1.57%, the remaining 141 0.91% with 51 of them under 0.5%. The curve is a
+      plateau over about the top 40 experts, a decline, then a floor near what an
+      Adam random walk produces in 100 steps at 1e-4, so on this data `top_p` 0.2
+      was too narrow and 0.5 captured the plateau. Hash layers 0 to 2: flat, 1.4
+      to 1.7% at every share (correlation with share under 0.1); hash routing
+      gives each expert a fixed vocabulary slice with enough tokens for consistent
+      moments, so share-based selection is meaningless there and the choice is
+      all 256 or none (7% of the full model's experts). Share is a coarse
+      per-expert predictor even on the scored layer (correlation 0.39; the top
+      decile holds an expert at 0.08% beside one at 3.5%; one of the eight
+      selected flipped 0.51%): what moves an expert is gradient-sign consistency,
+      which share only partly captures. Cross-check: the eight selected flipped
+      2.02% here and 2.22% in the ESFT arm.
+      Conditionality, which bounds all of the above: `data/engineering.jsonl` is
+      off-policy for this model (written for another model), and the 4-layer
+      proxy's baseline loss of 16.2 is above the uniform 11.8, so much of every
+      run fits truncation repair. Both inflate gradient-sign consistency and so
+      flip rates everywhere. The structure (plateau, decline, floor on scored
+      layers; flat hash layers; share as a coarse predictor) follows from routing
+      and Adam and transfers; the positions (the 2% level, the `top_p` 0.5
+      boundary, where the noise floor begins) are properties of this dataset on
+      this proxy and do not. On near-policy data the plateau shrinks to the few
+      experts with the most consistent signal and the floor's share of the layer
+      grows. The proxy cannot test this even with model-generated data, since
+      truncation repair dominates its gradients. Selection for the full model is
+      therefore to be measured there, from per-expert gradient-sign consistency
+      (the mean sign of each expert row's gradient over the first steps, available
+      in the update-in-backward hook) and per-expert flip fraction, rather than
+      inherited as a `top_p` from here; `top_p` by routing share remains the
+      starting selection before any such measurement exists.
+   Open tuning questions for stage 7: the score function (token or gate), and
+   whether to combine selection with the dense-slowing knob.
+6. Stage 7 preparation list, each a separate decision: steady-state memory plan
+   redone with the selected trainable set; the dense-slowing knob as a recipe
+   setting (per-class rate via `optim.py` param groups, or `--dense-every`) with a
+   warmup for any class entering training (stage 6: a fresh Adam state at 1e-4
+   lifted held-out 5.24 to 5.67 in ten steps); the container from the
+   gate-passing lockfile; the dataset, where distance from policy is a condition
+   for the method and not only a quality choice: QAT publishes only drift that
+   crossed a half-cell, directed drift needs the data to disagree with the model
+   consistently, and a dataset built close to the model's own outputs may
+   fine-tune a BF16 model gently and publish nothing here but noise flips
+   (Handoff 5.4); the per-layer and per-expert flip fractions in the first
+   full-model run are how this is checked; an evaluation on prompts outside the
+   SFT distribution, since held-out loss on same-distribution rows cannot
+   separate dense fitting the data from experts generalizing from it (stage 5).
 
 Alternatives if QAT of the experts does not deliver, ranked by the operator, with
 the physics that ranks them. The released expert weights sit at the centers of
@@ -192,6 +286,7 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
 deepseek/
   PLAN-deepseek.md, SPEC-deepseek.md
   automodel/                                   NeMo AutoModel 0.8.0 source
+  ESFT/                                        DeepSeek ESFT reference code (method only)
   models--deepseek-ai--DeepSeek-V4-Flash-0731/ HF cache layout; snapshot
                                                7872f01b1d1fe23eabc4c98b48bffcef5a386062
   venv/                                        NeMo environment (uv, Python 3.12.13)
@@ -204,9 +299,10 @@ deepseek/
     fakequant.py      straight-through fake-quant hooks on the NeMo model
     freeze.py         disables NeMo's router correction-bias update
     data.py           reasoning-conversation dataset bridge (NeMo shifted format)
-    optim.py          torchao optimizer over local shards; FP32-master AdamW; step_param
+    optim.py          torchao optimizer over local shards; FP32-master AdamW; step_param;
+                      restrict_rows (per-row views for expert selection)
     inbackward.py     update-in-backward stepper with lagged clipping, optional per-class norms,
-                      per-class update period (frequency split)
+                      per-class update period (frequency split), per-parameter row selection
     overrides.py      --set/--unset recipe overrides shared by the torchrun entries
     proxy_export.py   trained-target export: quantize, gather experts to rank 0,
                       replace only tensors whose bytes differ from the source
@@ -214,8 +310,11 @@ deepseek/
                       --expect-logits PREFIX; shared probe token ids
     proxy_step.py     stage 3 to 6 training check and diagnostics (torchrun entry);
                       --in-backward, --per-class-clip, --set/--unset recipe overrides,
-                      --trainable-subset, --dense-every N, held-out capture with per-class flip totals,
+                      --trainable-subset, --dense-every N, --expert-selection SCORES.json,
+                      --expert-shares SCORES.json, held-out capture with per-class and
+                      per-layer flip totals, per-expert flip table in the report,
                       --export DIR [--force] with probe logits and replaced list beside --out
+    route_scores.py   routing-concentration measurement and ESFT top_p selection (torchrun entry)
     proxy-4layer.yaml stage 2 recipe (mock token ids)
     proxy-train.yaml  training recipe: data bridge, freeze config, optimizer
   tests/                                       unittest, run from the repo root
@@ -596,10 +695,10 @@ per GPU before activations, 4-bit about 106 GB. These are resident-state figures
 the steady-state peak adds activations, `min_error` fake-quant temporaries during
 recompute, and torchao step temporaries, and must be measured on a multi-step run
 (Handoff 2). A B300 host is available if the B200 budget is too tight. The
-preparation decisions are listed in Handoff 5. Expert flips arrive tens of steps
+preparation decisions are listed in Handoff 6. Expert flips arrive tens of steps
 after dense changes at the same rate (stage 5), and a joint run at one rate starves
 them once dense fits (phase C), so production runs need more steps than a dense
-recipe and dense slowed relative to experts (Handoff 4, 5); the flip fraction is
+recipe and dense slowed relative to experts (Handoff 4, 5, 6); the flip fraction is
 the leading indicator to watch, not the loss.
 
 ## Verified facts

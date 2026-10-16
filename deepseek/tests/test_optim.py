@@ -1,7 +1,9 @@
 """CPU tests for MasterOptimizer on plain BF16 parameters: a step equals FP32
 AdamW on an FP32 copy followed by a BF16 round, chunking does not change the
 result, step_param equals step, sub-ulp updates accumulate in the FP32 masters
-where BF16 masters would stall, and the inherited failure modes hold."""
+where BF16 masters would stall, and the inherited failure modes hold. For
+LocalShardOptimizer: restrict_rows steps only the selected rows of a stacked
+parameter, allocates state only for them, and is refused after a step."""
 
 import copy
 import unittest
@@ -9,7 +11,7 @@ import unittest
 import torch
 from torch import nn
 
-from deepseek.qat.optim import MasterOptimizer, adamw_fp32_master
+from deepseek.qat.optim import LocalShardOptimizer, MasterOptimizer, adamw_fp32_master
 
 LR = 1e-3
 
@@ -107,6 +109,58 @@ class Failures(unittest.TestCase):
         stranger.grad = torch.zeros(2, 2)
         with self.assertRaisesRegex(RuntimeError, "does not own"):
             opt.step_param(stranger)
+
+
+class RestrictRows(unittest.TestCase):
+    # A [4, 8, 6] "expert stack" with rows 1 and 3 selected: the stepped rows
+    # match AdamW run on those rows alone, the other rows are bit-identical, and
+    # the inner optimizer holds state for exactly the two row views.
+    def test_only_selected_rows_step_and_hold_state(self):
+        torch.manual_seed(0)
+        stack = nn.Parameter(torch.randn(4, 8, 6))
+        ref_rows = [nn.Parameter(stack.detach()[r].clone()) for r in (1, 3)]
+        opt = LocalShardOptimizer([stack], torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        opt.restrict_rows(stack, [3, 1])
+        ref = torch.optim.AdamW(ref_rows, lr=LR, weight_decay=0.0)
+        before = stack.detach().clone()
+        for step in range(3):
+            torch.manual_seed(step)
+            stack.grad = torch.randn_like(stack)
+            for q, r in zip(ref_rows, (1, 3)):
+                q.grad = stack.grad[r].clone()
+            ref.step()
+            opt.step_param(stack)
+            stack.grad = None
+        for r in (0, 2):
+            self.assertTrue(torch.equal(stack.detach()[r], before[r]))
+        for q, r in zip(ref_rows, (1, 3)):
+            self.assertTrue(torch.equal(stack.detach()[r], q.detach()))
+        self.assertEqual(len(opt.inner.state), 2)
+        self.assertEqual(len(opt.inner.param_groups[0]["params"]), 2)
+
+    def test_empty_selection_steps_nothing(self):
+        stack = nn.Parameter(torch.randn(3, 4, 4))
+        opt = LocalShardOptimizer([stack], torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        opt.restrict_rows(stack, [])
+        before = stack.detach().clone()
+        stack.grad = torch.randn_like(stack)
+        opt.step_param(stack)
+        self.assertTrue(torch.equal(stack.detach(), before))
+        self.assertEqual(len(opt.inner.state), 0)
+
+    def test_refused_after_step_or_with_bad_rows(self):
+        stack = nn.Parameter(torch.randn(3, 4, 4))
+        opt = LocalShardOptimizer([stack], torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        with self.assertRaises(ValueError):
+            opt.restrict_rows(stack, [0, 3])
+        with self.assertRaises(ValueError):
+            opt.restrict_rows(stack, [1, 1])
+        with self.assertRaises(RuntimeError):
+            opt.restrict_rows(nn.Parameter(torch.zeros(2)), [0])
+        stack.grad = torch.randn_like(stack)
+        opt.step_param(stack)
+        with self.assertRaisesRegex(RuntimeError, "before the first optimizer step"):
+            opt.restrict_rows(stack, [0])
 
 
 if __name__ == "__main__":
