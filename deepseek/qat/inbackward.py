@@ -130,6 +130,12 @@ class InBackwardStepper:
         self.last_norms: dict[str, float] = {}
         self.last_norm: float | None = None  # global norm over all classes
         self._stepped: set[int] = set()
+        # Largest CUDA allocation (bytes) observed at hook entry during the
+        # current step, when a gradient and the backward's live activations are
+        # both resident. The per-step analogue of sampling at the optimizer step
+        # with every gradient held; end_step publishes it as last_peak_hook_allocated.
+        self.peak_hook_allocated: int = 0
+        self.last_peak_hook_allocated: int = 0
         # Per-hook squared norms with the CUDA event that marks their completion.
         # Hooks run on different streams (FSDP2 fires dense hooks inside its
         # reduce-scatter stream, autograd fires expert hooks on its own), so a
@@ -161,6 +167,9 @@ class InBackwardStepper:
         self._check_only_gradient(p)
         self._scale_grads()
         g = _local(p.grad)
+        # Sampled before the step so the gradient is still counted; no sync.
+        if g.is_cuda:
+            self.peak_hook_allocated = max(self.peak_hook_allocated, torch.cuda.memory_allocated(g.device))
         cls = self._class_by_param[id(p)]
         # Unselected rows contribute nothing to the norm and are never stepped.
         mask = self._row_mask.get(id(p))
@@ -216,6 +225,8 @@ class InBackwardStepper:
         self.step_count += 1
         self._stepped.clear()
         self._sq_parts = []
+        self.last_peak_hook_allocated = self.peak_hook_allocated
+        self.peak_hook_allocated = 0
         return norm
 
     def remove(self) -> None:

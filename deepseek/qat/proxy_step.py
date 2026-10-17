@@ -9,7 +9,13 @@ recipe's own training loop, then requantizes and reports per target:
   elements that changed;
 - that every frozen tensor is bit-identical to before;
 - that the trainable set equals the target set minus the indexer;
-- training loss and gradient norm from the recipe's metrics log.
+- training loss, gradient norm, and learning rate from the recipe's metrics log,
+  plus ``lr_group{i}`` for each further optimizer parameter group (the experts
+  group under the recipe's ``param_group_overrides``);
+- per-step CUDA memory (allocated before and after the step, the step's peak,
+  reserved, and the gradient-resident moment: optimizer entry, or the largest
+  hook-entry allocation under ``--in-backward``) in ``steps``, with resident
+  state by class and series maxima under ``memory``.
 
 Exit nonzero on non-finite loss or gradient norm, a changed frozen tensor, a
 trainable-set mismatch, or zero value changes across all targets. Training and
@@ -65,9 +71,10 @@ from deepseek.qat.overrides import add_override_arguments, apply_overrides
 from deepseek.qat.proxy import _ep_offset, logits as hooked_logits, logits_path, probe_token_ids
 
 
-# One dense and one expert chunk from the inner optimizer's parameter list, by size.
+# One dense and one expert chunk from the inner optimizer's parameters (all
+# groups: dense and experts may sit in separate groups), by size.
 def _sample_inner_params(inner):
-    params = [p for p in inner.param_groups[0]["params"] if p.grad is not None]
+    params = [p for g in inner.param_groups for p in g["params"] if p.grad is not None]
     dense = [p for p in params if p.ndim == 2]
     expert = [p for p in params if p.ndim == 3]
     return [dense[0], expert[0]] if dense and expert else params[:2]
@@ -75,6 +82,22 @@ def _sample_inner_params(inner):
 
 def _canonical(name: str) -> str:
     return name.replace("_checkpoint_wrapped_module.", "").replace("_orig_mod.", "")
+
+
+# Optimizer group index of every parameter by canonical name. Must run before any
+# forward: FSDP2 with resharding off leaves module attributes pointing at the
+# unsharded parameter objects after a forward, so identity against the sharded
+# objects the optimizer registered fails from then on; names are stable.
+def group_by_name(model, optimizer) -> dict[str, int]:
+    group_of_id = {id(q): gi for gi, group in enumerate(optimizer.param_groups) for q in group["params"]}
+    return {_canonical(n): group_of_id[id(p)] for n, p in model.named_parameters() if id(p) in group_of_id}
+
+
+# The learning rate currently set on the group that owns the named parameter.
+def _param_lr(optimizer, groups: dict[str, int], name: str) -> float:
+    if name not in groups:
+        raise RuntimeError(f"{name} is not in any optimizer group")
+    return float(optimizer.param_groups[groups[name]]["lr"])
 
 
 def _local(t: torch.Tensor) -> torch.Tensor:
@@ -126,6 +149,98 @@ def _frozen_tensors(model):
             yield n, p
     for n, b in model.named_buffers():
         yield n, b
+
+
+GB = 1024**3
+
+
+# Per-step CUDA memory samples around the recipe's optimizer step. The allocator
+# peak is reset at every step start so each step has its own peak, and the
+# maximum across resets is folded into running_peak so the whole-run figure
+# (setup, steps, and validation between steps) keeps its meaning. Samples are
+# bytes; the report converts to GB. Reads of the allocator stats never synchronize.
+class MemoryMeter:
+    def __init__(self, device):
+        self.device = device
+        self.running_peak = torch.cuda.max_memory_allocated(device)
+        self._current: dict | None = None
+
+    def _fold_peak(self) -> None:
+        self.running_peak = max(self.running_peak, torch.cuda.max_memory_allocated(self.device))
+
+    def begin_step(self) -> None:
+        self._fold_peak()
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self._current = {"mem_before_step": torch.cuda.memory_allocated(self.device)}
+
+    # Attach a sample taken inside the step (optimizer entry, hook peak).
+    def note(self, key: str, value: int) -> None:
+        if self._current is None:
+            raise RuntimeError(f"memory sample {key} taken outside a step")
+        self._current[key] = value
+
+    # Close the step and return its samples as GB metrics with 3-decimal (MB) resolution.
+    def end_step(self) -> dict[str, float]:
+        if self._current is None:
+            raise RuntimeError("end_step without begin_step")
+        sample = self._current
+        sample["mem_peak_step"] = torch.cuda.max_memory_allocated(self.device)
+        sample["mem_after_step"] = torch.cuda.memory_allocated(self.device)
+        sample["mem_reserved_after_step"] = torch.cuda.memory_reserved(self.device)
+        self._fold_peak()
+        self._current = None
+        return {f"{k}_gb": round(v / GB, 3) for k, v in sample.items()}
+
+    # Whole-run allocator peak so far, in bytes.
+    def peak(self) -> int:
+        self._fold_peak()
+        return self.running_peak
+
+
+# Bytes behind a tensor, following tensor subclasses (torchao's OptimState8bit
+# reports a float32 appearance dtype, so numel times element_size overstates its
+# codes four times) and counting each storage once, so a storage reached through
+# two state entries is not double counted.
+def _tensor_bytes(t: torch.Tensor, seen: set[int]) -> int:
+    flatten = getattr(t, "__tensor_flatten__", None)
+    if flatten is not None:
+        names, _ = flatten()
+        return sum(_tensor_bytes(getattr(t, n), seen) for n in names)
+    ptr = t.untyped_storage().data_ptr()
+    if ptr in seen:
+        return 0
+    seen.add(ptr)
+    return t.numel() * t.element_size()
+
+
+# Resident GPU state on this rank between steps, in bytes: parameters by class
+# (trainable dense FP8 targets, trainable expert FP4 targets, frozen), buffers,
+# and the inner optimizer's state (torchao allocates it lazily, so this is zero
+# before the first step). Parameters are counted as local shards, so the caller
+# must sample while FSDP2 parameters are sharded: after a backward, not after a
+# bare forward, which with reshard_after_forward off leaves them unsharded.
+# Dense and frozen FSDP2 parameters also get their unsharded size, resident
+# through forward and backward. Expert parameters are sharded over the expert
+# mesh and never materialized in full.
+def resident_bytes(model, inner) -> dict[str, int]:
+    out = {"trainable_dense_shard": 0, "trainable_dense_unsharded": 0, "trainable_expert_shard": 0,
+           "frozen_shard": 0, "frozen_unsharded": 0, "buffers": 0, "optimizer_state": 0}
+    for n, p in model.named_parameters():
+        shard = _local(p).numel() * p.element_size()
+        if ".mlp.experts" in n:
+            out["trainable_expert_shard" if p.requires_grad else "frozen_shard"] += shard
+            continue
+        cls = "trainable_dense" if p.requires_grad else "frozen"
+        out[f"{cls}_shard"] += shard
+        out[f"{cls}_unsharded"] += p.numel() * p.element_size()
+    for _, b in model.named_buffers():
+        out["buffers"] += _local(b).numel() * b.element_size()
+    seen: set[int] = set()
+    for st in inner.state.values():
+        for v in st.values():
+            if isinstance(v, torch.Tensor):
+                out["optimizer_state"] += _tensor_bytes(v, seen)
+    return out
 
 
 # Elements whose dequantized value differs between two packed states from
@@ -296,10 +411,27 @@ def main(argv=None) -> int:
                                          rows_of=rows_of if selection is not None else None)
         report["per_class_clip"] = args.per_class_clip or args.dense_every > 1
         report["dense_every"] = args.dense_every
-        original_step = recipe._run_train_optim_step
 
-        def stepping(batches, max_grad_norm=None):
-            sample = original_step(batches, None)
+    # Every step is wrapped for memory sampling (Handoff 2: steady-state peaks
+    # and the update-in-backward saving need per-step figures). Under
+    # update-in-backward the recipe's clip is disabled and the stepper owns
+    # clipping, so the recipe's max_grad_norm is withheld; otherwise it passes
+    # through unchanged. Memory keys join the step metrics so they stay aligned
+    # with the captured loss and norm of the same step.
+    meter = MemoryMeter(torch.cuda.current_device())
+    original_step = recipe._run_train_optim_step
+    # Resident state is sampled once, at the end of the first step: FSDP2 has
+    # resharded its dense parameters after backward and torchao's lazily
+    # allocated state exists. After training it would be wrong, because the last
+    # validation forward leaves FSDP2 parameters unsharded with resharding off.
+    resident: dict[str, int] = {}
+
+    def stepping(batches, max_grad_norm=None):
+        meter.begin_step()
+        sample = original_step(batches, None if stepper is not None else max_grad_norm)
+        if not resident:
+            resident.update(resident_bytes(model, recipe.optimizer[0].inner))
+        if stepper is not None:
             sample.metrics["grad_norm"] = stepper.end_step()
             # Per-class norms and coefficients when enabled; the global norm stays in grad_norm.
             for cls in stepper.classes:
@@ -307,9 +439,16 @@ def main(argv=None) -> int:
                 sample.metrics[f"clip_coef_next{suffix}"] = stepper.coefs[cls]
                 if cls != "all":
                     sample.metrics[f"grad_norm_{cls}"] = stepper.last_norms[cls]
-            return sample
+            meter.note("mem_peak_hook", stepper.last_peak_hook_allocated)
+        # Rates of the further parameter groups (group 0 is NeMo's `lr`), read at
+        # the same moment NeMo reads `lr`: after its scheduler has advanced, so
+        # every rate metric describes the next step.
+        for i, group in enumerate(recipe.optimizer[0].param_groups[1:], 1):
+            sample.metrics[f"lr_group{i}"] = float(group["lr"])
+        sample.metrics.update(meter.end_step())
+        return sample
 
-        recipe._run_train_optim_step = stepping
+    recipe._run_train_optim_step = stepping
 
     # Trainable set must be exactly the targets minus the indexer.
     # Expected trainable set: the targets minus the indexer, restricted to the
@@ -324,6 +463,7 @@ def main(argv=None) -> int:
     # Activation checkpointing and compile wrappers add path segments that the
     # target names (taken from the unwrapped hierarchy) do not carry.
     trainable = {_canonical(n) for n, p in model.named_parameters() if p.requires_grad}
+    param_groups_by_name = group_by_name(model, recipe.optimizer[0])
     report["trainable_params"] = len(trainable)
     report["trainable_numel"] = sum(_local(p).numel() for n, p in model.named_parameters() if p.requires_grad)
     report["trainable_not_target"] = sorted(trainable - target_params)
@@ -423,6 +563,9 @@ def main(argv=None) -> int:
     inner_step = inner.step
 
     def measured_step(closure=None):
+        # Every gradient of the step is resident here (post-backward, pre-step):
+        # the figure update-in-backward removes.
+        meter.note("mem_at_optimizer_step", torch.cuda.memory_allocated(meter.device))
         min_level = 3.25e-7
         for name, chunk in zip(["dense", "expert"], _sample_inner_params(inner)):
             g2 = chunk.grad.detach().float().square().reshape(-1)
@@ -444,9 +587,35 @@ def main(argv=None) -> int:
     recipe.run_train_validation_loop()
     report["grad_stats"] = grad_stats
     report["train_seconds"] = round(time.monotonic() - t1, 1)
-    report["peak_memory_gb"] = round(torch.cuda.max_memory_allocated() / 1024**3, 2)
-    step_keys = ("loss", "grad_norm", "lr", "clip_coef_next", "grad_norm_dense", "grad_norm_expert", "clip_coef_next_dense", "clip_coef_next_expert")
-    report["steps"] = [{k: m[k] for k in step_keys if k in m} for m in captured]
+    # Whole-run peak including setup and validation; the per-step peaks are in steps.
+    report["peak_memory_gb"] = round(meter.peak() / GB, 2)
+    step_keys = ("loss", "grad_norm", "lr", "clip_coef_next", "grad_norm_dense", "grad_norm_expert", "clip_coef_next_dense", "clip_coef_next_expert",
+                 "mem_before_step_gb", "mem_peak_step_gb", "mem_after_step_gb", "mem_reserved_after_step_gb", "mem_peak_hook_gb", "mem_at_optimizer_step_gb")
+    report["steps"] = [{k: v for k, v in m.items() if k in step_keys or k.startswith("lr_group")} for m in captured]
+    # Memory summary (Handoff 2). Resident state comes from the end of the first
+    # step (see stepping); the series figures summarize the per-step samples
+    # above. mem_after_step is the steady-state resident set (parameters,
+    # optimizer state; allocator-held but unused memory excluded); peak minus
+    # after is the step's transient: activations, unsharded dense parameters,
+    # gradients, fake-quant and optimizer temporaries. resident_total is the
+    # sum of the sharded classes, buffers, and state, and should agree with
+    # after_step_gb_median to within small library allocations.
+    mem_steps = [m for m in captured if "mem_peak_step_gb" in m]
+    memory: dict = {f"resident_{k}_gb": round(v / GB, 3) for k, v in resident.items()}
+    memory["resident_total_gb"] = round(sum(v for k, v in resident.items() if not k.endswith("_unsharded")) / GB, 3)
+    memory["steps_measured"] = len(mem_steps)
+    if mem_steps:
+        after = sorted(m["mem_after_step_gb"] for m in mem_steps)
+        memory["peak_step_gb_max"] = max(m["mem_peak_step_gb"] for m in mem_steps)
+        memory["after_step_gb_median"] = after[len(after) // 2]
+        memory["after_step_gb_last"] = mem_steps[-1]["mem_after_step_gb"]
+        memory["transient_gb_max"] = round(max(m["mem_peak_step_gb"] - m["mem_after_step_gb"] for m in mem_steps), 3)
+        # One of the two exists per arm: the hook sample under update-in-backward,
+        # the optimizer-entry sample otherwise.
+        for key, out in (("mem_peak_hook_gb", "peak_hook_gb_max"), ("mem_at_optimizer_step_gb", "at_optimizer_step_gb_max")):
+            if key in mem_steps[-1]:
+                memory[out] = max(m[key] for m in mem_steps)
+    report["memory"] = memory
     report["validation"] = captured_val
     last = captured[-1] if captured else {}
     report["loss"] = last.get("loss")
@@ -503,7 +672,7 @@ def main(argv=None) -> int:
             if name in masters:
                 m1 = _materialize(name, getattr(t.module, attr)).detach().cpu()
                 delta = (m1.float() - masters[name].float()).abs().reshape(-1)
-                lr = float(recipe.optimizer[0].param_groups[0]["lr"])
+                lr = _param_lr(recipe.optimizer[0], param_groups_by_name, name)
                 entry.update({
                     "master_changed": int((masters[name] != m1).sum()),
                     "master_elements": m1.numel(),

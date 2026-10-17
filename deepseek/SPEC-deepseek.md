@@ -19,7 +19,7 @@ same Transformers and vLLM paths as the source on the same hardware.
 Quantization-aware training on the full trainable set.
 
 - Every loss-bearing forward uses `dequant(Q(master))` for each trained tensor,
-  where `Q` is the source format's quantizer (section 3). A straight-through
+  where `Q` is the project quantizer for the tensor's format (section 3). A straight-through
   estimator carries gradients to the masters.
 - Every released tensor is a fixed point of `Q`: quantizing a source tensor
   reproduces its values exactly. A trained tensor therefore changes in the
@@ -83,8 +83,9 @@ collectives, forward, backward, activation checkpointing, expert-gradient
 scaling, and the training loop. Two NeMo behaviours are disabled after recipe
 setup because the recipe cannot express it: the per-step router correction-bias
 update (`deepseek/qat/freeze.py`) and, under update-in-backward, NeMo's own
-gradient clip. No NeMo model, parallelism, or kernel code is copied into
-`deepseek/qat`.
+gradient clip. The vendored NeMo copy may be patched and its module code adapted
+into `deepseek/qat` where the recipe cannot express a behaviour; `PLAN-deepseek.md`
+lists every patch with the stage that introduces it. Kernel code is not copied.
 
 ## 6. Source checkpoint compatibility
 
@@ -133,6 +134,13 @@ holdout is the last N rows in file order.
   each expert parameter to views of its selected local rows before the first
   step, so unselected rows get no update and no optimizer state; unselected
   rows of each expert gradient are zeroed before the norm.
+- Expert storage (stage 6b): each layer's routed experts are a trained BF16 stack
+  of selected experts and a frozen packed stack of unselected experts in the
+  source's FP4 codes and E8M0 scales, dequantized on the fly in forward and
+  backward with no weight gradient. Every expert-parallel rank selects the same
+  count per layer by score within its own expert range. The published artifact
+  copies packed stacks byte for byte and quantizes selected stacks with the
+  training quantizers. Until stage 6b lands, the single-stack path above applies.
 - Integrity: every run snapshots the quantized codes and scales of every target
   and a digest of every frozen parameter and buffer before training, and checks
   them after. A changed frozen tensor, or any code or scale change in an
@@ -197,12 +205,10 @@ weaken the preservation guarantees above.
 ## 14. Open decisions
 
 - Steady-state memory plan for the full model with the selected trainable set.
-- The dense-slowing knob as a recipe setting, with a warmup for any parameter
-  class entering training.
 - The container for the training host.
 - The training dataset, and its distance from the model's own policy.
 - An evaluation on prompts outside the SFT distribution.
-- The expert score function (`token_scores` or `gate_scores`), and whether the
-  full-model selection is taken from `top_p` or measured from per-expert
-  gradient-sign consistency and flip fraction.
+- The expert score function (`token_scores` or `gate_scores`), and the thresholds
+  of the measured full-model selection (per-expert gradient-sign consistency and
+  flip fraction), which starts from `top_p` by routing share.
 - Whether to combine selection with dense slowing.

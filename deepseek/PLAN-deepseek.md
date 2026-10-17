@@ -3,8 +3,8 @@
 Goal: post-train `deepseek-ai/DeepSeek-V4-Flash-0731` and publish a standalone
 checkpoint identical to the source in every file, tensor name, shape, dtype, shard
 layout, and scale grid, except the payloads of trained tensors and their scales. No
-adapter, no PEFT metadata, no optimizer state. It must load and generate on the
-same hardware as the source, with the 2x RTX PRO 6000 (192 GB) as the reference.
+adapter, no PEFT metadata, no optimizer state. It must load and generate on
+hardware that serves the source.
 
 Method: full-parameter quantization-aware training (QAT). Every loss-bearing forward
 uses `dequant(Q(master))` for each trained tensor, where `Q` is the released
@@ -20,12 +20,20 @@ under QAT (stage 5), and a trained proxy exports to a complete source-layout
 checkpoint that reloads bit-identically, twice in a chain (stage 6). The frequency
 split (Handoff 4) passed: slowing dense restores expert flips. ESFT-style expert
 selection (Handoff 5) is implemented and measured: selected experts flip at the
-split arm's rate with dense at full speed, unselected experts stay byte-identical,
-peak memory 48 GB against 70. Next: stage 7 preparation (Handoff 6). The dataset,
+split arm's rate with dense at full speed, unselected experts stay byte-identical.
+The steady-state memory plan (Handoff 2, Handoff 6
+item 1) is measured: per-step peaks, the update-in-backward saving, and a labelled
+full-model estimate (stage 7). The dense-slowing knob and warmup are recipe
+settings (Handoff 6 item 2). Next: stage 6b, split expert storage, which halves
+the per-GPU requirement and makes 4x B200 or 8x RTX PRO 6000 viable hosts; its
+design is resolved and its components, NeMo patches, gates, and per-component
+read list are in that stage, with no code written; then
+Handoff 6 from item 3. The dataset,
 optimizer, trainable set, and mechanism are decided and verified below. Every
 command runs from the repository root `/home/goon/trl/trlx`. Launch GPU runs from
 a plain terminal with `nohup`: the post-training report phase drives host memory
 low enough that an agent session's background-process reaper has killed a run.
+Rank 0 prints the full report to stdout, so a log redirect is a second copy of `--out`.
 
 Run all unit tests (CPU, under a minute; the data tests need the snapshot):
 
@@ -73,7 +81,10 @@ Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
 `proxy-stage3-*.json`, `proxy-stage4-*.json`, `proxy-stage5-*.json`,
 `proxy-stage6-*`) plus `proxy-split-dense4.json` (Handoff 4),
 `route-scores-engineering.json`, `proxy-esft-top02.json`, and
-`proxy-joint-perexpert.json` (Handoff 5). Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
+`proxy-joint-perexpert.json` (Handoff 5), and `proxy-mem-2layer-inbackward.json`,
+`proxy-mem-2layer-reference.json`, `proxy-mem-2layer-inbackward-rerun.json`, and
+`proxy-mem-esft-top02.json` (Handoff 2), and `proxy-mem-2layer-inbackward-groups.json`
+(Handoff 6 item 2). Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
 `stage6-experts/` and `stage6-sequential/` (stage 6), 156 GB each; all can be
 deleted and regenerated.
 
@@ -82,11 +93,35 @@ Handoff items, in order:
 1. `deepseek/qat/proxy_step.py` keeps host copies of sampled masters; the full set
    (26 GB per rank) exceeded this host's 122 GB alongside NeMo's load staging. Keep
    the sampling.
-2. Memory: steady-state peaks exceed first-step peaks (stage 5). Measured so far:
-   4-layer proxy, batch 2, in-backward, 70.0 GB; dense-only 45.7 GB. The stage 7
-   budget must come from multi-step measurements, and the update-in-backward saving
-   itself is still unmeasured (sample allocated memory at end of backward with and
-   without it).
+2. Memory (complete; GiB per rank, local batch 1, rows to 4,352 tokens). `proxy_step`
+   reports per-step allocated before/after, step peak, reserved, and the
+   gradient-resident moment (optimizer entry, or the hook-entry peak under
+   `--in-backward`) in `steps`, with resident state by class under `memory`.
+   Saving pair, 2 layers, full set, 20 steps at 1e-4 (`proxy-mem-2layer-reference.json`,
+   `-inbackward.json`): resident after step 26.196 in both arms; optimizer entry
+   38.442, which is resident plus exactly the BF16 gradient of the 6,574,571,520
+   trainable elements (12.246); step-peak maxima 56.821 against 46.538, so
+   update-in-backward saves 10.283 of peak, the gradient set minus the one gradient
+   live in the hook (hook-entry max 41.956), at no time cost (225 s both). Step-1
+   peaks (41.5, 36.7) understate steady state by 9 to 14; peaks rise with row length,
+   so a dataset-wide maximum needs a run over the whole file. Reserved exceeds peak
+   allocated by 8 to 10 under `expandable_segments`. Budget, 4 layers, ESFT top 0.2,
+   100 steps (`proxy-mem-esft-top02.json`): resident 29.169 after the step; the class
+   accounting sums to 29.153 (experts 24.000, 8-bit state 3.119, buffers 0.017, and
+   half of the dense 0.984 and frozen 3.050 full-tensor figures, since the report's
+   shard figures are the full tensors), the same 16 MiB residual as the 2-layer
+   rerun; step-peak max
+   53.445 (43 to 53 by batch), hook-entry max 47.579, transient max 24.276
+   (activations, unsharded dense 2.0, one expert gradient up to 4.0, fake-quant
+   temporaries during recompute, torchao step temporaries), reserved 60.168.
+   Resolved: a rerun of the 2-layer in-backward arm
+   (`proxy-mem-2layer-inbackward-rerun.json`) reproduced every per-step memory
+   figure to the megabyte, every loss, and the master digest, so the current code
+   is deterministic and a measured peak is a requirement. The Handoff 5.3 run of
+   this configuration reported 48.28 on an uncommitted working tree between commits
+   9b89c39 and 225d80f whose state is not recoverable; 53.45 is the figure for the
+   code going forward. The rerun also confirmed the resident accounting:
+   `resident_total_gb` 26.180 against 26.196 allocated after the step.
 3. Gate runs save weights with `proxy_step --export DIR` (stage 6).
 4. Frequency split (complete; `proxy_step --in-backward --dense-every 4`, report
    `proxy-split-dense4.json`). Joint training at 1e-4 for 100 steps with dense
@@ -121,8 +156,8 @@ Handoff items, in order:
    are the ones with enough task tokens to build consistent gradient sign and
    cross FP4 cells (the surgical form of what the frequency split does bluntly),
    and 8-bit optimizer state shrinks with the trainable set (full model: about
-   71 GB per rank at `ep_size` 8 for all experts, about 7 GB at 10%), which may
-   return the 8x RTX PRO 6000 host from fallback to primary. Caveat: ESFT is a
+   71 GB per rank at `ep_size` 8 for all experts, about 7 GB at 10%), which
+   lowers the per-GPU memory requirement. Caveat: ESFT is a
    BF16 result; its rates and quality numbers say nothing about flips. Steps 1 to
    4 are complete:
    1. Routing concentration (`deepseek/qat/route_scores.py`, report
@@ -193,10 +228,20 @@ Handoff items, in order:
    Open tuning questions for stage 7: the score function (token or gate), and
    whether to combine selection with the dense-slowing knob.
 6. Stage 7 preparation list, each a separate decision: steady-state memory plan
-   redone with the selected trainable set; the dense-slowing knob as a recipe
-   setting (per-class rate via `optim.py` param groups, or `--dense-every`) with a
-   warmup for any class entering training (stage 6: a fresh Adam state at 1e-4
-   lifted held-out 5.24 to 5.67 in ten steps); the container from the
+   redone with the selected trainable set (complete, item 2); the dense-slowing
+   knob as a recipe setting with a warmup for any class entering training
+   (stage 6: a fresh Adam state at 1e-4 lifted held-out 5.24 to 5.67 in ten
+   steps) (complete: `proxy-train.yaml` carries an `optimizer.param_group_overrides`
+   entry putting `mlp\.experts` in its own group with `lr_mult`, and an
+   `lr_scheduler` block with `lr_decay_style: constant` and `lr_warmup_steps`;
+   NeMo's scheduler applies both, so dense at r/N with experts at r is base
+   `lr = r/N` and `lr_mult: N`, and warmup is linear from `init_lr` (default
+   0.1 x lr) over `lr_warmup_steps`, which must stay below `max_steps`. The base
+   recipe sets `lr_mult: 1.0` and warmup 0, and the 2-layer in-backward arm under
+   it reproduced the master digest 54a0a65f of the ungrouped run
+   (`proxy-mem-2layer-inbackward-groups.json`). `--dense-every` remains as the
+   frequency-split form; a class entering mid-run is outside this mechanism. The
+   values of N and the warmup length are stage 7 tuning questions); the container from the
    gate-passing lockfile; the dataset, where distance from policy is a condition
    for the method and not only a quality choice: QAT publishes only drift that
    crossed a half-cell, directed drift needs the data to disagree with the model
@@ -215,9 +260,8 @@ gradient chose (QAT) or through dithering from a misaligned grid.
 
 1. Dense-only QAT: attention and shared experts (6.3B FP8) trained, routed experts
    byte-identical. Proven effective on the proxy; a public attention-only fine-tune
-   of this model ships in the native format. Borderline on the 2x RTX PRO 6000
-   (about 92 to 97 GB per GPU with MXFP4-resident experts, whose kernel path is
-   unverified here); fits the 8x host.
+   of this model ships in the native format. About 92 to 97 GB per GPU on two
+   GPUs with MXFP4-resident experts, whose kernel path is unverified here.
 2. FP8 experts as the publication format: a four times finer grid, so experts
    register at ordinary rates; all-FP8 checkpoint about 267 GB, native vLLM FP8
    path, no Blackwell FP4 kernels, does not fit two 96 GB GPUs for serving.
@@ -236,11 +280,19 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
 - Full-parameter QAT is the only path pursued until exhausted. The LoRA-QAT gate arm
   was dropped before measurement (stage 5) and is not developed further unless
   full-parameter fails.
-- Training hardware: 8x B200 (180 GB each) for the full model. The 8x RTX PRO 6000
-  with 1.5 TB host RAM is the fallback and needs custom host-offloaded FP32 masters.
-- Development, unit tests, and the four-layer proxy gate run on the owned 2x RTX PRO
-  6000 in a host venv. A Docker image is built only for the B200, from the lockfile
-  of the venv that passed the gate, and is not tested locally.
+- Training host requirements for the full model: a rank count dividing 256, with
+  the expert-parallel group spanning the world (`tp = pp = cp = 1`); per-GPU memory
+  equal to the steady-state peak measured for the selected trainable set at that
+  rank count (Handoff 2 measured the proxy; the full-model figure is the stage 7
+  estimate until the first full-model run's `memory` block measures it; resident
+  expert weights are 516 GiB of dequantized BF16 divided by the rank count); host
+  RAM for NeMo's dequantized load staging and the master sampling (unquantified for
+  the full model); no format-specific kernels. The stage 6b hardware estimate bounds
+  the host search; the working target host is a separate decision below, and the
+  first full-model run's `memory` block remains the requirement.
+- Development, unit tests, and the four-layer proxy gate run on the owned host
+  (Environment) in a venv. A container is built for the training host from the
+  lockfile of the venv that passed the gate and is not tested locally.
 - Engine: NeMo AutoModel 0.8.0, the source copy in `deepseek/automodel/` from
   https://github.com/nvidia-nemo/automodel. It supplies the model definition, FSDP2,
   expert parallelism, and grouped expert execution. It provides no weight fake-quant,
@@ -254,8 +306,13 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   Frozen tensors are copied byte for byte at export. NeMo's hardcoded per-step
   router-bias update is disabled by `deepseek.qat.freeze.freeze_gate_bias` after
   recipe setup; the frozen-integrity check digests buffers as well as parameters.
+  Routed experts train only when selected for the run by ESFT-style routing scores
+  (Handoff 5); the selection may be all experts. The full-model selection is
+  measured there from per-expert gradient-sign consistency and flip fraction,
+  with `top_p` by routing share as the starting point. Unselected experts are
+  frozen byte for byte and get no optimizer state.
 - Master precision: BF16 masters with stochastic-rounding updates and torchao
-  `AdamW8bit` (8-bit blockwise moments, block 256) on the B200 and on the proxy.
+  `AdamW8bit` (8-bit blockwise moments, block 256) for the full run and on the proxy.
   FP32 masters do not fit the proxy (27B parameters at 4 bytes plus moments on two
   96 GB GPUs). The FP32-master comparison in stage 4 uses a configuration that fits.
 - Optimizer wiring: `deepseek/qat/optim.py` runs the torchao optimizer over each
@@ -265,6 +322,10 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   step materializes several FP32 copies of each tensor it updates, which exceeded GPU
   memory on a 2-billion-element expert tensor. Shard views share storage with the
   DTensor, and chunked updates were verified bit-identical to unchunked ones.
+  `LocalShardOptimizer` mirrors NeMo's parameter groups: its own `param_groups`
+  hold the model's parameters with float rates, which NeMo's LR scheduler reads
+  and writes, and it copies them into the inner groups before every inner step,
+  because torchao keeps its rate as a tensor and raises on a float.
 - Update-in-backward with lagged clipping: `deepseek/qat/inbackward.py` steps every
   trainable parameter from its post-accumulate-grad hook (autograd for expert
   parameters, FSDP2 after reduce-scatter for dense ones) and frees the gradient. The
@@ -295,6 +356,22 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   exact format and token length the full run will use, not for quality; it targets a
   different model and is still being cleaned. The last 16 rows are held out. The
   gate measures mechanism (flips, loss response, held-out loss), not behavior.
+- Expert storage (stage 6b): each layer's routed experts are split into a trained
+  BF16 stack (selected experts) and a frozen packed stack (unselected experts as
+  the source's FP4 codes and E8M0 scales), dequantized on the fly through NeMo's
+  `MXFP4GroupedMM`. Equivalent by construction: an unselected expert's
+  `dequant(Q(w))` is `dequant(codes, scales)`, and selected experts keep the same
+  masters, hook, and optimizer. Shards are even: every expert-parallel rank selects
+  the same count per layer, by score within its own expert range (`route_scores
+  --per-rank N`); hash layers stay all-or-none. The selected stacks keep the names
+  `gate_and_up_projs` and `down_projs`, so the fake-quant, stepper, optimizer, and
+  export contract is unchanged, only shorter along dim 0.
+- The vendored NeMo copy may be patched and its module code adapted into
+  `deepseek/qat`. Each patch is listed in the stage that introduces it.
+- Working target host: 4x B200 (NVLink, about 40% margin on the stage 6b estimate,
+  fits a 30% selection). 8x RTX PRO 6000 is the fallback (PCIe, about 25% margin
+  at 8% selection). The first full-model run's `memory` block remains the
+  requirement.
 - Everything for this work lives under `deepseek/`. Git is managed by the operator.
 
 ## Layout
@@ -317,9 +394,11 @@ deepseek/
     freeze.py         disables NeMo's router correction-bias update
     data.py           reasoning-conversation dataset bridge (NeMo shifted format)
     optim.py          torchao optimizer over local shards; FP32-master AdamW; step_param;
-                      restrict_rows (per-row views for expert selection)
+                      restrict_rows (per-row views for expert selection); NeMo parameter
+                      groups with rate sync into torchao's tensor rates
     inbackward.py     update-in-backward stepper with lagged clipping, optional per-class norms,
-                      per-class update period (frequency split), per-parameter row selection
+                      per-class update period (frequency split), per-parameter row selection,
+                      hook-entry peak memory sample
     overrides.py      --set/--unset recipe overrides shared by the torchrun entries
     proxy_export.py   trained-target export: quantize, gather experts to rank 0,
                       replace only tensors whose bytes differ from the source
@@ -330,10 +409,17 @@ deepseek/
                       --trainable-subset, --dense-every N, --expert-selection SCORES.json,
                       --expert-shares SCORES.json, held-out capture with per-class and
                       per-layer flip totals, per-expert flip table in the report,
+                      per-step memory series and resident accounting by class, per-group
+                      rate metrics,
                       --export DIR [--force] with probe logits and replaced list beside --out
     route_scores.py   routing-concentration measurement and ESFT top_p selection (torchrun entry)
+    split_experts.py  (stage 6b) per-layer experts module: trained BF16 stack plus frozen packed
+                      stack with on-the-fly dequantization; local-slot to global-expert ids
+    split_adapter.py  (stage 6b) DeepSeekV4StateDictAdapter subclass routing each expert into
+                      the BF16 or packed stack per rank
     proxy-4layer.yaml stage 2 recipe (mock token ids)
-    proxy-train.yaml  training recipe: data bridge, freeze config, optimizer
+    proxy-train.yaml  training recipe: data bridge, freeze config, optimizer with the
+                      experts parameter group (lr_mult), constant-rate scheduler with warmup
   tests/                                       unittest, run from the repo root
 ```
 
@@ -501,7 +587,7 @@ The optimizer and its wiring are done (stage 3).
   (`deepseek/exports/logs/proxy-stage4-freeze.json`): factor 1e-3 before, one scored
   gate on the proxy (layers 0 to 2 hash-route), 68 frozen parameters and 6 buffers
   unchanged by a bit, all other figures equal to stage 3.
-- Update-in-backward (Decisions). Motivation: with `ep_size: 8` each B200 rank owns
+- Update-in-backward (Decisions). Motivation: with `ep_size: 8` each rank owns
   32 experts per layer outside FSDP, and a full BF16 gradient for them is about
   69 GB. `proxy_step.py --in-backward` enables it. Equivalence check with stochastic
   rounding off in both runs and the reference clip at 1e9 (so both first steps are
@@ -702,24 +788,163 @@ deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config dee
 # train on an export: add the two model-path overrides to the proxy_step command
 ```
 
-### Stage 7: full model on 8x B200 or B300 (planned)
+### Stage 6b: split expert storage (planned)
 
-Docker image from the gate-passing venv lockfile with a verifier script run first.
+Routed experts of each layer live in two stacks: selected experts as trained BF16
+parameters, unselected experts as the source's packed FP4 codes and E8M0 scales
+(Decisions). Unselected experts are 92% of resident bytes at an 8% selection and
+cost about 0.53 bytes per parameter packed against 2 as BF16: expert storage
+falls from 516 GiB to about 167, the load no longer dequantizes them (NeMo's
+dequantized load staging was the unquantified host-RAM item), and export and
+integrity for unselected experts become byte copies and digests.
+
+NeMo supplies the pieces: `GroupedExpertsMXFP4` and `MXFP4ExpertStorageMixin`
+(`components/moe/quantized_experts.py`) keep `*_packed` and `*_scales` as frozen
+parameters; `MXFP4GroupedMM` (`components/quantization/mxfp4.py`) dequantizes
+inside forward and backward, returns the activation gradient, and produces no
+weight gradient; the adapter's `expert_storage_format = "mxfp4"` aggregates
+per-expert codes and scales without unpacking, byte-identical to the HF layout
+(gate and up concatenated along the output dim); the LoRA variant shows trainable
+and packed compute in one grouped forward. What NeMo lacks is two storage kinds
+in one layer, and a hook between construction and sharding: with `ep_size > 1`
+the build applies EP and FSDP first (`_should_load_before_shard` is false under
+expert parallelism) and loads the checkpoint afterwards through DCP into the
+sharded parameters, with the adapter's `to_hf` supplying per-expert placeholders
+from each rank's local shard and `from_hf` rebuilding the stacks.
+
+Components, in build order:
+
+- `deepseek/qat/split_experts.py`: `ExpertSplit` (reads a `route_scores` report,
+  requires an equal count per rank per layer, `install(model)` swaps each layer's
+  experts module and the adapter) and `SplitExperts(GroupedExperts)`, adapted from
+  `GroupedExpertsMXFP4` and `GroupedExperts._forward_grouped_mm`. BF16 stacks keep
+  the names `gate_and_up_projs` and `down_projs` (global dim 0 is ranks times the
+  per-rank count); packed stacks are `*_packed` and `*_scales`; `_mxfp4_resident =
+  True` so NeMo's initializer skips the module. Local slot to global expert id is
+  derived from the DTensor mesh rank and the selection on first use and cached,
+  not stored as a buffer: the init-time state dict includes persistent buffers and
+  DCP requires every key in the checkpoint. Forward remaps global ids to a
+  selected-first local order, calls `_permute_tokens_for_grouped_mm` once, splits
+  at the selected token count, runs `torch._grouped_mm` on the BF16 stack and
+  `MXFP4GroupedMM` on the packed stack, skips a stack with no tokens, and scatters
+  once. A layer with no selected experts holds only packed stacks and no
+  trainable parameter.
+- `deepseek/qat/split_adapter.py`: `DeepSeekV4StateDictAdapter` subclass overriding
+  `_dequantize` (selected experts only), `_aggregate_experts` (two stacks per layer
+  as DTensors on the expert mesh), `_split_merged_expert` (per-slot ids from the
+  module; the base splitter asserts a local count of experts divided by ranks and
+  cannot be reused), and the placeholder branch of `convert_single_tensor_to_hf`
+  (FP4 placeholders for selected experts, passthrough views for packed).
+- NeMo patch 1, `components/models/deepseek_v4/model.py`: `DeepseekV4ForCausalLM.__init__`
+  pops `expert_split` from its kwargs and calls `install(self)` after the adapter is
+  created. The recipe key is `model.expert_split`, a `_target_` block instantiating
+  `ExpertSplit` with `scores: PATH`, so NeMo imports nothing from the project.
+  Keys under `model:` that are not config fields reach the constructor (NeMo's
+  kwargs filter passes everything to a `**kwargs` constructor); they do not reach
+  `apply_model_infrastructure`, which receives named arguments only, and today an
+  unknown key is silently ignored.
+- NeMo patch 2, `components/utils/model_utils.py`: the freeze selector sets
+  `requires_grad` per floating-point parameter instead of `module.requires_grad_`,
+  which raises on the int8 and E8M0 packed parameters under the recipe's
+  `unfreeze_modules` glob (NeMo's own MXFP4 modules fail the same way).
+- `route_scores.py --per-rank N`: N experts per layer per rank by score within the
+  rank's range, every layer; the report records the rank count. The full-model
+  all-or-none policy for hash layers (Handoff 5.4) is a separate selection file.
+- `fakequant.find_targets`: accepts `SplitExperts`; skips layers without a
+  selected stack.
+- `proxy.py`, `proxy_export.py`: the `rank * E_local + i` rule is replaced by the
+  module's ids; parity compares selected experts against their source tensors and
+  packed stacks against the source bytes; export quantizes selected stacks only,
+  gathering equal-shaped per-rank stacks with their id lists.
+- `proxy_step.py`: flip accounting reads the module; packed stacks are covered by
+  the frozen digest; `--expert-selection` together with `model.expert_split` is
+  rejected, so `restrict_rows` and the stepper's row masks are not used on this
+  path.
+- `proxy-train.yaml`: `model.expert_split` absent by default so every existing arm
+  is unchanged; runs add it with `--set model.expert_split._target_=...` and
+  `--set model.expert_split.scores=PATH`.
+
+Unchanged by evidence: `inbackward.py` and `optim.py` select parameters by
+`requires_grad` and the `.mlp.experts` name; NeMo's expert-gradient scaling
+identifies expert parameters by the `ep` axis on their DTensor mesh, which both
+stacks carry.
+
+Implementation read list, per component: `split_experts.py` needs
+`components/moe/quantized_experts.py`, `components/quantization/mxfp4.py`,
+`components/moe/experts.py` (`GroupedExperts.__init__`, `forward`,
+`_forward_grouped_mm`, `_permute_tokens_for_grouped_mm`); `split_adapter.py` needs
+`components/models/deepseek_v4/state_dict_adapter.py` and
+`components/moe/state_dict_utils.py`; the entry-point changes need
+`deepseek/qat/proxy.py`, `proxy_export.py`, and the expert sections of
+`proxy_step.py` (`quantized_state`, `flip_totals`, the per-expert report).
+
+Gates, in order, each blocking the next:
+
+1. CPU: `dequantize_mxfp4` equals `quant.py` on sampled source tensors and on a
+   zero-exponent scale (NeMo's load-time FP4 dequantization decodes E8M0 byte 0 as
+   0, its on-the-fly path as `2**-127`; the checkpoint has no zero scales); the
+   adapter routes a synthetic two-layer state dict into the right stacks and
+   shapes per rank on a one-rank gloo mesh (`create_dtensor_from_local` needs a
+   mesh named `ep`); the forward on random tokens equals a single-stack reference
+   within fp32 tolerance; a one-layer meta build from the snapshot config runs
+   through the constructor hook.
+2. GPU, zero delta: `proxy.py` fixed-point and source-parity checks pass on the
+   split module; hooked probe logits bit-identical to the current path. The packed
+   grouped matmul reads a transposed operand and may change fp32 accumulation
+   order; if logits differ, the report carries the maximum difference and the
+   gate is equality within fp32 accumulation.
+3. GPU, training: `route_scores --per-rank N` (N chosen so the total is near the
+   ESFT arm's 83), one single-stack run with `--expert-selection` on that file as
+   the baseline (about 40 minutes), then the split module on the same file under
+   `model.expert_split`. Pass: identical master digest. `proxy-mem-esft-top02.json`
+   cannot serve as the baseline because its 25, 25, 25, 8 selection is not an
+   equal count per rank. Peak memory recorded against that report.
+4. GPU, artifact: export, `verify_export` against the replaced list, reload under
+   the current path with bit-identical probe logits.
+5. GPU, estimate: a 16-layer proxy memory run at 2 ranks, giving the 4x B200
+   column a measured transient before any rental.
+
+Hardware estimate at 8% selection (GiB reserved per rank, same model as Handoff 2;
+the per-layer dequantization transient is inferred, a few GiB at most): 2 ranks
+about 170 (B300 class only); 4 ranks about 104 (B200: fits; RTX PRO 6000: no);
+8 ranks about 71 (RTX PRO 6000: fits; B200: fits); 16 ranks about 54. Selection
+fraction matters here: at 30%, 8 ranks is about 99 and 4x B200 about 130. The
+local 2x RTX PRO 6000 host still cannot train the full model (about 170 at 2
+ranks); it gains a 15 to 20 layer proxy.
+
+Not in scope: uneven shards by per-layer `top_p`; MXFP4 compute for selected
+experts; selection scoring changes beyond the per-rank quota.
+
+### Stage 7: full model (planned)
+
+Container from the gate-passing venv lockfile with a verifier script run first.
 Routing scores over the training data on the training host, then selection, then
 one update, bounded convergence run, export, fresh-process equality, Transformers
-and vLLM probes on the RTX PRO 6000 pair. Memory plan with `ep_size: 8` and
-ESFT-style selection (Handoff 5): each rank owns 32 experts per layer outside FSDP
-as dequantized BF16, about 72 GB of weights per rank for the full model, which now
-dominates; 8-bit moments are under 2 GB for dense and a few GB for the selected
-experts (about 71 GB per rank if every expert were trained, the pre-selection
-figure of 141 GB per GPU with all experts no longer applies). Weights fall further
-only if unselected experts could stay in MXFP4, which NeMo's one-tensor-per-layer
-expert layout does not allow. These are resident-state figures; the steady-state
-peak adds activations, `min_error` fake-quant temporaries during recompute, and
-torchao step temporaries, and must be measured on a multi-step run (Handoff 2).
-With selection the 8x RTX PRO 6000 (96 GB) host is borderline on activations rather
-than ruled out; the B200 is comfortable, and a B300 host is available. The
-preparation decisions are listed in Handoff 6. Expert flips arrive tens of steps
+and vLLM probes on hardware that serves the source. Memory plan with the
+expert-parallel group spanning the world and ESFT-style selection (Handoff 5):
+each rank owns its share of every layer's experts outside FSDP as dequantized
+BF16: 43 layers of 6,442,450,944 elements, 516 GiB (the earlier 593 GB counted the
+three unloaded MTP modules), so 64.5 GiB at eight ranks and 32.3 at sixteen, which
+dominates; 8-bit moments are about 1.5 GiB for dense and about 5.3 for experts at
+the 8% selection of Handoff 5 (about 66 at eight ranks if every expert were
+trained, so the pre-selection figure of 141 GB per GPU no longer applies). Stage 6b
+keeps unselected experts packed, cutting expert storage to about 167 GiB; its
+figures are in that stage, and the ones below are for the single-stack path.
+Estimate (labelled; the first
+full-model run's `memory` block is the measurement), from the proxy's Handoff 2
+figures at local batch 1 and rows to 4,352 tokens: resident about 73 GiB at eight
+ranks (experts 64.5, dense shard 1.5, frozen 0.35, dense state 1.5, expert state
+5.3); transient about 32 to 39 (the proxy's 24.3, plus dense and frozen parameters
+held unsharded through forward and backward growing from 2.0 to about 12.7 under
+`reshard_after_forward: false`, plus checkpoint-saved activations for 39 more
+layers, minus four times smaller per-rank expert gradients and fake-quant copies);
+peak allocated about 105 to 112 at eight ranks and 120 to 127 reserved, outside a
+96 GB GPU. Two levers: `distributed.moe.reshard_after_forward: true` removes most
+of the unsharded-dense term (about 95 to 101 allocated at eight ranks), and
+sixteen ranks give about 69 to 76 allocated (58 to 65 with resharding) and 80 to 87
+reserved, inside a 96 GB (89.4 GiB) GPU. The measured peak of the first full-model
+run is the per-GPU memory requirement and selects the host. The preparation
+decisions are listed in Handoff 6. Expert flips arrive tens of steps
 after dense changes at the same rate (stage 5), and a joint run at one rate starves
 them once dense fits (phase C). Selection is the primary remedy: the task-routed
 experts flip at full dense speed (Handoff 5.3). Dense slowing is a tuning knob
@@ -799,6 +1024,24 @@ and per-expert flip fractions are the leading indicators to watch, not the loss.
   consistent drift; it does not change what experts can learn.
 - First-step peak memory understates steady state: optimizer state allocated
   progressively during a first backward is fully resident before every later one.
+  Measured in Handoff 2: 9 to 14 GiB at two layers.
+- NeMo `param_group_overrides` only stores `lr_mult` on a group; the multiplier is
+  applied by `OptimizerParamScheduler.step`, so it is inert without an
+  `lr_scheduler` block. The scheduler calls `step(0)` at build and `step(1)` after
+  each optimizer step, so every rate describes the next step, which is compatible
+  with update-in-backward. torchao's Adam keeps each group's `lr` as a tensor and
+  raises when a float replaces it, which NeMo's scheduler does.
+- After a bare forward with `reshard_after_forward: false`, FSDP2 module
+  attributes point at the unsharded parameter objects, not the sharded ones the
+  optimizer registered; parameter lookups across that boundary must use names.
+- FSDP2 dense and frozen parameters are sharded between steps and unsharded
+  through forward and backward under `reshard_after_forward: false`; a bare
+  forward (validation) leaves them unsharded until the next backward. Resident
+  accounting must therefore sample after a backward (`proxy_step` samples at the
+  end of the first step).
+- The BF16 gradient set equals trainable elements times two bytes exactly:
+  12.246 GiB for 6,574,571,520 elements, measured as optimizer-entry allocation
+  minus steady resident state on the two-layer proxy.
 
 ## Prior investigation (rented 8x H100, 2026-10-07)
 

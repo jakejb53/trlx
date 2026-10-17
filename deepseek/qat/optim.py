@@ -10,8 +10,11 @@ DTensor path would.
 ``LocalShardOptimizer`` builds the inner optimizer over shard views, and at each
 step copies every DTensor gradient's local tensor onto its view before stepping.
 ``step_param`` does the same for a single parameter so ``deepseek.qat.inbackward``
-can step each parameter as its gradient arrives. It exposes ``param_groups`` for
-learning-rate reads. Optimizer state checkpoints
+can step each parameter as its gradient arrives. It accepts NeMo's parameter
+groups (``param_group_overrides``) and mirrors them: its own ``param_groups``
+hold the model's parameters with float rates for NeMo's LR scheduler to read and
+write, and each inner group receives those rates before every inner step, since
+torchao keeps its lr as a tensor and refuses a float. Optimizer state checkpoints
 are not supported; this is for gate runs.
 
 ``MasterOptimizer`` is the FP32-master counterpart: torch AdamW over FP32 copies
@@ -36,8 +39,14 @@ class LocalShardOptimizer(torch.optim.Optimizer):
 
     def __init__(self, params, factory, max_chunk_elems: int = 1 << 28, **kwargs):
         originals = [p for p in params]
-        if any(isinstance(p, dict) for p in originals):
-            raise TypeError("LocalShardOptimizer takes a flat parameter list, not param groups")
+        # A flat parameter list is one group; NeMo's param_group_overrides deliver
+        # a list of group dicts ({"params", "lr_mult", "wd_mult"}) instead.
+        if originals and all(isinstance(p, dict) for p in originals):
+            groups = originals
+        elif any(isinstance(p, dict) for p in originals):
+            raise TypeError("LocalShardOptimizer takes a flat parameter list or a list of parameter groups, not a mix")
+        else:
+            groups = [{"params": originals}]
         # (parameter, [(chunk view, dim-0 slice)]). A plain parameter is its own
         # single chunk; a DTensor's local shard is split along dim 0 so torchao's
         # step, which materializes several FP32 copies of each tensor it updates,
@@ -45,28 +54,50 @@ class LocalShardOptimizer(torch.optim.Optimizer):
         # of the shard's storage, and chunk boundaries fall on dim-0 rows, which
         # are multiples of torchao's 256-element state blocks for every target.
         self._entries: list[tuple[torch.Tensor, list[tuple[torch.Tensor, slice]]]] = []
-        locals_: list[torch.Tensor] = []
-        for p in originals:
-            if not isinstance(p, DTensor):
-                self._entries.append((p, [(p, slice(None))]))
-                locals_.append(p)
-                continue
-            shard = p.to_local()
-            if shard.untyped_storage().data_ptr() != p._local_tensor.untyped_storage().data_ptr():
-                raise RuntimeError("local shard view does not share storage with its DTensor parameter")
-            shard = shard.detach()
-            chunks = []
-            for sl in _dim0_slices(shard, max_chunk_elems):
-                view = shard[sl].requires_grad_(True)
-                chunks.append((view, sl))
-                locals_.append(view)
-            self._entries.append((p, chunks))
+        inner_groups: list[dict] = []
+        outer_groups: list[dict] = []
+        for group in groups:
+            views: list[torch.Tensor] = []
+            for p in group["params"]:
+                chunks = self._chunks_for(p, max_chunk_elems)
+                self._entries.append((p, chunks))
+                views.extend(v for v, _ in chunks)
+            options = {k: v for k, v in group.items() if k != "params"}
+            inner_groups.append({"params": views, **options})
+            outer_groups.append({"params": list(group["params"]), **options})
         self._chunks_by_param = {id(p): chunks for p, chunks in self._entries}
-        self.inner = factory(params=locals_, **kwargs)
-        # Register the original parameters so torch's Optimizer bookkeeping and
-        # NeMo's param_groups reads see the model's parameters and the inner lr.
-        super().__init__(originals, dict(self.inner.defaults))
-        self.param_groups = self.inner.param_groups
+        self.inner = factory(params=inner_groups, **kwargs)
+        # The outer param_groups are torch's own bookkeeping over the model's
+        # parameters, one per inner group and in the same order, holding plain
+        # float lr/weight_decay. NeMo's LR scheduler writes floats into them and
+        # reads its base rate from group 0; torchao keeps its lr as a tensor and
+        # refuses a float, so _sync_rates carries the outer values into the
+        # inner groups before every inner step.
+        super().__init__(outer_groups, dict(self.inner.defaults))
+
+    # Chunk views of one parameter: a plain tensor is its own chunk; a DTensor's
+    # local shard is split along dim 0.
+    @staticmethod
+    def _chunks_for(p: torch.Tensor, max_chunk_elems: int) -> list[tuple[torch.Tensor, slice]]:
+        if not isinstance(p, DTensor):
+            return [(p, slice(None))]
+        shard = p.to_local()
+        if shard.untyped_storage().data_ptr() != p._local_tensor.untyped_storage().data_ptr():
+            raise RuntimeError("local shard view does not share storage with its DTensor parameter")
+        shard = shard.detach()
+        return [(shard[sl].requires_grad_(True), sl) for sl in _dim0_slices(shard, max_chunk_elems)]
+
+    # Copy each outer group's scheduled lr and weight decay onto its inner group.
+    # A tensor lr (torchao) is filled in place so the compiled step sees the
+    # same object; a float lr (torch optimizers) is assigned.
+    def _sync_rates(self) -> None:
+        for outer, inner in zip(self.param_groups, self.inner.param_groups):
+            lr = inner["lr"]
+            if isinstance(lr, torch.Tensor):
+                lr.fill_(float(outer["lr"]))
+            else:
+                inner["lr"] = outer["lr"]
+            inner["weight_decay"] = outer["weight_decay"]
 
     # Restrict a parameter's stepped rows to `rows` (local dim-0 indices): its
     # chunks become one view per selected row, so the other rows are never
@@ -90,11 +121,18 @@ class LocalShardOptimizer(torch.optim.Optimizer):
             raise ValueError(f"restrict_rows needs distinct row indices in [0, {n}), got {rows}")
         new = [(shard[r].requires_grad_(True), r) for r in sorted(rows)]
         old_views = {id(v) for v, _ in old}
-        params = self.inner.param_groups[0]["params"]
-        kept = [q for q in params if id(q) not in old_views]
-        if len(kept) != len(params) - len(old):
-            raise RuntimeError("inner optimizer parameter list does not match the chunk views")
-        self.inner.param_groups[0]["params"] = kept + [v for v, _ in new]
+        # The parameter's chunk views all live in one inner group; swap them there.
+        for group in self.inner.param_groups:
+            params = group["params"]
+            kept = [q for q in params if id(q) not in old_views]
+            if len(kept) == len(params):
+                continue
+            if len(kept) != len(params) - len(old):
+                raise RuntimeError("inner optimizer parameter list does not match the chunk views")
+            group["params"] = kept + [v for v, _ in new]
+            break
+        else:
+            raise RuntimeError("inner optimizer holds no chunk views of this parameter")
         for i, (q, chunks) in enumerate(self._entries):
             if q is p:
                 self._entries[i] = (p, new)
@@ -120,6 +158,7 @@ class LocalShardOptimizer(torch.optim.Optimizer):
             g = None if p.grad is None else self._local_grad(p)
             for view, sl in chunks:
                 view.grad = None if g is None else g[sl]
+        self._sync_rates()
         return self.inner.step(closure)
 
     # Step one parameter in isolation, for update-in-backward: its gradient is
@@ -138,6 +177,7 @@ class LocalShardOptimizer(torch.optim.Optimizer):
             g = self._local_grad(p)
             for view, sl in chunks:
                 view.grad = g[sl]
+        self._sync_rates()
         self.inner.step()
         if mapped:
             for view, _ in chunks:

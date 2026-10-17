@@ -115,3 +115,16 @@ optimizer:
   weight_decay: 0.0
   betas: [0.9, 0.95]
   bf16_stochastic_round: true
+  # Routed experts form their own parameter group. lr_mult is the per-class rate
+  # (the dense-slowing knob: base lr is the dense rate, experts run at lr_mult
+  # times it); 1.0 keeps a single rate. Applied by the lr_scheduler below.
+  param_group_overrides:
+    - pattern: 'mlp\.experts'
+      lr_mult: 1.0
+
+# Constant rate with a linear warmup from init_lr (NeMo default: 0.1 x lr) over
+# lr_warmup_steps, for every class entering training. Warmup must stay below
+# max_steps; the one-step base recipe keeps it at 0 and runs set it with --set.
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 0

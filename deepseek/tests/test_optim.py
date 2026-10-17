@@ -3,7 +3,9 @@ AdamW on an FP32 copy followed by a BF16 round, chunking does not change the
 result, step_param equals step, sub-ulp updates accumulate in the FP32 masters
 where BF16 masters would stall, and the inherited failure modes hold. For
 LocalShardOptimizer: restrict_rows steps only the selected rows of a stacked
-parameter, allocates state only for them, and is refused after a step."""
+parameter, allocates state only for them, and is refused after a step; NeMo-style
+parameter groups are mirrored into the inner optimizer, outer float rates reach
+inner tensor rates in place, and restrict_rows works in any group."""
 
 import copy
 import unittest
@@ -161,6 +163,78 @@ class RestrictRows(unittest.TestCase):
         opt.step_param(stack)
         with self.assertRaisesRegex(RuntimeError, "before the first optimizer step"):
             opt.restrict_rows(stack, [0])
+
+
+class ParameterGroups(unittest.TestCase):
+    # Two groups as NeMo's param_group_overrides deliver them, the second with
+    # lr_mult. The inner groups mirror the outer ones, a float written to an
+    # outer group's lr (what OptimizerParamScheduler.step does) reaches the inner
+    # group at the next step, and the stepped values equal AdamW at those rates.
+    def test_groups_mirror_and_rates_follow_outer_writes(self):
+        dense, expert = _params()
+        ref_dense, ref_expert = copy.deepcopy(dense), copy.deepcopy(expert)
+        opt = LocalShardOptimizer([{"params": [dense]}, {"params": [expert], "lr_mult": 4.0}],
+                                  torch.optim.AdamW, lr=LR, weight_decay=0.0, foreach=False)
+        self.assertEqual(len(opt.inner.param_groups), 2)
+        self.assertEqual(opt.inner.param_groups[1]["lr_mult"], 4.0)
+        self.assertIsInstance(opt.param_groups[0]["lr"], float)
+        opt.param_groups[1]["lr"] = 4 * LR
+        ref = torch.optim.AdamW([{"params": [ref_dense]}, {"params": [ref_expert], "lr": 4 * LR}],
+                                lr=LR, weight_decay=0.0, foreach=False)
+        for step in range(2):
+            _set_grads([dense, expert], step)
+            _set_grads([ref_dense, ref_expert], step)
+            opt.step()
+            ref.step()
+        self.assertTrue(torch.equal(dense, ref_dense))
+        self.assertTrue(torch.equal(expert, ref_expert))
+        self.assertEqual(opt.inner.param_groups[1]["lr"], 4 * LR)
+
+    # torchao keeps each group's lr as a tensor and raises when a float replaces
+    # it; the sync must fill that tensor in place rather than rebind the key.
+    def test_tensor_lr_is_filled_in_place(self):
+        class TensorLR(torch.optim.AdamW):
+            def add_param_group(self, group):
+                super().add_param_group(group)
+                g = self.param_groups[-1]
+                if not isinstance(g["lr"], torch.Tensor):
+                    g["lr"] = torch.tensor(g["lr"], dtype=torch.float32)
+
+        p = _params()[0]
+        opt = LocalShardOptimizer([p], TensorLR, lr=LR, weight_decay=0.0, foreach=False)
+        inner_lr = opt.inner.param_groups[0]["lr"]
+        self.assertIsInstance(inner_lr, torch.Tensor)
+        opt.param_groups[0]["lr"] = 2 * LR
+        p.grad = torch.randn_like(p)
+        opt.step_param(p)
+        self.assertIs(opt.inner.param_groups[0]["lr"], inner_lr)
+        self.assertAlmostEqual(float(inner_lr), 2 * LR)
+
+    def test_mixed_list_is_rejected(self):
+        dense, expert = _params()
+        with self.assertRaises(TypeError):
+            LocalShardOptimizer([dense, {"params": [expert]}], torch.optim.AdamW, lr=LR, weight_decay=0.0)
+
+    # restrict_rows must find the parameter's chunk views in whichever inner
+    # group holds them, not assume group 0.
+    def test_restrict_rows_in_a_later_group(self):
+        torch.manual_seed(0)
+        dense = nn.Parameter(torch.randn(6, 4))
+        stack = nn.Parameter(torch.randn(4, 8, 6))
+        opt = LocalShardOptimizer([{"params": [dense]}, {"params": [stack], "lr_mult": 2.0}],
+                                  torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        opt.restrict_rows(stack, [2])
+        self.assertEqual(len(opt.inner.param_groups[0]["params"]), 1)
+        self.assertEqual(len(opt.inner.param_groups[1]["params"]), 1)
+        before = stack.detach().clone()
+        stack.grad = torch.randn_like(stack)
+        dense.grad = torch.randn_like(dense)
+        opt.step_param(stack)
+        opt.step_param(dense)
+        for r in (0, 1, 3):
+            self.assertTrue(torch.equal(stack.detach()[r], before[r]))
+        self.assertFalse(torch.equal(stack.detach()[2], before[2]))
+        self.assertEqual(len(opt.inner.state), 2)
 
 
 if __name__ == "__main__":
