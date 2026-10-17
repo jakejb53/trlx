@@ -6,14 +6,18 @@ wrapping match training), loads the real checkpoint, and checks:
 1. fixed point: every target's fake-quantized tensor equals the loaded tensor
    bit for bit, on this rank's local shard;
 2. source parity: every loaded target equals the dequantized source tensor from
-   the snapshot (dense: full tensor on rank 0; experts: this rank's local experts);
+   the snapshot (dense: full tensor on rank 0; experts: this rank's local experts,
+   by global id); under split storage (stage 6b) every packed slot also equals
+   the source's codes and scales byte for byte;
 3. logits parity: on fixed token ids, the hooked and unhooked forwards produce
    bit-identical logits, and uninstalling restores the unhooked logits.
 
 Pointed at an export (``--snapshot`` and the model-path overrides naming the
 export), the same checks prove the export reloads exactly; ``--expect-logits``
 additionally compares the hooked logits bit for bit with those a ``proxy_step
---export`` run saved before writing it.
+--export`` run saved before writing it. ``--save-logits PREFIX`` writes this
+run's hooked logits in that format, so two builds of the same checkpoint (the
+single-stack path and split expert storage, stage 6b gate 2) can be compared.
 
 Any failure exits nonzero. Launch from the repo root:
 
@@ -108,12 +112,22 @@ def _local(t: torch.Tensor) -> torch.Tensor:
     return t.to_local() if isinstance(t, DTensor) else t
 
 
-def _ep_offset(t: torch.Tensor) -> int:
-    """First global expert index held in this rank's local shard of a dim-0-sharded DTensor."""
-    if not isinstance(t, DTensor) or not any(p.is_shard() for p in t.placements):
-        return 0
-    mesh = t.device_mesh
-    return mesh.get_local_rank() * t.to_local().shape[0]
+def local_expert_ids(module, param: torch.Tensor) -> list[int]:
+    """Global expert id of each dim-0 row of this rank's shard of a trained expert parameter.
+
+    Split storage (stage 6b, ``SplitExperts``) maps rows through its selection;
+    the single stack holds the contiguous range starting at rank times the local
+    count on a one-dimensional expert mesh.
+    """
+    from deepseek.qat.split_experts import SplitExperts  # local: NeMo is only needed on a built model
+
+    if isinstance(module, SplitExperts):
+        return module.local_ids()[0]
+    n_local = _local(param).shape[0]
+    if not isinstance(param, DTensor) or not any(p.is_shard() for p in param.placements):
+        return list(range(n_local))
+    offset = param.device_mesh.get_local_rank() * n_local
+    return [offset + i for i in range(n_local)]
 
 
 def check_fixed_point(state: FQ.FakeQuantState) -> dict:
@@ -145,9 +159,7 @@ def check_source(state: FQ.FakeQuantState, source: Source, rank: int) -> dict:
                 continue
             layer = int(t.name.split(".")[2])
             local = _local(param).cpu()
-            offset = _ep_offset(param)
-            for i in range(local.shape[0]):
-                e = offset + i
+            for i, e in enumerate(local_expert_ids(t.module, param)):
                 if attr == "gate_and_up_projs":
                     inter = local.shape[2] // 2
                     exp = torch.cat([source.expert(layer, e, "w1").T, source.expert(layer, e, "w3").T], dim=-1)
@@ -157,6 +169,29 @@ def check_source(state: FQ.FakeQuantState, source: Source, rank: int) -> dict:
                 n = int((local[i] != exp.to(local.dtype)).sum())
                 if n:
                     bad[f"{full_name}[expert {e}]"] = n
+    return bad
+
+
+# Split storage (stage 6b): every packed slot of every layer must hold the
+# source's codes and scales byte for byte, on this rank's shard. Empty when the
+# model has no split layers.
+def check_packed(model, source: Source) -> dict:
+    from deepseek.qat.split_experts import SplitExperts  # local: NeMo is only needed on a built model
+
+    bad = {}
+    for key, layer in model.model.layers.items():
+        m = layer.mlp.experts
+        if not isinstance(m, SplitExperts) or m.n_packed == 0:
+            continue
+        _, ids = m.local_ids()
+        for j, e in enumerate(ids):
+            for attr, halves in (("gate_and_up_projs", ("w1", "w3")), ("down_projs", ("w2",))):
+                for suffix, disk in (("_packed", "weight"), ("_scales", "scale")):
+                    got = _local(getattr(m, attr + suffix)).detach()[j].cpu().view(torch.uint8)
+                    exp = torch.cat([source.tensor(f"layers.{key}.ffn.experts.{e}.{w}.{disk}") for w in halves]).view(torch.uint8)
+                    n = int((got != exp).sum()) if got.shape == exp.shape else -1
+                    if n:
+                        bad[f"model.layers.{key}.mlp.experts.{attr}{suffix}[expert {e}]"] = n
     return bad
 
 
@@ -176,8 +211,13 @@ def main(argv=None) -> int:
     parser.add_argument("--skip-source-check", action="store_true")
     add_override_arguments(parser)
     parser.add_argument("--expect-logits", default=None, metavar="PREFIX",
-                        help="compare hooked logits bit for bit with PREFIX-logits-rank{rank}.pt saved by proxy_step --export")
+                        help="compare hooked logits bit for bit with PREFIX-logits-rank{rank}.pt saved by proxy_step --export or --save-logits")
+    parser.add_argument("--save-logits", default=None, metavar="PREFIX",
+                        help="save this rank's hooked logits as PREFIX-logits-rank{rank}.pt for a later --expect-logits (stage 6b gate 2: "
+                             "the single-stack path against split storage)")
     args = parser.parse_args(argv)
+    if args.save_logits is not None and args.save_logits == args.expect_logits:
+        parser.error("--save-logits and --expect-logits name the same prefix")
 
     from nemo_automodel.components.config.loader import load_yaml_config
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -200,7 +240,9 @@ def main(argv=None) -> int:
     report["fixed_point_mismatches"] = check_fixed_point(state)
 
     if not args.skip_source_check:
-        report["source_mismatches"] = check_source(state, Source(args.snapshot), rank)
+        source = Source(args.snapshot)
+        report["source_mismatches"] = check_source(state, source, rank)
+        report["packed_mismatches"] = check_packed(model, source)
 
     vocab = int(model.config.vocab_size)
     input_ids = probe_token_ids(vocab, args.batch, args.seq, args.seed).to(device)
@@ -215,6 +257,11 @@ def main(argv=None) -> int:
     report["logits_hooked_max_abs_diff"] = float((plain - hooked).abs().max())
     report["logits_hooked_differing"] = int((plain != hooked).sum())
     report["logits_restored_equal"] = bool(torch.equal(plain, restored))
+
+    # Same file format as proxy_step --export, so either source serves --expect-logits.
+    if args.save_logits is not None:
+        torch.save(hooked.cpu(), logits_path(args.save_logits, rank))
+        report["saved_logits_path"] = logits_path(args.save_logits, rank)
 
     # Reload check: the export holds Q(master) exactly, a fixed point of the
     # quantizer, so the saved logits must be reproduced bit for bit; a missing
@@ -237,6 +284,7 @@ def main(argv=None) -> int:
     ok = (
         not report["fixed_point_mismatches"]
         and not report.get("source_mismatches")
+        and not report.get("packed_mismatches")
         and report["logits_hooked_equal"]
         and report["logits_restored_equal"]
         and report.get("logits_match_saved", True)

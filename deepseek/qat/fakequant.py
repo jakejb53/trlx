@@ -146,6 +146,12 @@ def find_targets(model: nn.Module) -> list[Target]:
         for proj in ("gate_proj", "up_proj", "down_proj"):
             targets.append(Target(f"model.layers.{i}.mlp.shared_experts.{proj}", getattr(shared, proj), {"weight": "fp8"}))
         experts = layer.mlp.experts
+        # Split expert storage (stage 6b): a layer with no selected experts holds
+        # packed stacks only and has no trained expert tensor to fake-quantize.
+        from deepseek.qat.split_experts import SplitExperts  # local: NeMo is only needed on a built model
+
+        if isinstance(experts, SplitExperts) and experts.n_selected == 0:
+            continue
         for attr in ("gate_and_up_projs", "down_projs"):
             if not isinstance(getattr(experts, attr, None), torch.Tensor):
                 raise ValueError(f"layer {i}: experts module {type(experts).__name__} has no {attr} parameter")

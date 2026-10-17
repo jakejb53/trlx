@@ -137,8 +137,10 @@ class PerExpertAndSelection(unittest.TestCase):
 class ExpertReporting(unittest.TestCase):
     def test_breakdown_keys_by_global_expert_and_sums_to_total(self):
         entries = [1, 2, 3, 4, 5, 6]  # gate/up: two entries per expert, three local experts
-        rows = expert_breakdown(entries, 3, offset=10, elements_per_expert=100)
+        rows = expert_breakdown(entries, [10, 11, 12], elements_per_expert=100)
         self.assertEqual(rows, {10: (3, 100), 11: (7, 100), 12: (11, 100)})
+        # Split storage names rows by the selection, not by a contiguous offset.
+        self.assertEqual(expert_breakdown(entries, [3, 17, 200], elements_per_expert=100), {3: (3, 100), 17: (7, 100), 200: (11, 100)})
         self.assertEqual(sum(n for n, _ in rows.values()), sum(entries))
 
     def test_load_shares(self):

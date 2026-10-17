@@ -36,6 +36,13 @@ report: the stepper restricts each expert parameter to the selected local rows
 experts per layer, and any code or scale change in an unselected expert fails
 the run. Requires ``--in-backward``.
 
+Split expert storage (stage 6b) is a recipe setting, ``model.expert_split``
+(``--set model.expert_split._target_=deepseek.qat.split_experts.ExpertSplit --set
+model.expert_split.scores=SCORES.json`` with a ``route_scores --per-rank``
+report): selected experts train as BF16 stacks, unselected experts stay packed
+and are covered by the frozen digest; the per-expert tables name rows by the
+module's global ids. ``--expert-selection`` is rejected alongside it.
+
 ``--expert-shares SCORES.json`` (reporting only) joins each routed expert's
 token share from a ``route_scores`` report onto the per-expert flip table the
 report always carries under ``experts`` (global expert index -> values changed,
@@ -68,7 +75,7 @@ from deepseek.qat import proxy_export
 from deepseek.qat.export import ExportError
 from deepseek.qat.freeze import freeze_gate_bias
 from deepseek.qat.overrides import add_override_arguments, apply_overrides
-from deepseek.qat.proxy import _ep_offset, logits as hooked_logits, logits_path, probe_token_ids
+from deepseek.qat.proxy import local_expert_ids, logits as hooked_logits, logits_path, probe_token_ids
 
 
 # One dense and one expert chunk from the inner optimizer's parameters (all
@@ -279,9 +286,10 @@ def per_expert(entries: list[int], n_local: int) -> list[int]:
 
 
 # Per-expert flip rows for one expert parameter: global expert index ->
-# (values changed, value elements), from per-entry counts grouped by local expert.
-def expert_breakdown(entries: list[int], n_local: int, offset: int, elements_per_expert: int) -> dict[int, tuple[int, int]]:
-    return {offset + i: (n, elements_per_expert) for i, n in enumerate(per_expert(entries, n_local))}
+# (values changed, value elements), from per-entry counts grouped by local row,
+# named by the global id of each local row.
+def expert_breakdown(entries: list[int], ids: list[int], elements_per_expert: int) -> dict[int, tuple[int, int]]:
+    return {e: (n, elements_per_expert) for e, n in zip(ids, per_expert(entries, len(ids)))}
 
 
 # Read each layer's token shares from a route_scores report, for reporting only.
@@ -359,6 +367,10 @@ def main(argv=None) -> int:
     snapshot = cfg.model.config.pretrained_model_name_or_path
     if args.export is not None and not os.path.isfile(os.path.join(snapshot, "model.safetensors.index.json")):
         raise SystemExit(f"--export: the recipe's model path {snapshot} has no model.safetensors.index.json to export from")
+    # Split expert storage (stage 6b) freezes unselected experts in packed stacks;
+    # the stepper's row restriction is the single-stack form of the same selection.
+    if args.expert_selection is not None and cfg.model.get("expert_split", None) is not None:
+        raise SystemExit("--expert-selection cannot be combined with model.expert_split: the split storage already fixes the trained experts")
     recipe = TrainFinetuneRecipeForNextTokenPrediction(cfg)
     recipe.setup()
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -388,13 +400,18 @@ def main(argv=None) -> int:
                 continue
             layer = int(t.name.split(".")[2])
             for attr in t.params:
-                param = getattr(t.module, attr)
-                offset = _ep_offset(param)
-                n_local = _local(param).shape[0]
-                local_selected[f"{t.name}.{attr}"] = [e - offset for e in selection[layer] if offset <= e < offset + n_local]
+                ids = local_expert_ids(t.module, getattr(t.module, attr))
+                local_selected[f"{t.name}.{attr}"] = [i for i, e in enumerate(ids) if e in selection[layer]]
         report["expert_selection"] = args.expert_selection
         report["selected_per_layer"] = {str(k): len(v) for k, v in selection.items()}
         report["selected_total"] = sum(len(v) for v in selection.values())
+    # Split storage: the selection is fixed by the model; report it the same way.
+    split = getattr(next(iter(model.model.layers.values())).mlp.experts, "split", None)
+    if split is not None:
+        report["expert_split"] = split.source
+        report["selected_per_layer"] = {str(k): len(v) for k, v in sorted(split.layers.items())}
+        report["selected_total"] = sum(len(v) for v in split.layers.values())
+        report["packed_per_rank"] = {str(k): split.per_rank_total - split.selected_per_rank(k) for k in sorted(split.layers)}
 
     def rows_of(name: str) -> list[int] | None:
         return local_selected.get(_canonical(name))
@@ -637,26 +654,24 @@ def main(argv=None) -> int:
             entries = None if kind == "fp8" else entry_value_changes((c0, s0), (c1, s1))
             if entries is not None:
                 layer = int(t.name.split(".")[2])
-                n_local = c1.shape[0] // (2 if kind == "fp4_gate_up" else 1)
-                offset = _ep_offset(getattr(t.module, attr))
+                ids = local_expert_ids(t.module, getattr(t.module, attr))
                 rows = local_experts.setdefault(layer, {})
-                for e, (n, m) in expert_breakdown(entries, n_local, offset, c1.numel() * 2 // n_local).items():
+                for e, (n, m) in expert_breakdown(entries, ids, c1.numel() * 2 // len(ids)).items():
                     acc = rows.setdefault(e, [0, 0])
                     acc[0] += n
                     acc[1] += m
             if selection is not None and name in local_selected:
                 # Any bit change in an unselected expert's codes or scales is a
                 # frozen-integrity failure, named by global expert index.
-                n_local = c1.shape[0] // (2 if kind == "fp4_gate_up" else 1)
+                n_local = len(ids)
                 k = c1.shape[0] // n_local
-                offset = _ep_offset(getattr(t.module, attr))
                 chosen = set(local_selected[name])
                 for i in range(n_local):
                     if i in chosen:
                         continue
                     sl = slice(i * k, (i + 1) * k)
                     if not torch.equal(c0[sl], c1[sl]) or not torch.equal(s0[sl], s1[sl]):
-                        unselected_changed.append(f"{name}[expert {offset + i}]")
+                        unselected_changed.append(f"{name}[expert {ids[i]}]")
             code_flips = int((c0 != c1).sum())
             code_elems = c0.numel() if kind == "fp8" else c0.numel() * 2
             entry = {

@@ -57,6 +57,23 @@ class CoverageAndSelection(unittest.TestCase):
         with self.assertRaises(ValueError):
             RS.select([0.5, 0.5], 0.0)
 
+    def test_select_per_rank_is_even_within_rank_ranges(self):
+        # Rank 0 owns experts 0-3, rank 1 owns 4-7; the top scores all sit on rank 0.
+        score = [0.3, 0.25, 0.2, 0.15, 0.04, 0.03, 0.02, 0.01]
+        self.assertEqual(RS.select_per_rank(score, 1, 2), [0, 4])
+        self.assertEqual(RS.select_per_rank(score, 2, 2), [0, 1, 4, 5])
+        self.assertEqual(RS.select_per_rank(score, 4, 1), [0, 1, 2, 3])
+        # Ties go to the lower index.
+        self.assertEqual(RS.select_per_rank([0.1] * 8, 1, 2), [0, 4])
+        for n, ranks in ((0, 2), (5, 2), (1, 3)):
+            with self.assertRaises(ValueError):
+                RS.select_per_rank(score, n, ranks)
+        s = RS.summarize_layer(torch.tensor([6, 2, 1, 1], dtype=torch.int64), torch.zeros(4, dtype=torch.float64), topk=2,
+                               score_function="token", per_rank=1, ranks=2)
+        self.assertEqual(s["selected"], [0, 2])
+        with self.assertRaises(ValueError):
+            RS.summarize_layer(torch.tensor([6, 2, 1, 1]), torch.zeros(4, dtype=torch.float64), topk=2, score_function="token")
+
     def test_summary_fields(self):
         counts = torch.tensor([6, 2, 0, 0], dtype=torch.int64)
         gate_sum = torch.tensor([3.0, 1.0, 0.0, 0.0], dtype=torch.float64)

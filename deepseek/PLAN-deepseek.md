@@ -24,11 +24,10 @@ split arm's rate with dense at full speed, unselected experts stay byte-identica
 The steady-state memory plan (Handoff 2, Handoff 6
 item 1) is measured: per-step peaks, the update-in-backward saving, and a labelled
 full-model estimate (stage 7). The dense-slowing knob and warmup are recipe
-settings (Handoff 6 item 2). Next: stage 6b, split expert storage, which halves
-the per-GPU requirement and makes 4x B200 or 8x RTX PRO 6000 viable hosts; its
-design is resolved and its components, NeMo patches, gates, and per-component
-read list are in that stage, with no code written; then
-Handoff 6 from item 3. The dataset,
+settings (Handoff 6 item 2). Stage 6b, split expert storage, which halves
+the per-GPU requirement and makes 4x B200 or 8x RTX PRO 6000 viable hosts, is
+coded and its CPU gate (gate 1) passes; next are its GPU gates 2 to 5, whose
+commands are in that stage, then Handoff 6 from item 3. The dataset,
 optimizer, trainable set, and mechanism are decided and verified below. Every
 command runs from the repository root `/home/goon/trl/trlx`. Launch GPU runs from
 a plain terminal with `nohup`: the post-training report phase drives host memory
@@ -41,7 +40,7 @@ Run all unit tests (CPU, under a minute; the data tests need the snapshot):
 deepseek/venv/bin/python -B -m unittest deepseek.tests.test_quant deepseek.tests.test_export \
     deepseek.tests.test_fakequant deepseek.tests.test_data deepseek.tests.test_freeze \
     deepseek.tests.test_inbackward deepseek.tests.test_optim deepseek.tests.test_proxy_step \
-    deepseek.tests.test_proxy_export deepseek.tests.test_route_scores
+    deepseek.tests.test_proxy_export deepseek.tests.test_route_scores deepseek.tests.test_split_experts
 ```
 
 Reproduce the stage 3 one-step check (about 5 minutes, both GPUs):
@@ -403,7 +402,8 @@ deepseek/
     proxy_export.py   trained-target export: quantize, gather experts to rank 0,
                       replace only tensors whose bytes differ from the source
     proxy.py          parity check and export reload (torchrun entry); --set/--unset,
-                      --expect-logits PREFIX; shared probe token ids
+                      --expect-logits PREFIX, --save-logits PREFIX; shared probe token ids;
+                      packed-stack byte check under split storage
     proxy_step.py     stage 3 to 6 training check and diagnostics (torchrun entry);
                       --in-backward, --per-class-clip, --set/--unset recipe overrides,
                       --trainable-subset, --dense-every N, --expert-selection SCORES.json,
@@ -412,11 +412,11 @@ deepseek/
                       per-step memory series and resident accounting by class, per-group
                       rate metrics,
                       --export DIR [--force] with probe logits and replaced list beside --out
-    route_scores.py   routing-concentration measurement and ESFT top_p selection (torchrun entry)
-    split_experts.py  (stage 6b) per-layer experts module: trained BF16 stack plus frozen packed
-                      stack with on-the-fly dequantization; local-slot to global-expert ids
-    split_adapter.py  (stage 6b) DeepSeekV4StateDictAdapter subclass routing each expert into
-                      the BF16 or packed stack per rank
+    route_scores.py   routing-concentration measurement; ESFT top_p or --per-rank N selection (torchrun entry)
+    split_experts.py  stage 6b: ExpertSplit (selection file, install hook) and SplitExperts, the per-layer
+                      module with a trained BF16 stack and a frozen packed stack dequantized on the fly
+    split_adapter.py  stage 6b: DeepSeekV4StateDictAdapter subclass routing each expert into the BF16
+                      or packed stack per rank on load and export
     proxy-4layer.yaml stage 2 recipe (mock token ids)
     proxy-train.yaml  training recipe: data bridge, freeze config, optimizer with the
                       experts parameter group (lr_mult), constant-rate scheduler with warmup
@@ -788,7 +788,7 @@ deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config dee
 # train on an export: add the two model-path overrides to the proxy_step command
 ```
 
-### Stage 6b: split expert storage (planned)
+### Stage 6b: split expert storage (code complete; gate 1 passed, gates 2 to 5 pending)
 
 Routed experts of each layer live in two stacks: selected experts as trained BF16
 parameters, unselected experts as the source's packed FP4 codes and E8M0 scales
@@ -812,97 +812,129 @@ expert parallelism) and loads the checkpoint afterwards through DCP into the
 sharded parameters, with the adapter's `to_hf` supplying per-expert placeholders
 from each rank's local shard and `from_hf` rebuilding the stacks.
 
-Components, in build order:
+Components (built):
 
-- `deepseek/qat/split_experts.py`: `ExpertSplit` (reads a `route_scores` report,
-  requires an equal count per rank per layer, `install(model)` swaps each layer's
-  experts module and the adapter) and `SplitExperts(GroupedExperts)`, adapted from
-  `GroupedExpertsMXFP4` and `GroupedExperts._forward_grouped_mm`. BF16 stacks keep
-  the names `gate_and_up_projs` and `down_projs` (global dim 0 is ranks times the
-  per-rank count); packed stacks are `*_packed` and `*_scales`; `_mxfp4_resident =
-  True` so NeMo's initializer skips the module. Local slot to global expert id is
-  derived from the DTensor mesh rank and the selection on first use and cached,
-  not stored as a buffer: the init-time state dict includes persistent buffers and
-  DCP requires every key in the checkpoint. Forward remaps global ids to a
-  selected-first local order, calls `_permute_tokens_for_grouped_mm` once, splits
-  at the selected token count, runs `torch._grouped_mm` on the BF16 stack and
-  `MXFP4GroupedMM` on the packed stack, skips a stack with no tokens, and scatters
-  once. A layer with no selected experts holds only packed stacks and no
-  trainable parameter.
-- `deepseek/qat/split_adapter.py`: `DeepSeekV4StateDictAdapter` subclass overriding
-  `_dequantize` (selected experts only), `_aggregate_experts` (two stacks per layer
-  as DTensors on the expert mesh), `_split_merged_expert` (per-slot ids from the
-  module; the base splitter asserts a local count of experts divided by ranks and
-  cannot be reused), and the placeholder branch of `convert_single_tensor_to_hf`
-  (FP4 placeholders for selected experts, passthrough views for packed).
+- `deepseek/qat/split_experts.py`: `ExpertSplit` reads a `route_scores --per-rank`
+  report (`ranks`, `n_routed_experts`, `layers.<L>.selected`), requires an equal
+  count per rank per layer inside each rank's contiguous expert range, and
+  `install(model)` swaps every backbone layer's experts module and the state-dict
+  adapter (the model must have no MTP and must enable the HF adapter).
+  `SplitExperts(GroupedExperts)`: BF16 stacks keep the names `gate_and_up_projs`
+  and `down_projs` (global dim 0 is ranks times the per-rank count); packed stacks
+  are `*_packed` and `*_scales` in checkpoint orientation; `_mxfp4_resident = True`
+  so NeMo's initializer skips the module; a stack with no experts is not
+  registered. Local slot to global expert id (selected first, ascending) is derived
+  from the DTensor mesh rank and the selection on first use and cached, not stored
+  as a buffer: the pre-shard state dict includes persistent buffers and DCP
+  requires every key in the checkpoint. Forward remaps global ids to local slots,
+  calls `_permute_tokens_for_grouped_mm` once, splits at the selected token count,
+  runs `torch._grouped_mm` on the BF16 stack and `MXFP4GroupedMM` on the packed
+  stack, and scatters once. A packed stack with no tokens is skipped; a BF16 stack
+  with no tokens runs NeMo's zero-contribution dummy through its expert 0, because
+  the update-in-backward stepper fails a step in which a trainable parameter
+  received no gradient.
+- `deepseek/qat/split_adapter.py`: `SplitStateDictAdapter(DeepSeekV4StateDictAdapter)`
+  overrides `convert_single_tensor_to_hf` for split layers (per-slot ids from
+  `ExpertSplit`; selected rows become the base adapter's FP4 placeholders,
+  packed rows become passthrough views into the module's storage that DCP writes
+  through), `_dequantize` (unselected experts keep codes and scales), and
+  `_aggregate_experts` (two stacks per layer as DTensors on the expert mesh, with
+  completeness and orphan checks). The base splitter asserts a local count of
+  experts divided by ranks and cannot be reused for the stacks.
 - NeMo patch 1, `components/models/deepseek_v4/model.py`: `DeepseekV4ForCausalLM.__init__`
-  pops `expert_split` from its kwargs and calls `install(self)` after the adapter is
-  created. The recipe key is `model.expert_split`, a `_target_` block instantiating
-  `ExpertSplit` with `scores: PATH`, so NeMo imports nothing from the project.
-  Keys under `model:` that are not config fields reach the constructor (NeMo's
-  kwargs filter passes everything to a `**kwargs` constructor); they do not reach
-  `apply_model_infrastructure`, which receives named arguments only, and today an
-  unknown key is silently ignored.
+  pops `expert_split` from its kwargs and calls `install(self)` after the adapter
+  and MTP are created. The recipe key is `model.expert_split`, a `_target_` block
+  instantiating `ExpertSplit` with `scores: PATH`, so NeMo imports nothing from
+  the project; `--set` creates the nested block.
 - NeMo patch 2, `components/utils/model_utils.py`: the freeze selector sets
-  `requires_grad` per floating-point parameter instead of `module.requires_grad_`,
-  which raises on the int8 and E8M0 packed parameters under the recipe's
-  `unfreeze_modules` glob (NeMo's own MXFP4 modules fail the same way).
-- `route_scores.py --per-rank N`: N experts per layer per rank by score within the
-  rank's range, every layer; the report records the rank count. The full-model
-  all-or-none policy for hash layers (Handoff 5.4) is a separate selection file.
-- `fakequant.find_targets`: accepts `SplitExperts`; skips layers without a
-  selected stack.
-- `proxy.py`, `proxy_export.py`: the `rank * E_local + i` rule is replaced by the
-  module's ids; parity compares selected experts against their source tensors and
-  packed stacks against the source bytes; export quantizes selected stacks only,
-  gathering equal-shaped per-rank stacks with their id lists.
-- `proxy_step.py`: flip accounting reads the module; packed stacks are covered by
-  the frozen digest; `--expert-selection` together with `model.expert_split` is
-  rejected, so `restrict_rows` and the stepper's row masks are not used on this
-  path.
-- `proxy-train.yaml`: `model.expert_split` absent by default so every existing arm
-  is unchanged; runs add it with `--set model.expert_split._target_=...` and
-  `--set model.expert_split.scores=PATH`.
+  `requires_grad` per parameter instead of `module.requires_grad_`. Freezing
+  applies to every dtype; unfreezing only to floating-point parameters wider than
+  one byte. The plan's earlier "per floating-point parameter" rule was wrong: torch
+  reports E8M0 as floating point and accepts `requires_grad_(True)` on it, so the
+  `unfreeze_modules` glob would have made the packed scales trainable.
+- `route_scores.py --per-rank N` (exactly one of `--top-p` and `--per-rank`): the N
+  highest-scoring experts of each rank's range, ties to the lower index, every
+  layer; the report records `ranks` (the world size) and `per_rank`. The
+  full-model all-or-none policy for hash layers (Handoff 5.4) is a separate
+  selection file.
+- `fakequant.find_targets` skips a split layer with no selected stack.
+- `proxy.py`: `local_expert_ids(module, param)` replaces the `rank * E_local + i`
+  rule; `check_packed` compares every packed slot with the source bytes
+  (`packed_mismatches` in the report, part of `ok`); `--save-logits PREFIX` writes
+  the hooked probe logits in the `--expect-logits` format. `proxy_export.py`:
+  `expert_ids_per_rank` names gathered rows; export quantizes selected stacks only,
+  and unselected experts are copied from the source like every frozen tensor.
+- `proxy_step.py`: per-expert tables read the module's ids; packed stacks are
+  covered by the frozen digest and counted as `frozen_shard` in the memory
+  report; `--expert-selection` together with `model.expert_split` is rejected; the
+  report records `expert_split`, `selected_per_layer`, `selected_total`, and
+  `packed_per_rank`.
+- `proxy-train.yaml` is unchanged: `model.expert_split` is absent so every
+  existing arm is unchanged; runs add it with the two `--set` keys below.
 
 Unchanged by evidence: `inbackward.py` and `optim.py` select parameters by
 `requires_grad` and the `.mlp.experts` name; NeMo's expert-gradient scaling
 identifies expert parameters by the `ep` axis on their DTensor mesh, which both
 stacks carry.
 
-Implementation read list, per component: `split_experts.py` needs
-`components/moe/quantized_experts.py`, `components/quantization/mxfp4.py`,
-`components/moe/experts.py` (`GroupedExperts.__init__`, `forward`,
-`_forward_grouped_mm`, `_permute_tokens_for_grouped_mm`); `split_adapter.py` needs
-`components/models/deepseek_v4/state_dict_adapter.py` and
-`components/moe/state_dict_utils.py`; the entry-point changes need
-`deepseek/qat/proxy.py`, `proxy_export.py`, and the expert sections of
-`proxy_step.py` (`quantized_state`, `flip_totals`, the per-expert report).
-
 Gates, in order, each blocking the next:
 
-1. CPU: `dequantize_mxfp4` equals `quant.py` on sampled source tensors and on a
-   zero-exponent scale (NeMo's load-time FP4 dequantization decodes E8M0 byte 0 as
-   0, its on-the-fly path as `2**-127`; the checkpoint has no zero scales); the
-   adapter routes a synthetic two-layer state dict into the right stacks and
-   shapes per rank on a one-rank gloo mesh (`create_dtensor_from_local` needs a
-   mesh named `ep`); the forward on random tokens equals a single-stack reference
-   within fp32 tolerance; a one-layer meta build from the snapshot config runs
-   through the constructor hook.
-2. GPU, zero delta: `proxy.py` fixed-point and source-parity checks pass on the
-   split module; hooked probe logits bit-identical to the current path. The packed
-   grouped matmul reads a transposed operand and may change fp32 accumulation
+1. CPU (passed; `deepseek/tests/test_split_experts.py`, 22 tests): `dequantize_mxfp4`
+   equals `quant.py` on sampled source tensors and on a zero-exponent scale (both
+   on-the-fly paths decode E8M0 byte 0 as `2**-127`; NeMo's load-time dequantization
+   decodes it as 0; the checkpoint has no zero scales); the selection rules reject
+   uneven shards; the adapter routes a synthetic two-layer state dict into the
+   right stacks and shapes without a mesh and on a one-rank gloo expert mesh
+   (`DTensor.from_local`, since gloo cannot scatter int8 or E8M0); the forward on
+   random tokens equals a single-stack reference within bf16 tolerance (mixed,
+   packed-only, selected-only, and no-token routing) with gradients on the BF16
+   stack only; the freeze selectors leave the packed storage frozen; a one-layer
+   meta build from the snapshot config runs through the constructor hook and the
+   pre-shard key listing. CPU `torch._grouped_mm` accepts empty and zero-row groups.
+2. GPU, zero delta: `proxy.py` fixed-point, source-parity, and packed checks pass
+   on the split module; hooked probe logits bit-identical to the current path. The
+   packed grouped matmul reads a transposed operand and may change fp32 accumulation
    order; if logits differ, the report carries the maximum difference and the
    gate is equality within fp32 accumulation.
-3. GPU, training: `route_scores --per-rank N` (N chosen so the total is near the
-   ESFT arm's 83), one single-stack run with `--expert-selection` on that file as
-   the baseline (about 40 minutes), then the split module on the same file under
-   `model.expert_split`. Pass: identical master digest. `proxy-mem-esft-top02.json`
+3. GPU, training: `route_scores --per-rank 10` (80 experts, near the ESFT arm's
+   83), one single-stack run with `--expert-selection` on that file as the
+   baseline (about 40 minutes), then the split module on the same file under
+   `model.expert_split`. Pass: identical `masters_sha256`. `proxy-mem-esft-top02.json`
    cannot serve as the baseline because its 25, 25, 25, 8 selection is not an
    equal count per rank. Peak memory recorded against that report.
 4. GPU, artifact: export, `verify_export` against the replaced list, reload under
    the current path with bit-identical probe logits.
-5. GPU, estimate: a 16-layer proxy memory run at 2 ranks, giving the 4x B200
-   column a measured transient before any rental.
+5. GPU, estimate: a 16-layer proxy memory run at 2 ranks (a 16-layer `--per-rank`
+   selection first, both with `--set model.config.num_hidden_layers=16`), giving
+   the 4x B200 column a measured transient before any rental.
+
+Gate commands (both GPUs, `nohup` from a plain terminal; `$SNAP` as above):
+
+```sh
+SPLIT="--set model.expert_split._target_=deepseek.qat.split_experts.ExpertSplit --set model.expert_split.scores=deepseek/exports/logs/route-scores-perrank10.json"
+COMMON="--config deepseek/qat/proxy-train.yaml --in-backward --set optimizer.lr=1e-4 --set step_scheduler.max_steps=100 \
+    --set step_scheduler.val_every_steps=10 --set step_scheduler.global_batch_size=2 --set step_scheduler.local_batch_size=1"
+deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.route_scores \
+    --config deepseek/qat/proxy-train.yaml --per-rank 10 --out deepseek/exports/logs/route-scores-perrank10.json
+# gate 2
+deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config deepseek/qat/proxy-4layer.yaml \
+    --snapshot $SNAP --save-logits deepseek/exports/logs/proxy-stage6b-single
+deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config deepseek/qat/proxy-4layer.yaml \
+    --snapshot $SNAP $SPLIT --expect-logits deepseek/exports/logs/proxy-stage6b-single
+# gate 3
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy_step $COMMON \
+    --expert-selection deepseek/exports/logs/route-scores-perrank10.json --out deepseek/exports/logs/proxy-stage6b-baseline.json
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy_step $COMMON \
+    $SPLIT --out deepseek/exports/logs/proxy-stage6b-split.json
+# gate 4
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy_step $COMMON \
+    $SPLIT --out deepseek/exports/logs/proxy-stage6b-export.json --export deepseek/exports/stage6b-split
+deepseek/venv/bin/python -B -m deepseek.qat.verify_export $SNAP deepseek/exports/stage6b-split \
+    --expect @deepseek/exports/logs/proxy-stage6b-export-replaced.txt
+deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config deepseek/qat/proxy-4layer.yaml \
+    --snapshot deepseek/exports/stage6b-split --set model.config.pretrained_model_name_or_path=deepseek/exports/stage6b-split \
+    --set model.config.name_or_path=deepseek/exports/stage6b-split --expect-logits deepseek/exports/logs/proxy-stage6b-export
+```
 
 Hardware estimate at 8% selection (GiB reserved per rank, same model as Handoff 2;
 the per-layer dequantization transient is inferred, a few GiB at most): 2 ranks

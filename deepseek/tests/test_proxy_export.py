@@ -73,7 +73,7 @@ class Assembly(unittest.TestCase):
             per_rank.append((codes, scales))
             for i in range(2):
                 expected[2 * r + i] = (codes[i], scales[i])
-        reps = PE.assemble_expert_replacements(3, "w1", per_rank)
+        reps = PE.assemble_expert_replacements(3, "w1", per_rank, [[0, 1], [2, 3]])
         self.assertEqual(len(reps), 8)
         for e, (codes, scales) in expected.items():
             w = reps[f"layers.3.ffn.experts.{e}.w1.weight"]
@@ -82,6 +82,17 @@ class Assembly(unittest.TestCase):
             self.assertEqual(s.dtype, torch.float8_e8m0fnu)
             self.assertTrue(torch.equal(w, codes))
             self.assertTrue(torch.equal(s.view(torch.uint8), scales))
+        # Split storage names rows by the selection: rank 0 holds experts 1 and 2, rank 1 holds 5 and 6.
+        reps = PE.assemble_expert_replacements(3, "w1", per_rank, [[1, 2], [5, 6]])
+        self.assertEqual(sorted(int(k.split(".")[4]) for k in reps if k.endswith(".weight")), [1, 2, 5, 6])
+        self.assertTrue(torch.equal(reps["layers.3.ffn.experts.5.w1.weight"], per_rank[1][0][0]))
+        with self.assertRaises(ValueError):
+            PE.assemble_expert_replacements(3, "w1", per_rank, [[1, 2, 3], [5, 6]])
+        with self.assertRaises(ValueError):
+            PE.assemble_expert_replacements(3, "w1", per_rank, [[1, 2], [1, 6]])
+
+    def test_expert_ids_per_rank_single_stack(self):
+        self.assertEqual(PE.expert_ids_per_rank(object(), torch.zeros(3, 4, 4)), [[0, 1, 2]])
 
     def test_dense_maps_to_hf_weight_and_scale(self):
         w = torch.randn(256, 128)

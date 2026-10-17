@@ -204,7 +204,6 @@ weaken the preservation guarantees above.
 
 ## 14. Open decisions
 
-- Steady-state memory plan for the full model with the selected trainable set.
 - The container for the training host.
 - The training dataset, and its distance from the model's own policy.
 - An evaluation on prompts outside the SFT distribution.

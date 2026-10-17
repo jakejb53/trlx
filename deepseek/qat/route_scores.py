@@ -6,10 +6,13 @@ the expert received and its summed gate weight over valid tokens. From those it
 reports ESFT's two scores (Wang et al. 2024, ``deepseek/ESFT``): ``token_scores``,
 each expert's share of routed slots, and ``gate_scores``, its summed gate weight
 per token; how many experts cover 20%, 50%, and 80% of routed slots; and the
-``--top-p`` selection, experts taken in descending score until the cumulative
-score reaches ``top_p``. The selection is the trainable set for ESFT-style
-training; the coverage says whether selection concentrates signal on this data
-or only saves memory.
+selection: with ``--top-p``, experts taken in descending score until the
+cumulative score reaches ``top_p``; with ``--per-rank N``, the N highest-scoring
+experts inside each expert-parallel rank's contiguous expert range, in every
+layer, so split expert storage (stage 6b) gets even shards; the report records
+the rank count. The selection is the trainable set for ESFT-style training; the
+coverage says whether selection concentrates signal on this data or only saves
+memory.
 
 The forward is the recipe's own validation epoch over the train dataloader, so
 batch handling and eval mode are NeMo's; the hook reads ``token_mask`` from the
@@ -99,11 +102,34 @@ def select(score: list[float], top_p: float) -> list[int]:
     return sorted(chosen)
 
 
+# Even-shard selection for split expert storage (stage 6b): the n highest-scoring
+# experts inside each rank's contiguous range [r*E/R, (r+1)*E/R), ties to the
+# lower index, so every expert-parallel rank holds the same count per layer.
+def select_per_rank(score: list[float], n: int, ranks: int) -> list[int]:
+    e = len(score)
+    if ranks < 1 or e % ranks:
+        raise ValueError(f"{e} experts do not divide over {ranks} ranks")
+    per_rank = e // ranks
+    if not (1 <= n <= per_rank):
+        raise ValueError(f"per-rank count must be in [1, {per_rank}], got {n}")
+    chosen = []
+    for r in range(ranks):
+        lo = r * per_rank
+        ordered = sorted(range(lo, lo + per_rank), key=lambda i: -score[i])
+        chosen.extend(ordered[:n])
+    return sorted(chosen)
+
+
 # Per-layer report: both scores, coverage of the slot share, the largest share,
-# and the top_p selection by the chosen score function.
-def summarize_layer(counts: torch.Tensor, gate_sum: torch.Tensor, topk: int, top_p: float, score_function: str) -> dict:
+# and the selection by the chosen score function: cumulative top_p, or per_rank
+# experts within each of `ranks` expert ranges.
+def summarize_layer(counts: torch.Tensor, gate_sum: torch.Tensor, topk: int, score_function: str,
+                    top_p: float | None = None, per_rank: int | None = None, ranks: int = 1) -> dict:
+    if (top_p is None) == (per_rank is None):
+        raise ValueError("exactly one of top_p and per_rank selects the experts")
     token_scores, gate_scores = scores(counts, gate_sum, topk)
     by_name = {"token": token_scores, "gate": gate_scores}
+    score = by_name[score_function]
     return {
         "tokens": int(counts.sum()) // topk,
         "token_scores": [round(v, 6) for v in token_scores],
@@ -111,7 +137,7 @@ def summarize_layer(counts: torch.Tensor, gate_sum: torch.Tensor, topk: int, top
         "coverage_experts": coverage(token_scores),
         "max_token_share": round(max(token_scores), 6),
         "experts_with_zero_slots": int((counts == 0).sum()),
-        "selected": select(by_name[score_function], top_p),
+        "selected": select(score, top_p) if top_p is not None else select_per_rank(score, per_rank, ranks),
     }
 
 
@@ -119,13 +145,20 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--config", required=True)
     parser.add_argument("--out", required=True, help="write the rank-0 report here as JSON")
-    parser.add_argument("--top-p", type=float, required=True, help="cumulative score threshold for the selection")
+    parser.add_argument("--top-p", type=float, default=None, help="cumulative score threshold for the selection")
+    parser.add_argument("--per-rank", type=int, default=None, metavar="N",
+                        help="select the N highest-scoring experts of each rank's expert range in every layer (even shards for "
+                             "split expert storage); the report records the rank count")
     parser.add_argument("--score-function", choices=("token", "gate"), default="token",
                         help="which ESFT score the selection uses (default: token, the share of routed slots)")
     add_override_arguments(parser)
     args = parser.parse_args(argv)
-    if not (0 < args.top_p <= 1):
+    if (args.top_p is None) == (args.per_rank is None):
+        parser.error("exactly one of --top-p and --per-rank is required")
+    if args.top_p is not None and not (0 < args.top_p <= 1):
         parser.error(f"--top-p must be in (0, 1], got {args.top_p}")
+    if args.per_rank is not None and args.per_rank < 1:
+        parser.error(f"--per-rank must be a positive integer, got {args.per_rank}")
 
     from nemo_automodel.components.config.loader import load_yaml_config
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -172,6 +205,9 @@ def main(argv=None) -> int:
             dist.all_reduce(counts)
             dist.all_reduce(gate_sum)
 
+    # The rank count is the expert-parallel size this selection is even for;
+    # the recipe's expert mesh spans the world (inbackward.from_recipe checks it).
+    ranks = dist.get_world_size() if dist.is_initialized() else 1
     report = {
         "rank": rank,
         "config": args.config,
@@ -179,11 +215,14 @@ def main(argv=None) -> int:
         "n_routed_experts": n_experts,
         "topk": topk,
         "top_p": args.top_p,
+        "per_rank": args.per_rank,
+        "ranks": ranks,
         "score_function": args.score_function,
         "hash_routing_layers": hash_layers,
         "setup_seconds": round(t1 - t0, 1),
         "forward_seconds": round(time.monotonic() - t1, 1),
-        "layers": {str(i): summarize_layer(c, g, topk, args.top_p, args.score_function) for i, (c, g) in sorted(totals.items())},
+        "layers": {str(i): summarize_layer(c, g, topk, args.score_function, top_p=args.top_p, per_rank=args.per_rank, ranks=ranks)
+                   for i, (c, g) in sorted(totals.items())},
     }
     report["selected_total"] = sum(len(v["selected"]) for v in report["layers"].values())
     if rank == 0:
@@ -195,7 +234,8 @@ def main(argv=None) -> int:
                   f"selected {len(v['selected'])}", file=sys.stderr, flush=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=1)
-        print(f"wrote {args.out} ({report['selected_total']} experts selected at top_p {args.top_p})", file=sys.stderr, flush=True)
+        rule = f"top_p {args.top_p}" if args.top_p is not None else f"{args.per_rank} per rank over {ranks} ranks"
+        print(f"wrote {args.out} ({report['selected_total']} experts selected at {rule})", file=sys.stderr, flush=True)
     if dist.is_initialized():
         dist.barrier()
     return 0

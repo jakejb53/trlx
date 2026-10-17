@@ -77,8 +77,8 @@ def quantize_local_experts(w_local: torch.Tensor, kind: str) -> dict[str, tuple[
 
 
 # Gather equal-shaped tensors from every rank of the parameter's expert mesh
-# onto global rank 0, in mesh-rank order, so list index r holds the experts
-# that start at r * E_local (the same rule as proxy._ep_offset). The mesh must
+# onto global rank 0, in mesh-rank order, so list index r holds rank r's local
+# experts (named by expert_ids_per_rank). The mesh must
 # be one-dimensional and span the world: that is the layout every proxy
 # recipe and the update-in-backward stepper assume, and anything else would
 # make the expert-index arithmetic silently wrong. Non-DTensor (unsharded)
@@ -101,21 +101,39 @@ def gather_expert_shards(t: torch.Tensor, param: torch.Tensor) -> list[torch.Ten
     return gathered
 
 
-# Build the HF replacement entries for one expert half from per-rank stacks:
-# global expert e is rank r's local expert i with e = r * E_local + i. Tensors
-# are moved to host once per rank stack and sliced as views; scales get back
-# their E8M0 dtype so the exporter's header check sees the source dtype.
-def assemble_expert_replacements(layer: int, which: str, per_rank: list[tuple[torch.Tensor, torch.Tensor]]) -> dict[str, torch.Tensor]:
+# Global expert id of every local row of a trained expert parameter, per rank
+# of its expert mesh in mesh-rank order: the single stack holds the contiguous
+# range r * E_local + i; split storage (stage 6b) holds rank r's selected experts.
+def expert_ids_per_rank(module, param: torch.Tensor) -> list[list[int]]:
+    from deepseek.qat.split_experts import SplitExperts  # local: NeMo is only needed on a built model
+
+    if isinstance(module, SplitExperts):
+        return [module.split.rank_selected(module.layer, r) for r in range(module.ranks)]
+    n_local = _local(param).shape[0]
+    ranks = param.device_mesh.size() if isinstance(param, DTensor) else 1
+    return [[r * n_local + i for i in range(n_local)] for r in range(ranks)]
+
+
+# Build the HF replacement entries for one expert half from per-rank stacks and
+# the global expert ids of their rows. Tensors are moved to host once per rank
+# stack and sliced as views; scales get back their E8M0 dtype so the exporter's
+# header check sees the source dtype.
+def assemble_expert_replacements(layer: int, which: str, per_rank: list[tuple[torch.Tensor, torch.Tensor]],
+                                 ids_per_rank: list[list[int]]) -> dict[str, torch.Tensor]:
+    if len(per_rank) != len(ids_per_rank):
+        raise ValueError(f"{len(per_rank)} rank stacks for {len(ids_per_rank)} id lists")
     replacements: dict[str, torch.Tensor] = {}
-    e = 0
-    for codes, scales in per_rank:
+    for (codes, scales), ids in zip(per_rank, ids_per_rank):
+        if codes.shape[0] != len(ids):
+            raise ValueError(f"layer {layer} {which}: a rank stack holds {codes.shape[0]} experts for {len(ids)} ids")
         codes = codes.cpu()
         scales = scales.cpu().view(torch.float8_e8m0fnu)
-        for i in range(codes.shape[0]):
+        for i, e in enumerate(ids):
             base = expert_name(layer, e, which)
+            if base + ".weight" in replacements:
+                raise ValueError(f"{base}: expert exported twice")
             replacements[base + ".weight"] = codes[i]
             replacements[base + ".scale"] = scales[i]
-            e += 1
     return replacements
 
 
@@ -167,12 +185,13 @@ def export_trained(state: FQ.FakeQuantState, target_params: set[str], snapshot: 
             reps = dense_replacements(name, param)
         else:
             layer = int(t.name.split(".")[2])
+            ids_per_rank = expert_ids_per_rank(t.module, param)
             reps = {}
             for which, (codes, scales) in quantize_local_experts(_local(param), kind).items():
                 per_rank_codes = gather_expert_shards(codes, param)
                 per_rank_scales = gather_expert_shards(scales.view(torch.uint8), param)
                 if rank == 0:
-                    reps.update(assemble_expert_replacements(layer, which, list(zip(per_rank_codes, per_rank_scales))))
+                    reps.update(assemble_expert_replacements(layer, which, list(zip(per_rank_codes, per_rank_scales)), ids_per_rank))
                 del codes, scales, per_rank_codes, per_rank_scales
         if rank == 0:
             candidates.update(reps)
