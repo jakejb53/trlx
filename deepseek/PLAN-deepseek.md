@@ -26,12 +26,14 @@ item 1) is measured: per-step peaks, the update-in-backward saving, and a labell
 full-model estimate (stage 7). The dense-slowing knob and warmup are recipe
 settings (Handoff 6 item 2). Stage 6b, split expert storage, which halves
 the per-GPU requirement and makes 4x B200 or 8x RTX PRO 6000 viable hosts, is
-coded and its CPU gate (gate 1) passes; next are its GPU gates 2 to 5, whose
-commands are in that stage, then Handoff 6 from item 3. The dataset,
-optimizer, trainable set, and mechanism are decided and verified below. Every
-command runs from the repository root `/home/goon/trl/trlx`. Launch GPU runs from
-a plain terminal with `nohup`: the post-training report phase drives host memory
-low enough that an agent session's background-process reaper has killed a run.
+complete: a split-module run trains the selected experts at the ESFT arm's
+rates, exports a verified checkpoint that reloads bit-identically, and peaks at
+44.4 GiB against 53.4. Next is Handoff 6 from item 3. The dataset, optimizer,
+trainable set, and mechanism are decided and verified below. Every command runs
+from the repository root
+`/home/goon/trl/trlx`. Launch GPU runs from a plain terminal with `nohup`: the
+post-training report phase drives host memory low enough that an agent
+session's background-process reaper has killed a run.
 Rank 0 prints the full report to stdout, so a log redirect is a second copy of `--out`.
 
 Run all unit tests (CPU, under a minute; the data tests need the snapshot):
@@ -83,9 +85,10 @@ Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
 `proxy-joint-perexpert.json` (Handoff 5), and `proxy-mem-2layer-inbackward.json`,
 `proxy-mem-2layer-reference.json`, `proxy-mem-2layer-inbackward-rerun.json`, and
 `proxy-mem-esft-top02.json` (Handoff 2), and `proxy-mem-2layer-inbackward-groups.json`
-(Handoff 6 item 2). Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
-`stage6-experts/` and `stage6-sequential/` (stage 6), 156 GB each; all can be
-deleted and regenerated.
+(Handoff 6 item 2), and `route-scores-perrank10.json` and `proxy-stage6b-*` (stage 6b).
+Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
+`stage6-experts/` and `stage6-sequential/` (stage 6), and `stage6b-split/`
+(stage 6b), 156 GB each; all can be deleted and regenerated.
 
 Handoff items, in order:
 
@@ -788,7 +791,7 @@ deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config dee
 # train on an export: add the two model-path overrides to the proxy_step command
 ```
 
-### Stage 6b: split expert storage (code complete; gate 1 passed, gates 2 to 5 pending)
+### Stage 6b: split expert storage (complete; gate 4 optional)
 
 Routed experts of each layer live in two stacks: selected experts as trained BF16
 parameters, unselected experts as the source's packed FP4 codes and E8M0 scales
@@ -891,22 +894,50 @@ Gates, in order, each blocking the next:
    stack only; the freeze selectors leave the packed storage frozen; a one-layer
    meta build from the snapshot config runs through the constructor hook and the
    pre-shard key listing. CPU `torch._grouped_mm` accepts empty and zero-row groups.
-2. GPU, zero delta: `proxy.py` fixed-point, source-parity, and packed checks pass
-   on the split module; hooked probe logits bit-identical to the current path. The
-   packed grouped matmul reads a transposed operand and may change fp32 accumulation
-   order; if logits differ, the report carries the maximum difference and the
-   gate is equality within fp32 accumulation.
-3. GPU, training: `route_scores --per-rank 10` (80 experts, near the ESFT arm's
-   83), one single-stack run with `--expert-selection` on that file as the
-   baseline (about 40 minutes), then the split module on the same file under
-   `model.expert_split`. Pass: identical `masters_sha256`. `proxy-mem-esft-top02.json`
-   cannot serve as the baseline because its 25, 25, 25, 8 selection is not an
-   equal count per rank. Peak memory recorded against that report.
-4. GPU, artifact: export, `verify_export` against the replaced list, reload under
-   the current path with bit-identical probe logits.
-5. GPU, estimate: a 16-layer proxy memory run at 2 ranks (a 16-layer `--per-rank`
-   selection first, both with `--set model.config.num_hidden_layers=16`), giving
-   the 4x B200 column a measured transient before any rental.
+2. GPU, zero delta (passed): on the split module (`route-scores-perrank10.json`,
+   20 experts per layer, 10 per rank), fixed-point, source-parity, and packed
+   checks are clean on both ranks; setup 19 s against 169 s because the load
+   dequantizes nothing. Probe logits (`proxy-stage6b-single-logits-rank{0,1}.pt`
+   against `proxy-stage6b-split-logits-rank{0,1}.pt`): max abs diff 0.878, mean
+   9.4e-3, argmax agreement 99.2%, mean KL 2.8e-4; row 0 bit-identical through
+   position 10, row 1 through position 2, every later position differs.
+   Calibration: the unmodified single-stack path with the probe batch changed
+   from 2 to 1 (`proxy --batch 1`, `proxy-stage6b-single-b1-logits-rank0.pt`,
+   row 0 against row 0) differs more: max 0.962, mean 1.25e-2, argmax 98.8%,
+   mean KL 2.8e-4. Kernel check on 8 real layer-3 experts (ids 100 to 107) and
+   4,096 random bf16 tokens in uneven groups: `MXFP4GroupedMM` and `_grouped_mm`
+   on the contiguous BF16 stack differ in 0.0001% of outputs by one bf16
+   rounding (up to 6 ulps at near-cancelling values), with identical error
+   against fp64 (mean 0.25 ulp). The difference is cuBLAS reduction order on the
+   transposed operand, entering rarely and amplified by routing and attention.
+3. GPU, training and artifact (passed; `proxy-stage6b-export.json`, export
+   `deepseek/exports/stage6b-split`): one split-module run on
+   `route-scores-perrank10.json` (80 experts, 20 per layer) with `--export`,
+   then `verify_export` against the replaced list and a reload under the split
+   path. Against the ESFT arm (`proxy-mem-esft-top02.json`, 83 experts, single
+   stack): held-out 16.18 to 4.105 (ESFT 4.121), within 0.04 at all twelve
+   validation points; selected experts changed 1.63 / 1.46 / 1.77 / 2.16% on
+   layers 0 to 3 (ESFT 1.64 / 1.49 / 1.77 / 2.22%); dense 54.22% (54.25%);
+   unselected changed 0, frozen clean. Export: 544 candidates, 445 replaced, 99
+   unchanged, all scales; `verify_export --expect` exact; reload fixed-point,
+   source-parity, and packed checks clean with probe logits bit-identical.
+   Memory (GiB per rank): peak step 44.36 (ESFT 53.45), resident after step
+   12.19 (29.17: experts 1.88 against 24.0, frozen shard 7.40 against 3.05,
+   optimizer state 2.40 against 3.12), hook-entry peak 25.09 (47.58), transient
+   32.15 (24.28). Time: training 509 s (ESFT 2,297 s), setup 21 s (175 s),
+   export 158 s. The transient grew by 7.9: `dequantize_mxfp4` builds two
+   full-size fp32 temporaries before the bf16 cast, so a layer's packed stack
+   costs about 2.5 times its bf16 size while it is dequantized; it scales with
+   packed experts per rank per layer (118 here). The earlier form of this gate,
+   a single-stack baseline on the same selection with identical `masters_sha256`
+   and a reload under the single-stack path, was dropped: masters cannot agree
+   across kernel paths (gate 2, Verified facts), and the cross-path reload adds
+   nothing to `verify_export` plus the same-path reload.
+4. GPU, estimate (optional, unblocking): a 16-layer proxy memory run at 2 ranks
+   (a 16-layer `--per-rank` selection first, both with
+   `--set model.config.num_hidden_layers=16`), giving the 4x B200 column a
+   measured transient. Its only value is avoiding a wrong rental; the first live
+   step measures the same thing.
 
 Gate commands (both GPUs, `nohup` from a plain terminal; `$SNAP` as above):
 
@@ -923,21 +954,18 @@ deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config dee
     --snapshot $SNAP $SPLIT --expect-logits deepseek/exports/logs/proxy-stage6b-single
 # gate 3
 PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy_step $COMMON \
-    --expert-selection deepseek/exports/logs/route-scores-perrank10.json --out deepseek/exports/logs/proxy-stage6b-baseline.json
-PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy_step $COMMON \
-    $SPLIT --out deepseek/exports/logs/proxy-stage6b-split.json
-# gate 4
-PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy_step $COMMON \
     $SPLIT --out deepseek/exports/logs/proxy-stage6b-export.json --export deepseek/exports/stage6b-split
 deepseek/venv/bin/python -B -m deepseek.qat.verify_export $SNAP deepseek/exports/stage6b-split \
     --expect @deepseek/exports/logs/proxy-stage6b-export-replaced.txt
 deepseek/venv/bin/torchrun --nproc-per-node 2 -m deepseek.qat.proxy --config deepseek/qat/proxy-4layer.yaml \
-    --snapshot deepseek/exports/stage6b-split --set model.config.pretrained_model_name_or_path=deepseek/exports/stage6b-split \
+    --snapshot deepseek/exports/stage6b-split $SPLIT --set model.config.pretrained_model_name_or_path=deepseek/exports/stage6b-split \
     --set model.config.name_or_path=deepseek/exports/stage6b-split --expect-logits deepseek/exports/logs/proxy-stage6b-export
 ```
 
 Hardware estimate at 8% selection (GiB reserved per rank, same model as Handoff 2;
-the per-layer dequantization transient is inferred, a few GiB at most): 2 ranks
+the per-layer dequantization transient measured 7.9 at 118 packed experts per
+rank per layer in gate 3, so about 4 at 4 ranks and 2 at 8, inside the allowance
+below): 2 ranks
 about 170 (B300 class only); 4 ranks about 104 (B200: fits; RTX PRO 6000: no);
 8 ranks about 71 (RTX PRO 6000: fits; B200: fits); 16 ranks about 54. Selection
 fraction matters here: at 30%, 8 ranks is about 99 and 4x B200 about 130. The
@@ -1074,6 +1102,11 @@ and per-expert flip fractions are the leading indicators to watch, not the loss.
 - The BF16 gradient set equals trainable elements times two bytes exactly:
   12.246 GiB for 6,574,571,520 elements, measured as optimizer-entry allocation
   minus steady resident state on the two-layer proxy.
+- Probe logits are bit-exact only along one kernel path. A change of reduction
+  order alone (probe batch 2 to 1 on the unmodified single-stack path) moves
+  logits by up to 0.96 with 98.8% argmax agreement, because one bf16 rounding
+  difference is amplified by top-k routing and attention. Cross-path comparisons
+  are made at the kernel level and calibrated against that run (stage 6b gate 2).
 
 ## Prior investigation (rented 8x H100, 2026-10-07)
 

@@ -134,13 +134,13 @@ holdout is the last N rows in file order.
   each expert parameter to views of its selected local rows before the first
   step, so unselected rows get no update and no optimizer state; unselected
   rows of each expert gradient are zeroed before the norm.
-- Expert storage (stage 6b): each layer's routed experts are a trained BF16 stack
+- Expert storage: each layer's routed experts are a trained BF16 stack
   of selected experts and a frozen packed stack of unselected experts in the
   source's FP4 codes and E8M0 scales, dequantized on the fly in forward and
   backward with no weight gradient. Every expert-parallel rank selects the same
   count per layer by score within its own expert range. The published artifact
   copies packed stacks byte for byte and quantizes selected stacks with the
-  training quantizers. Until stage 6b lands, the single-stack path above applies.
+  training quantizers.
 - Integrity: every run snapshots the quantized codes and scales of every target
   and a digest of every frozen parameter and buffer before training, and checks
   them after. A changed frozen tensor, or any code or scale change in an

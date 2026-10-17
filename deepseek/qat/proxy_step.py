@@ -550,8 +550,11 @@ def main(argv=None) -> int:
                     per_row = c1.numel() * 2 // n_local
                     totals[f"expert_values_changed_layer{layer}"] = totals.get(f"expert_values_changed_layer{layer}", 0) + sum(changes[r] for r in rows)
                     totals[f"expert_value_elements_layer{layer}"] = totals.get(f"expert_value_elements_layer{layer}", 0) + per_row * len(rows)
+        # Expert tensors are sharded over the expert mesh, so every expert figure
+        # (class totals and per-layer) is this rank's share and is summed over
+        # ranks. Dense tensors are full on every rank and are not reduced.
         if dist.is_initialized():
-            keys = sorted(k for k in totals if "_layer" in k)
+            keys = sorted(k for k in totals if k.startswith("expert_"))
             if keys:
                 vec = torch.tensor([totals[k] for k in keys], dtype=torch.int64, device=torch.cuda.current_device())
                 dist.all_reduce(vec)
