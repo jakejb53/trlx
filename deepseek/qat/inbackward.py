@@ -79,6 +79,8 @@ class InBackwardStepper:
         class_of: Callable[[str], str] | None = None,
         every: dict[str, int] | None = None,
         rows_of: Callable[[str], list[int] | None] | None = None,
+        report_class_of: Callable[[str], str] | None = None,
+        drift_sample_of: Callable[[str, torch.Tensor], tuple[str, tuple] | None] | None = None,
     ):
         # Duck-typed: LocalShardOptimizer and MasterOptimizer both provide step_param.
         if not callable(getattr(optimizer, "step_param", None)):
@@ -99,6 +101,24 @@ class InBackwardStepper:
         # each class has its own norm and coefficient, so a class with large
         # gradients does not throttle the drift of a class with small ones.
         self._class_by_param: dict[int, str] = {}
+        # Master drift samples (the per-step learning signal the published flips
+        # lag by tens of steps): for each sampled parameter, a fixed slice of its
+        # local shard with its baseline, its value after the previous step, and
+        # the running sum of |update|. drift_sample_of(name, param) returns
+        # (class, index tuple into the local shard) or None. Per class, end_step
+        # publishes mean |master - baseline| and the sign consistency
+        # sum|drift| / sum(sum|update|): 1.0 when every update pushed the same
+        # way, near 0 for a random walk.
+        self._drift: dict[int, tuple[str, str, tuple, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.drift_classes: list[str] = []
+        self.last_drift: dict[str, dict[str, float]] = {}
+        # The same per sampled parameter (by canonical name), reduced over ranks:
+        # the per-tensor sign consistency that ranks tensors for selection.
+        self.last_drift_by_param: dict[str, dict[str, float]] = {}
+        # Reporting classes (dense vs expert) are independent of the clipping
+        # classes: their norms are published every step in last_report_norms and
+        # never affect a coefficient.
+        self._report_class_by_param: dict[int, str] = {}
         # Row masks for parameters with a selection: True rows are stepped.
         # The optimizer is restricted here, before any step, so unselected rows
         # never receive optimizer state.
@@ -107,6 +127,12 @@ class InBackwardStepper:
             for name, q in mp.named_parameters():
                 if q.requires_grad:
                     self._class_by_param[id(q)] = class_of(name) if class_of is not None else "all"
+                    self._report_class_by_param[id(q)] = report_class_of(name) if report_class_of is not None else self._class_by_param[id(q)]
+                    sample = drift_sample_of(name, q) if drift_sample_of is not None else None
+                    if sample is not None:
+                        cls, index = sample
+                        base = _local(q).detach()[index].clone()
+                        self._drift[id(q)] = (cls, name, index, base, base.clone(), torch.zeros(base.shape, dtype=torch.float32, device=base.device))
                     rows = rows_of(name) if rows_of is not None else None
                     if rows is not None:
                         if not callable(getattr(optimizer, "restrict_rows", None)):
@@ -128,6 +154,10 @@ class InBackwardStepper:
             self.every[cls] = n
         self.coefs: dict[str, float] = {c: 1.0 for c in self.classes}
         self.last_norms: dict[str, float] = {}
+        self.report_classes: list[str] = sorted(set(self._report_class_by_param.values()))
+        self.drift_classes = sorted({cls for cls, *_ in self._drift.values()})
+        self._drift_names = sorted(name for _, name, *_ in self._drift.values())
+        self.last_report_norms: dict[str, float] = {}
         self.last_norm: float | None = None  # global norm over all classes
         self._stepped: set[int] = set()
         # Largest CUDA allocation (bytes) observed at hook entry during the
@@ -141,7 +171,7 @@ class InBackwardStepper:
         # reduce-scatter stream, autograd fires expert hooks on its own), so a
         # single running sum across them would race; each contribution is kept
         # with its event and summed at step end after waiting on all of them.
-        self._sq_parts: list[tuple[str, torch.Tensor, object]] = []
+        self._sq_parts: list[tuple[str, str, torch.Tensor, object]] = []
         self._handles = [p.register_post_accumulate_grad_hook(self._on_grad) for p in self._params]
 
     # Fail fast if another gradient is alive: NeMo's scaling would touch it too,
@@ -180,7 +210,7 @@ class InBackwardStepper:
         if sq.is_cuda:
             event = torch.cuda.Event()
             event.record()
-        self._sq_parts.append((cls, sq, event))
+        self._sq_parts.append((cls, self._report_class_by_param[id(p)], sq, event))
         # A class off its update period contributes to the norm above and is
         # otherwise skipped: no optimizer call, so its moments do not advance.
         if self.step_count % self.every.get(cls, 1) == 0:
@@ -188,6 +218,12 @@ class InBackwardStepper:
             if coef != 1.0:
                 g.mul_(coef)
             self.optimizer.step_param(p)
+            sampled = self._drift.get(id(p))
+            if sampled is not None:
+                _, _, index, _, prev, abs_sum = sampled
+                cur = _local(p).detach()[index]
+                abs_sum += (cur.float() - prev.float()).abs()
+                prev.copy_(cur)
         p.grad = None
         self._stepped.add(id(p))
 
@@ -201,33 +237,68 @@ class InBackwardStepper:
         # Make the reducing stream wait for every hook's contribution, and tell
         # the allocator those tensors are now used here so their memory is not
         # recycled by the producing stream before this read completes.
-        if self._sq_parts and self._sq_parts[0][1].is_cuda:
+        if self._sq_parts and self._sq_parts[0][2].is_cuda:
             current = torch.cuda.current_stream()
-            for _, sq, event in self._sq_parts:
+            for _, _, sq, event in self._sq_parts:
                 current.wait_event(event)
                 sq.record_stream(current)
-        # One tensor of per-class sums so a single collective serves every class.
-        device = self._sq_parts[0][1].device
-        totals = torch.zeros(len(self.classes), dtype=torch.float32, device=device)
-        for cls, sq, _ in self._sq_parts:
+        # One tensor of per-class sums (clipping classes, then reporting classes)
+        # so a single collective serves every class.
+        device = self._sq_parts[0][2].device
+        n_clip = len(self.classes)
+        totals = torch.zeros(n_clip + len(self.report_classes), dtype=torch.float32, device=device)
+        for cls, rcls, sq, _ in self._sq_parts:
             totals[self.classes.index(cls)] += sq
+            totals[n_clip + self.report_classes.index(rcls)] += sq
         if dist.is_initialized():
             dist.all_reduce(totals, group=self._group)
         # Checked after the reduction so every rank sees the same value and
         # raises together instead of one rank leaving the others in the collective.
-        values = totals.tolist()
+        all_values = totals.tolist()
+        values = all_values[:n_clip]
         if not all(math.isfinite(v) for v in values):
             raise RuntimeError(f"update-in-backward: non-finite gradient norm (sums of squares {dict(zip(self.classes, values))}) at step {self.step_count}")
         self.last_norms = {c: math.sqrt(v) for c, v in zip(self.classes, values)}
+        self.last_report_norms = {c: math.sqrt(v) for c, v in zip(self.report_classes, all_values[n_clip:])}
         self.coefs = {c: min(1.0, self.max_norm / (n + 1e-6)) for c, n in self.last_norms.items()}
         norm = math.sqrt(sum(values))
         self.last_norm = norm
+        self.last_drift = self._drift_stats()
         self.step_count += 1
         self._stepped.clear()
         self._sq_parts = []
         self.last_peak_hook_allocated = self.peak_hook_allocated
         self.peak_hook_allocated = 0
         return norm
+
+    # Per drift class: mean |master - baseline| and sign consistency over every
+    # rank's samples (sums reduced over the world).
+    def _drift_stats(self) -> dict[str, dict[str, float]]:
+        if not self._drift:
+            return {}
+        device = next(iter(self._drift.values()))[3].device
+        # One vector: per class then per parameter, three sums each (|drift|,
+        # sum|update|, elements), reduced once. Every rank holds the same name
+        # list (dense shards exist on every rank; expert names are per layer).
+        n_cls, names = len(self.drift_classes), self._drift_names
+        sums = torch.zeros(3 * (n_cls + len(names)), dtype=torch.float64, device=device)
+        for cls, name, index, base, prev, abs_sum in self._drift.values():
+            drift = (prev.float() - base.float()).abs().sum()
+            moved = abs_sum.sum()
+            for i in (3 * self.drift_classes.index(cls), 3 * (n_cls + names.index(name))):
+                sums[i] += drift
+                sums[i + 1] += moved
+                sums[i + 2] += base.numel()
+        if dist.is_initialized():
+            dist.all_reduce(sums, group=self._group)
+        v = sums.tolist()
+
+        def stats(i):
+            drift, moved, n = v[i : i + 3]
+            return {"mean_abs_drift": drift / n if n else 0.0, "consistency": (drift / moved) if moved > 0 else 0.0, "sampled_elements": int(n)}
+
+        self.last_drift_by_param = {name: stats(3 * (n_cls + k)) for k, name in enumerate(names)}
+        return {cls: {k: val for k, val in stats(3 * k_cls).items() if k != "sampled_elements"} for k_cls, cls in enumerate(self.drift_classes)}
 
     def remove(self) -> None:
         for h in self._handles:
@@ -284,7 +355,26 @@ def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: i
     if dense_every < 1:
         raise ValueError(f"dense_every must be a positive integer, got {dense_every}")
     # Dense (attention, shared experts) and routed experts clipped separately.
-    class_of = (lambda name: "expert" if ".mlp.experts" in name else "dense") if (per_class or dense_every > 1) else None
+    by_class = lambda name: "expert" if ".mlp.experts" in name else "dense"
+    class_of = by_class if (per_class or dense_every > 1) else None
     every = {"dense": dense_every} if dense_every > 1 else None
-    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every,
-                             rows_of=rows_of)
+    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every, report_class_of=by_class,
+                             rows_of=rows_of, drift_sample_of=drift_sample)
+
+
+# Drift sample: every dense tensor's shard, its first rows up to one DRIFT_FRACTION
+# of them (at least one row), and the first DRIFT_ROWS rows of local expert 0's
+# gate/up matrix per layer. About 0.7 GB per rank of baseline, previous value,
+# and |update| sums at the full model's shapes. Every dense tensor is sampled so
+# its sign consistency ranks it for selection (last_drift_by_param).
+DRIFT_ROWS = 512
+DRIFT_FRACTION = 8
+
+
+def drift_sample(name: str, param: torch.Tensor) -> tuple[str, tuple] | None:
+    local = _local(param)
+    if ".mlp.experts" not in name:
+        return "dense", (slice(0, max(1, local.shape[0] // DRIFT_FRACTION)),)
+    if name.endswith(".mlp.experts.gate_and_up_projs") and local.ndim == 3 and local.shape[0] > 0:
+        return "expert", (0, slice(0, min(DRIFT_ROWS, local.shape[1])))
+    return None

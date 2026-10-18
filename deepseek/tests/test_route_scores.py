@@ -65,7 +65,9 @@ class CoverageAndSelection(unittest.TestCase):
         self.assertEqual(RS.select_per_rank(score, 4, 1), [0, 1, 2, 3])
         # Ties go to the lower index.
         self.assertEqual(RS.select_per_rank([0.1] * 8, 1, 2), [0, 4])
-        for n, ranks in ((0, 2), (5, 2), (1, 3)):
+        # Zero per rank is a layer with no trained experts.
+        self.assertEqual(RS.select_per_rank(score, 0, 2), [])
+        for n, ranks in ((-1, 2), (5, 2), (1, 3)):
             with self.assertRaises(ValueError):
                 RS.select_per_rank(score, n, ranks)
         s = RS.summarize_layer(torch.tensor([6, 2, 1, 1], dtype=torch.int64), torch.zeros(4, dtype=torch.float64), topk=2,

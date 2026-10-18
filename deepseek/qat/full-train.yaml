@@ -1,0 +1,139 @@
+# Stage 7 full-model recipe: all 43 backbone layers on eight expert-parallel
+# ranks with split expert storage (model.expert_split; the scoring run overrides
+# its scores path with the all-packed bootstrap selection), resharding on, the
+# reasoning-conversation bridge, full-parameter trainability on the FP8/FP4
+# targets only, and the BF16-master optimizer (torchao AdamW8bit with stochastic
+# rounding) at the stage 5 rate. Update-in-backward needs one microbatch per
+# rank, so the global batch equals the world size. Steps are overridden per run.
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 1000000
+  val_every_steps: 1000000
+  max_steps: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
+    pretrained_model_name_or_path: deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+    name_or_path: deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+    num_hidden_layers: 43
+    num_nextn_predict_layers: 0
+    use_cache: false
+  trust_remote_code: false
+  load_base_model: true
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: sdpa
+    linear: torch
+    rms_norm: torch_fp32
+    rope_fusion: false
+    experts: torch_mm
+    dispatcher: torch
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+  # Split expert storage (stage 6b): selected experts as trained BF16 stacks,
+  # the rest packed FP4 from the source. The selection must be a route_scores
+  # --per-rank report written for 8 ranks.
+  expert_split:
+    _target_: deepseek.qat.split_experts.ExpertSplit
+    scores: deepseek/exports/logs/route-scores-full.json
+
+# Trainable set: FP8 attention and shared-expert projections and the FP4 routed
+# experts. Everything else (embeddings, head, norms, gates, hyper-connections,
+# compressor, indexer) stays frozen; the indexer is also frozen by NeMo itself.
+freeze_config:
+  freeze_modules:
+    - glob: "model"
+    - glob: "lm_head"
+  unfreeze_modules:
+    - glob: "model.layers.*.self_attn.wq_a"
+    - glob: "model.layers.*.self_attn.wq_b"
+    - glob: "model.layers.*.self_attn.wkv"
+    - glob: "model.layers.*.self_attn.wo_a"
+    - glob: "model.layers.*.self_attn.wo_b"
+    - glob: "model.layers.*.mlp.shared_experts.*_proj"
+    - glob: "model.layers.*.mlp.experts"
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: deepseek/exports/proxy-checkpoints/
+  dequantize_base_checkpoint: true
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+  pipeline:
+    patch_inner_model: false
+    patch_causal_lm_model: false
+  moe:
+    reshard_after_forward: true
+    wrap_outer_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+clip_grad_norm:
+  max_norm: 1.0
+
+dataset:
+  _target_: deepseek.qat.data.build_dataset
+  path: data/engineering.jsonl
+  snapshot: deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+  max_tokens: 4352
+  split: train
+  holdout: 16
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+validation_dataset:
+  _target_: deepseek.qat.data.build_dataset
+  path: data/engineering.jsonl
+  snapshot: deepseek/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062
+  max_tokens: 4352
+  split: holdout
+  holdout: 16
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: false
+
+optimizer:
+  _target_: deepseek.qat.optim.adamw8bit
+  lr: 1e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  bf16_stochastic_round: true
+  # Routed experts form their own parameter group. lr_mult is the per-class rate
+  # (the dense-slowing knob: base lr is the dense rate, experts run at lr_mult
+  # times it); 1.0 keeps a single rate. Applied by the lr_scheduler below.
+  param_group_overrides:
+    - pattern: 'mlp\.experts'
+      lr_mult: 1.0
+
+# Constant rate with a linear warmup from init_lr (NeMo default: 0.1 x lr) over
+# lr_warmup_steps, for every class entering training. Warmup must stay below
+# max_steps; the one-step base recipe keeps it at 0 and runs set it with --set.
+lr_scheduler:
+  lr_decay_style: constant
+  lr_warmup_steps: 0

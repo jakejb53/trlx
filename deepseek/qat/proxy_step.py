@@ -43,17 +43,36 @@ report): selected experts train as BF16 stacks, unselected experts stay packed
 and are covered by the frozen digest; the per-expert tables name rows by the
 module's global ids. ``--expert-selection`` is rejected alongside it.
 
+``--dense-tensors attention|shared|none`` declares which dense targets the recipe
+trains (the recipe's ``freeze_config`` freezes the rest); frozen targets stay
+fake-quantized and are covered by the frozen digest, like the indexer.
+
 ``--expert-shares SCORES.json`` (reporting only) joins each routed expert's
 token share from a ``route_scores`` report onto the per-expert flip table the
 report always carries under ``experts`` (global expert index -> values changed,
 elements, selected flag), so flip rate can be read against routing share.
 
-``--export DIR`` (stage 6) records the hooked logits on the shared probe token
-ids after training, saved as ``<out stem>-logits-rank{rank}.pt``, then writes
-the trained targets as a complete checkpoint in the layout of the recipe's
-``pretrained_model_name_or_path`` (``deepseek.qat.proxy_export``). The names of
-the replaced tensors go to ``<out stem>-replaced.txt`` for ``verify_export
---expect @FILE``. Requires ``--out``; ``--force`` replaces an existing DIR.
+Every step is one table row on rank 0's stderr (``deepseek.qat.progress``):
+step, epoch, loss and the running epoch mean, the latest held-out loss with its
+change from the previous validation and from baseline, the fraction of dense and
+expert values changed since the start, the layers with any expert change, the
+per-class gradient norms, and the step's seconds. Every validation adds an
+``eval step N`` line. The changed fractions come from ``deepseek.qat.flips``,
+which compares each forward's fake quantization against the source on the
+device, so they are exact and cost no second pass. With ``--out`` every record
+is also appended as one JSON line to ``<out stem>-progress.jsonl``, so a killed
+run keeps every measurement taken before the kill. The final report remains the
+complete record.
+
+``--export DIR`` (stage 6, stage 7) writes the trained targets as a complete
+checkpoint in the layout of the recipe's ``pretrained_model_name_or_path``
+(``deepseek.qat.proxy_export``) at every validation and at the end of the run,
+under ``DIR/step-N`` with ``DIR/latest`` pointing at the newest; the oldest are
+removed beyond ``--keep-exports K`` (default 3). Each export records the hooked
+logits on the shared probe token ids as ``<out stem>-step{N}-logits-rank{rank}.pt``
+and the replaced tensor names as ``<out stem>-step{N}-replaced.txt`` for
+``verify_export --expect @FILE``. Requires ``--out``; ``--force`` replaces an
+existing DIR. A failed export stops the run on every rank.
 """
 
 import argparse
@@ -61,6 +80,8 @@ import hashlib
 import json
 import math
 import os
+import re
+import shutil
 import sys
 import time
 
@@ -73,7 +94,9 @@ from deepseek.qat import quant as Q
 from deepseek.qat import inbackward
 from deepseek.qat import proxy_export
 from deepseek.qat.export import ExportError
+from deepseek.qat.flips import FlipCounter
 from deepseek.qat.freeze import freeze_gate_bias
+from deepseek.qat.progress import Progress, StepTable
 from deepseek.qat.overrides import add_override_arguments, apply_overrides
 from deepseek.qat.proxy import local_expert_ids, logits as hooked_logits, logits_path, probe_token_ids
 
@@ -159,6 +182,41 @@ def _frozen_tensors(model):
 
 
 GB = 1024**3
+
+
+STEP_EXPORT = re.compile(r"^step-(\d+)$")
+
+
+# Step exports under an export root, oldest first, as (step, directory name).
+def step_exports(root: str) -> list[tuple[int, str]]:
+    found = []
+    for name in os.listdir(root):
+        m = STEP_EXPORT.match(name)
+        if m and os.path.isdir(os.path.join(root, name)) and not os.path.islink(os.path.join(root, name)):
+            found.append((int(m.group(1)), name))
+    return sorted(found)
+
+
+# Keep the newest `keep` step exports and remove the rest; returns the removed
+# names. Staging leftovers and `latest` are not step exports and are untouched.
+def retain_exports(root: str, keep: int) -> list[str]:
+    if keep < 1:
+        raise ValueError(f"keep must be at least 1, got {keep}")
+    removed = []
+    for _, name in step_exports(root)[:-keep]:
+        shutil.rmtree(os.path.join(root, name))
+        removed.append(name)
+    return removed
+
+
+# `latest` is a relative symlink to the newest step export, replaced atomically.
+def point_latest(root: str, name: str) -> None:
+    link = os.path.join(root, "latest")
+    tmp = link + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(name, tmp)
+    os.replace(tmp, link)
 
 
 # Per-step CUDA memory samples around the recipe's optimizer step. The allocator
@@ -338,17 +396,27 @@ def main(argv=None) -> int:
                         help="with --in-backward: update dense parameters on 1 step in N (gradients discarded otherwise, "
                              "Adam moments untouched); experts update every step; implies --per-class-clip")
     parser.add_argument("--trainable-subset", choices=("all", "dense", "experts"), default="all",
-                        help="which targets the recipe is expected to train (ablations freeze the rest via --set); the exact-set check uses it")
+                        help="which target classes the recipe is expected to train (ablations freeze the rest via --set); the exact-set check uses it")
+    parser.add_argument("--dense-tensors", choices=("all", "attention", "shared", "none"), default="all",
+                        help="which dense (FP8) targets the recipe is expected to train: all, the attention projections only, the shared "
+                             "experts only, or none; the recipe's freeze_config must freeze the rest, which the exact-set check verifies")
     parser.add_argument("--expert-shares", default=None, metavar="SCORES.json",
                         help="reporting only: join each expert's token share from a route_scores report onto the per-expert flip table")
     parser.add_argument("--expert-selection", default=None, metavar="SCORES.json",
                         help="with --in-backward: train only the experts selected per layer in a route_scores report")
     parser.add_argument("--export", default=None, metavar="DIR",
-                        help="after training, export the trained targets as a complete checkpoint in the source layout (requires --out)")
+                        help="export the trained targets as a complete checkpoint in the source layout at every validation and at "
+                             "the end, under DIR/step-N with DIR/latest pointing at the newest (requires --out)")
+    parser.add_argument("--keep-exports", type=int, default=3, metavar="K",
+                        help="with --export: keep the newest K step exports and remove older ones (default 3)")
     parser.add_argument("--force", action="store_true", help="replace an existing --export directory")
     args = parser.parse_args(argv)
     if args.export is not None and not args.out:
-        parser.error("--export requires --out: probe logits and the replaced-tensor list are saved beside the report")
+        parser.error("--export requires --out: probe logits and the replaced-tensor lists are saved beside the report")
+    if args.keep_exports < 1:
+        parser.error(f"--keep-exports must be at least 1, got {args.keep_exports}")
+    if args.export is not None and os.path.lexists(args.export) and not args.force:
+        parser.error(f"--export: {args.export} exists; pass --force to replace it")
     if args.dense_every < 1:
         parser.error(f"--dense-every must be a positive integer, got {args.dense_every}")
     if args.dense_every > 1 and not args.in_backward:
@@ -375,6 +443,19 @@ def main(argv=None) -> int:
     recipe.setup()
     rank = dist.get_rank() if dist.is_initialized() else 0
     model = recipe.model_parts[0]
+    # The export root is created (or, with --force, replaced) once, by rank 0,
+    # before anything else; step exports are staged inside it.
+    export_root = os.path.abspath(args.export) if args.export is not None else None
+    if export_root is not None and rank == 0:
+        if os.path.lexists(export_root):
+            shutil.rmtree(export_root) if os.path.isdir(export_root) and not os.path.islink(export_root) else os.remove(export_root)
+        os.makedirs(export_root)
+    if dist.is_initialized():
+        dist.barrier()
+    prefix = os.path.splitext(args.out)[0] if args.out else None
+    progress = Progress(f"{prefix}-progress.jsonl" if prefix else None, rank)
+    progress.record("run", {"config": args.config, "overrides": overrides, "in_backward": args.in_backward,
+                            "export": export_root, "keep_exports": args.keep_exports})
     # Disable NeMo's per-step router-bias update before any training step.
     gate_factor_before, gates_with_bias = freeze_gate_bias(model)
     state = FQ.install(model)
@@ -444,19 +525,33 @@ def main(argv=None) -> int:
     resident: dict[str, int] = {}
 
     def stepping(batches, max_grad_norm=None):
+        t_step = time.monotonic()
         meter.begin_step()
+        # The step's forward quantizes every trained tensor; the counter compares
+        # that against the baselines, so these totals describe the masters as the
+        # step began (after the previous update).
+        counter.begin_pass()
         sample = original_step(batches, None if stepper is not None else max_grad_norm)
         if not resident:
             resident.update(resident_bytes(model, recipe.optimizer[0].inner))
         if stepper is not None:
             sample.metrics["grad_norm"] = stepper.end_step()
-            # Per-class norms and coefficients when enabled; the global norm stays in grad_norm.
+            # Clipping classes' coefficients (one global coefficient unless per-class
+            # clipping is on); the reporting norms for dense and experts always.
             for cls in stepper.classes:
                 suffix = "" if cls == "all" else f"_{cls}"
                 sample.metrics[f"clip_coef_next{suffix}"] = stepper.coefs[cls]
-                if cls != "all":
-                    sample.metrics[f"grad_norm_{cls}"] = stepper.last_norms[cls]
+            for cls, norm in stepper.last_report_norms.items():
+                sample.metrics[f"grad_norm_{cls}"] = norm
+            for cls, stats in stepper.last_drift.items():
+                sample.metrics[f"drift_{cls}"] = stats["mean_abs_drift"]
+                sample.metrics[f"consistency_{cls}"] = stats["consistency"]
+            # Per-tensor drift and sign consistency, the selection data for the
+            # next run: in the progress file every step, in the report at the end.
+            progress.record("drift_by_tensor", {"step": stepper.step_count - 1, "tensors": stepper.last_drift_by_param})
             meter.note("mem_peak_hook", stepper.last_peak_hook_allocated)
+        sample.metrics.update(counter.totals())
+        sample.metrics["step_seconds"] = round(time.monotonic() - t_step, 1)
         # Rates of the further parameter groups (group 0 is NeMo's `lr`), read at
         # the same moment NeMo reads `lr`: after its scheduler has advanced, so
         # every rate metric describes the next step.
@@ -473,10 +568,18 @@ def main(argv=None) -> int:
     # the exact-set check and the flip totals follow this selection.
     def in_subset(name: str) -> bool:
         is_expert = ".mlp.experts" in name
-        return args.trainable_subset == "all" or (args.trainable_subset == "experts") == is_expert
+        if not (args.trainable_subset == "all" or (args.trainable_subset == "experts") == is_expert):
+            return False
+        if is_expert:
+            return True
+        # Dense selection by role (the second selection axis beside the experts'):
+        # attention projections or shared experts, the two kinds of dense target.
+        role = "attention" if ".self_attn." in name else "shared"
+        return args.dense_tensors in ("all", role)
 
     target_params = {f"{t.name}.{a}" for t in state.targets for a in t.params if "indexer" not in t.name and in_subset(t.name)}
     report["trainable_subset"] = args.trainable_subset
+    report["dense_tensors"] = args.dense_tensors
     # Activation checkpointing and compile wrappers add path segments that the
     # target names (taken from the unwrapped hierarchy) do not carry.
     trainable = {_canonical(n) for n, p in model.named_parameters() if p.requires_grad}
@@ -490,14 +593,23 @@ def main(argv=None) -> int:
     # and the gate/up expert tensor per layer): a full copy is 26 GB per rank of
     # host memory, which with two ranks and NeMo's load staging exceeds this host.
     sampled = {t.name for t in state.targets if t.name.endswith(".self_attn.wq_b") or t.name.endswith(".mlp.experts")}
-    before = {}
     masters = {}
     for t in state.targets:
         for attr, kind in t.params.items():
             name = f"{t.name}.{attr}"
-            before[name] = quantized_state(name, getattr(t.module, attr), kind)
             if t.name in sampled and attr != "down_projs":
                 masters[name] = _materialize(name, getattr(t.module, attr)).detach().cpu().clone()
+    # Flip accounting (deepseek.qat.flips): baselines recorded now from the
+    # untrained weights; from here every forward's fake quantization is compared
+    # against them on the device, so the counts exist after every step.
+    # Every routed expert of every backbone layer, from the model config (w1, w3:
+    # hidden x inter each; w2: inter x hidden), whether selected or packed.
+    mcfg = model.config
+    expert_class_elements = 3 * int(mcfg.hidden_size) * int(mcfg.moe_intermediate_size) * int(mcfg.n_routed_experts) * len(model.model.layers)
+    counter = FlipCounter(state, target_params, _materialize, torch.device(torch.cuda.current_device()),
+                          expert_class_elements=expert_class_elements)
+    steps_per_epoch = len(recipe.dataloader) if hasattr(recipe.dataloader, "__len__") else None
+    table = StepTable(int(cfg.step_scheduler.max_steps), steps_per_epoch, len(counter.layers))
     frozen_before = {n: _digest(n, t) for n, t in _frozen_tensors(model)}
     report["frozen_params"] = sum(1 for _, p in model.named_parameters() if not p.requires_grad)
     report["frozen_buffers"] = sum(1 for _ in model.named_buffers())
@@ -507,7 +619,13 @@ def main(argv=None) -> int:
     original_log = recipe.log_train_metrics
 
     def capturing_log(log_data):
-        captured.append({k: (float(v) if isinstance(v, (int, float, torch.Tensor)) else v) for k, v in log_data.metrics.items()})
+        m = {k: (float(v) if isinstance(v, (int, float, torch.Tensor)) else v) for k, v in log_data.metrics.items()}
+        m["step"] = int(log_data.step)
+        captured.append(m)
+        progress.record("step", m)
+        norms = {c: m[f"grad_norm_{c}"] for c in ("dense", "expert") if f"grad_norm_{c}" in m} or None
+        drift = {c: (m[f"drift_{c}"], m[f"consistency_{c}"]) for c in ("dense", "expert") if f"drift_{c}" in m} or None
+        progress.say(table.row(m["step"], m.get("loss"), m if "dense_value_elements" in m else None, norms, m.get("step_seconds"), drift))
         return original_log(log_data)
 
     recipe.log_train_metrics = capturing_log
@@ -519,58 +637,90 @@ def main(argv=None) -> int:
     captured_val: list[dict] = []
     original_val_log = recipe.log_val_metrics
 
-    # Value and scale changes since the start, totalled per class (dense FP8,
-    # expert FP4) over the trainable targets, so flipping can be read against
-    # held-out loss on the same clock. Dense materialization is a collective;
-    # every rank runs this from the same validation event in the same order.
-    def flip_totals() -> dict:
-        totals = {f"{c}_{k}": 0 for c in ("dense", "expert") for k in ("values_changed", "scales_changed", "value_elements")}
-        for t in state.targets:
-            for attr, kind in t.params.items():
-                name = f"{t.name}.{attr}"
-                if name not in target_params:
-                    continue
-                c1, s1 = quantized_state(name, getattr(t.module, attr), kind)
-                cls = "dense" if kind == "fp8" else "expert"
-                # FP4 entries are dequantized once on the host (the expensive
-                # part of this function) and serve both the class total and the
-                # per-layer selected count.
-                entries = None if kind == "fp8" else entry_value_changes(before[name], (c1, s1))
-                totals[f"{cls}_values_changed"] += value_changes(before[name], (c1, s1), kind) if entries is None else sum(entries)
-                totals[f"{cls}_scales_changed"] += int((before[name][1] != s1).sum())
-                totals[f"{cls}_value_elements"] += c1.numel() if kind == "fp8" else c1.numel() * 2
-                if entries is not None:
-                    # Per layer, over the selected local experts when a selection
-                    # is active (all local experts otherwise); summed over ranks
-                    # below so every rank's report carries the same numbers.
-                    layer = t.name.split(".")[2]
-                    n_local = c1.shape[0] // (2 if kind == "fp4_gate_up" else 1)
-                    rows = local_selected.get(name, list(range(n_local))) if selection is not None else list(range(n_local))
-                    changes = per_expert(entries, n_local)
-                    per_row = c1.numel() * 2 // n_local
-                    totals[f"expert_values_changed_layer{layer}"] = totals.get(f"expert_values_changed_layer{layer}", 0) + sum(changes[r] for r in rows)
-                    totals[f"expert_value_elements_layer{layer}"] = totals.get(f"expert_value_elements_layer{layer}", 0) + per_row * len(rows)
-        # Expert tensors are sharded over the expert mesh, so every expert figure
-        # (class totals and per-layer) is this rank's share and is summed over
-        # ranks. Dense tensors are full on every rank and are not reduced.
+    # One checkpoint per validation and at the end: the trained targets exported
+    # under <export>/step-N with the probe logits and replaced list beside the
+    # report, `latest` pointing at the newest, the oldest removed beyond
+    # --keep-exports. Killing the run after any validation leaves a complete,
+    # verifiable checkpoint. Every rank joins the export collectives and the
+    # failure flag is reduced, so the outcome is agreed and no rank is left
+    # waiting on a collective. Returns the error message, or None on success.
+    exports: list[dict] = []
+    last_export_step: list[int | None] = [None]
+
+    def export_at(step: int) -> str | None:
+        dest = os.path.join(export_root, f"step-{step}")
+        step_prefix = f"{prefix}-step{step}"
+        ids = probe_token_ids(int(model.config.vocab_size)).to(next(model.parameters()).device)
+        torch.save(hooked_logits(model, ids).cpu(), logits_path(step_prefix, rank))
+        t2 = time.monotonic()
+        failure = None
+        try:
+            exported = proxy_export.export_trained(state, target_params, snapshot, dest, force=False)
+        except ExportError as e:
+            failure = str(e)
+        flag = torch.tensor([0 if failure is None else 1], device=torch.cuda.current_device())
         if dist.is_initialized():
-            keys = sorted(k for k in totals if k.startswith("expert_"))
-            if keys:
-                vec = torch.tensor([totals[k] for k in keys], dtype=torch.int64, device=torch.cuda.current_device())
-                dist.all_reduce(vec)
-                totals.update(dict(zip(keys, vec.tolist())))
-        return totals
+            dist.all_reduce(flag)
+        if int(flag.item()):
+            failure = failure or "export failed on another rank"
+            progress.record("export_error", {"step": step, "path": dest, "error": failure})
+            progress.say(f"export at step {step} failed: {failure}")
+            return failure
+        last_export_step[0] = step
+        if rank == 0:
+            replaced_file = f"{step_prefix}-replaced.txt"
+            with open(replaced_file, "w", encoding="utf-8") as f:
+                f.write("".join(f"{n}\n" for n in exported.pop("replaced")))
+            point_latest(export_root, f"step-{step}")
+            removed = retain_exports(export_root, args.keep_exports)
+            # A removed export's probe logits (about 265 MB per rank) and replaced
+            # list are useless without it; they go with it.
+            world = dist.get_world_size() if dist.is_initialized() else 1
+            for name in removed:
+                gone_prefix = f"{prefix}-step{name.split('-', 1)[1]}"
+                for path in [f"{gone_prefix}-replaced.txt", *(logits_path(gone_prefix, r) for r in range(world))]:
+                    if os.path.exists(path):
+                        os.remove(path)
+            exported.update({"step": step, "replaced_file": replaced_file, "probe_logits_prefix": step_prefix,
+                             "export_seconds": round(time.monotonic() - t2, 1), "removed": removed})
+            exports.append(exported)
+            progress.record("export", exported)
+            progress.say(f"exported step {step} to {dest} ({exported['replaced_count']} tensors replaced, {exported['export_seconds']} s; "
+                         f"latest -> step-{step}; removed {', '.join(exported['removed']) or 'none'})")
+        return None
+
+    # Every validation epoch is one counting pass, so its totals describe the
+    # masters after the last update (the training pass describes the step start).
+    original_val_epoch = recipe._run_validation_epoch
+
+    def counting_val_epoch(*a, **kw):
+        counter.begin_pass()
+        return original_val_epoch(*a, **kw)
+
+    recipe._run_validation_epoch = counting_val_epoch
 
     def capturing_val_log(val_name, log_data, metric_logger=None):
         entry = {"step": int(log_data.step), "name": val_name, "val_loss": float(log_data.metrics["val_loss"])}
-        entry.update(flip_totals())
+        entry.update(counter.totals())
         captured_val.append(entry)
+        progress.record("validation", entry)
+        table.note_validation(entry["val_loss"])
+        progress.say(table.validation_line(entry["step"]))
+        if export_root is not None:
+            # The validation left the model in eval mode, which the probe needs.
+            failure = export_at(entry["step"])
+            if failure is not None:
+                # Mid-run, a broken destination would waste every further step.
+                raise SystemExit(f"export at step {entry['step']} failed; stopping the run: {failure}")
         return original_val_log(val_name, log_data, metric_logger)
 
     recipe.log_val_metrics = capturing_val_log
     for val_name, val_loader in recipe.val_dataloaders.items():
         sample = recipe._run_validation_epoch(val_loader)
         captured_val.append({"step": -1, "name": val_name, "val_loss": float(sample.metrics["val_loss"])})
+        progress.record("validation", captured_val[-1])
+        table.note_validation(captured_val[-1]["val_loss"], baseline=True)
+        progress.say(f"held-out baseline: loss {captured_val[-1]['val_loss']:.4f}")
     for mp in recipe.model_parts:
         mp.train()
 
@@ -609,7 +759,7 @@ def main(argv=None) -> int:
     report["train_seconds"] = round(time.monotonic() - t1, 1)
     # Whole-run peak including setup and validation; the per-step peaks are in steps.
     report["peak_memory_gb"] = round(meter.peak() / GB, 2)
-    step_keys = ("loss", "grad_norm", "lr", "clip_coef_next", "grad_norm_dense", "grad_norm_expert", "clip_coef_next_dense", "clip_coef_next_expert",
+    step_keys = ("step", "loss", "grad_norm", "lr", "clip_coef_next", "drift_dense", "drift_expert", "consistency_dense", "consistency_expert", "step_seconds", "grad_norm_dense", "grad_norm_expert", "clip_coef_next_dense", "clip_coef_next_expert",
                  "mem_before_step_gb", "mem_peak_step_gb", "mem_after_step_gb", "mem_reserved_after_step_gb", "mem_peak_hook_gb", "mem_at_optimizer_step_gb")
     report["steps"] = [{k: v for k, v in m.items() if k in step_keys or k.startswith("lr_group")} for m in captured]
     # Memory summary (Handoff 2). Resident state comes from the end of the first
@@ -637,10 +787,17 @@ def main(argv=None) -> int:
                 memory[out] = max(m[key] for m in mem_steps)
     report["memory"] = memory
     report["validation"] = captured_val
+    if stepper is not None:
+        report["drift_by_tensor"] = {_canonical(n): v for n, v in stepper.last_drift_by_param.items()}
     last = captured[-1] if captured else {}
     report["loss"] = last.get("loss")
     report["grad_norm"] = last.get("grad_norm")
 
+    # Final flip figures: one explicit counting pass over the trained masters
+    # (the training pass describes a step's start, and a validation may not have
+    # followed the last update), then the per-tensor and per-expert counts.
+    counter.refresh(_materialize)
+    tensors = counter.per_tensor()
     flips = {}
     total_code_flips = 0
     total_value_changes = 0
@@ -652,41 +809,30 @@ def main(argv=None) -> int:
     for t in state.targets:
         for attr, kind in t.params.items():
             name = f"{t.name}.{attr}"
-            c0, s0 = before[name]
-            c1, s1 = quantized_state(name, getattr(t.module, attr), kind)
-            entries = None if kind == "fp8" else entry_value_changes((c0, s0), (c1, s1))
-            if entries is not None:
+            if name not in tensors:
+                continue  # frozen targets (the indexer, an ablation's other class) are covered by the frozen digest
+            if kind != "fp8":
                 layer = int(t.name.split(".")[2])
                 ids = local_expert_ids(t.module, getattr(t.module, attr))
+                values, codes, scales = counter.per_expert(name)
+                if len(ids) != len(values):
+                    raise RuntimeError(f"{name}: {len(ids)} local experts but {len(values)} counted rows")
+                per = counter.elements_per_expert(name)
                 rows = local_experts.setdefault(layer, {})
-                for e, (n, m) in expert_breakdown(entries, ids, c1.numel() * 2 // len(ids)).items():
+                for e, n in zip(ids, values):
                     acc = rows.setdefault(e, [0, 0])
                     acc[0] += n
-                    acc[1] += m
-            if selection is not None and name in local_selected:
-                # Any bit change in an unselected expert's codes or scales is a
-                # frozen-integrity failure, named by global expert index.
-                n_local = len(ids)
-                k = c1.shape[0] // n_local
-                chosen = set(local_selected[name])
-                for i in range(n_local):
-                    if i in chosen:
-                        continue
-                    sl = slice(i * k, (i + 1) * k)
-                    if not torch.equal(c0[sl], c1[sl]) or not torch.equal(s0[sl], s1[sl]):
-                        unselected_changed.append(f"{name}[expert {ids[i]}]")
-            code_flips = int((c0 != c1).sum())
-            code_elems = c0.numel() if kind == "fp8" else c0.numel() * 2
-            entry = {
-                # Digest of the trained master (dense: full tensor; experts:
-                # this rank's shard) so two runs can be compared for equality.
-                "master_sha256": _digest(name, getattr(t.module, attr)),
-                "codes_flipped": code_flips,
-                "values_changed": value_changes((c0, s0), (c1, s1), kind) if entries is None else sum(entries),
-                "code_elements": code_elems,
-                "scales_changed": int((s0 != s1).sum()),
-                "scale_elements": s0.numel(),
-            }
+                    acc[1] += per
+                if selection is not None and name in local_selected:
+                    # Any bit change in an unselected expert's codes or scales is a
+                    # frozen-integrity failure, named by global expert index.
+                    chosen = set(local_selected[name])
+                    for i, e in enumerate(ids):
+                        if i not in chosen and (codes[i] or scales[i]):
+                            unselected_changed.append(f"{name}[expert {e}]")
+            # Digest of the trained master (dense: full tensor; experts: this
+            # rank's shard) so two runs can be compared for equality.
+            entry = {"master_sha256": _digest(name, getattr(t.module, attr)), **tensors[name]}
             if name in masters:
                 m1 = _materialize(name, getattr(t.module, attr)).detach().cpu()
                 delta = (m1.float() - masters[name].float()).abs().reshape(-1)
@@ -701,9 +847,8 @@ def main(argv=None) -> int:
                 })
                 del m1, delta
             flips[name] = entry
-            if name in target_params:
-                total_code_flips += code_flips
-                total_value_changes += entry["values_changed"]
+            total_code_flips += entry["codes_flipped"]
+            total_value_changes += entry["values_changed"]
     report["targets"] = flips
     # Merge every rank's local experts, then join shares and selection flags.
     gathered: list = [None] * (dist.get_world_size() if dist.is_initialized() else 1)
@@ -731,7 +876,7 @@ def main(argv=None) -> int:
     # A tensor absent before training (a buffer created during the step) has no
     # prior digest and is reported as changed; the frozen set must be fixed.
     report["frozen_changed"] = sorted(n for n, t in _frozen_tensors(model) if _digest(n, t) != frozen_before.get(n))
-    report["indexer_changed"] = sorted(n for n, e in flips.items() if "indexer" in n and (e["codes_flipped"] or e["scales_changed"]))
+    report["indexer_changed"] = sorted(n for n in report["frozen_changed"] if "indexer" in n)
     report["unselected_experts_changed"] = unselected_changed
 
     # Every step's loss and gradient norm must be finite, not only the last.
@@ -748,33 +893,25 @@ def main(argv=None) -> int:
         and total_value_changes > 0
     )
 
-    # Stage 6: probe logits under the hooks, then export. The probe runs in
-    # eval mode on the shared token ids so `proxy --expect-logits` on the
-    # reloaded export reproduces it bit for bit. Every rank saves its own
-    # logits and joins the export collectives; rank 0 alone writes. A refused
-    # or failed export is recorded and fails the run instead of raising, so
-    # the other ranks still reach the final all-reduce rather than hanging.
-    if args.export is not None:
-        prefix = os.path.splitext(args.out)[0]
-        model.eval()
-        ids = probe_token_ids(int(model.config.vocab_size)).to(next(model.parameters()).device)
-        torch.save(hooked_logits(model, ids).cpu(), logits_path(prefix, rank))
-        report["probe_logits_path"] = logits_path(prefix, rank)
-        t2 = time.monotonic()
-        try:
-            exported = proxy_export.export_trained(state, target_params, snapshot, args.export, force=args.force)
-        except ExportError as e:
-            print(f"export failed: {e}", file=sys.stderr, flush=True)
-            report["export_error"] = str(e)
+    # Final export (stage 6): the probe runs in eval mode on the shared token ids
+    # so `proxy --expect-logits` on the reloaded export reproduces it bit for bit.
+    # NeMo validates at the end of training, so the last step usually already has
+    # its export from the validation hook and is not exported twice. A failed
+    # final export is recorded and fails the run without raising, so every rank
+    # still reaches the final all-reduce.
+    if export_root is not None:
+        final_step = captured[-1]["step"] if captured else None
+        if final_step is None:
+            report["export_error"] = "no training step ran; nothing to export"
             ok = False
-        else:
-            if rank == 0:
-                replaced_file = f"{prefix}-replaced.txt"
-                with open(replaced_file, "w", encoding="utf-8") as f:
-                    f.write("".join(f"{n}\n" for n in exported.pop("replaced")))
-                exported["replaced_file"] = replaced_file
-                exported["export_seconds"] = round(time.monotonic() - t2, 1)
-                report["export"] = exported
+        elif last_export_step[0] != final_step:
+            model.eval()
+            failure = export_at(final_step)
+            if failure is not None:
+                report["export_error"] = failure
+                ok = False
+        report["exports"] = exports
+        report["export"] = exports[-1] if exports else None
     report["ok"] = ok
     report["elapsed_seconds"] = round(time.monotonic() - t0, 1)
     if rank == 0:

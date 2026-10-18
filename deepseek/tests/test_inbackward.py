@@ -233,3 +233,29 @@ class Failures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DriftSamples(unittest.TestCase):
+    # A fixed slice of a parameter is tracked: mean |master - baseline| and the
+    # sign consistency of its updates, 1.0 when every update pushed the same way.
+    def test_consistent_updates_have_consistency_one_and_drift_equals_displacement(self):
+        torch.manual_seed(0)
+        model = _model()
+        opt = LocalShardOptimizer(list(model.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        sample_of = lambda name, p: ("dense", (slice(0, 2),)) if name == "0.weight" else None
+        stepper = InBackwardStepper([model], opt, 1e9, lambda: None, drift_sample_of=sample_of)
+        p0 = model[0].weight.detach()[0:2].clone()
+        x = torch.randn(4, 16)
+        for _ in range(3):
+            _loss(model, x).backward()
+            stepper.end_step()
+        drift = stepper.last_drift["dense"]
+        self.assertAlmostEqual(drift["mean_abs_drift"], float((model[0].weight.detach()[0:2] - p0).abs().mean()), places=6)
+        # Same input each step: most updates keep their sign, so |drift| is most of the summed |update|.
+        self.assertGreater(drift["consistency"], 0.8)
+        self.assertLessEqual(drift["consistency"], 1.0)
+        self.assertEqual(stepper.drift_classes, ["dense"])
+        self.assertEqual([n for n, q in model.named_parameters() if id(q) in stepper._drift], ["0.weight"])
+        per = stepper.last_drift_by_param["0.weight"]
+        self.assertAlmostEqual(per["mean_abs_drift"], drift["mean_abs_drift"], places=9)
+        self.assertEqual(per["sampled_elements"], 2 * 16)

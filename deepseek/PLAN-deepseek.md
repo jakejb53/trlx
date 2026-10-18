@@ -28,12 +28,37 @@ settings (Handoff 6 item 2). Stage 6b, split expert storage, which halves
 the per-GPU requirement and makes 4x B200 or 8x RTX PRO 6000 viable hosts, is
 complete: a split-module run trains the selected experts at the ESFT arm's
 rates, exports a verified checkpoint that reloads bit-identically, and peaks at
-44.4 GiB against 53.4. Next is Handoff 6 from item 3. The dataset, optimizer,
-trainable set, and mechanism are decided and verified below. Every command runs
-from the repository root
-`/home/$USER/trl/trlx`. Launch GPU runs from a plain terminal with `nohup`: the
+44.4 GiB against 53.4. The container image and host procedure are in place
+(Environment, Training host); the first rented host is released. Stage 7 ran
+there: the full-model
+recipe (`deepseek/qat/full-train.yaml`: `ep_size` 8, resharding on, split
+storage), routing scores over the training data at 8 ranks, and the first
+full-model runs at 8 per rank on scored layers plus every hash-layer expert
+(3,328 experts, 30.2%) pass every integrity check; the measured requirement for
+that selection is 79.8 GiB peak allocated and 89.7 reserved per rank on 95.0 GiB
+cards (20 steps over every row). The learning rate does not transfer from the
+proxy: at 1e-4 the full model degrades within one epoch (held-out 0.559 to
+0.629 in 20 steps, 15.9% of dense FP8 values re-rounded by step 3, a run killed
+as a failed test), at 1e-5 it learns (held-out 0.486 at step 20, 4.7% of dense
+values changed, zero expert values changed). The per-class arm (dense 1e-5,
+experts 1e-4) shows the second asymmetry: dense fits the 136 rows by step 33
+while expert flips only start at volume around step 34, and by step 79 held-out
+is above baseline with 0.44% of expert values changed (stage 7 run 7). The
+priority is therefore a dense selection to match the expert one (Decisions,
+trainable set): which dense tensors train, by what criterion. Selecting by
+role gives little, since the attention projections are 81% of dense values
+(run 8), and 20-step update-sign consistency does not rank dense tensors on
+this data (run 9); the criterion is open and is Pending item 1. Runs are
+watched live: one table row per step with held-out, flip fractions, master
+drift and sign consistency per class and per tensor, and an export at every
+validation (`DIR/step-N`, `DIR/latest`). Handoff 6 item 4, the dataset, is
+sized for LoRA (136 rows) and is being replaced by the operator. Every command runs from the repository root
+`/home/$USER/trl/trlx` (on the training host a symlink to `/workspace/trl/trlx`).
+Launch GPU runs from a plain terminal with `nohup`: the
 post-training report phase drives host memory low enough that an agent
-session's background-process reaper has killed a run.
+session's background-process reaper has killed a run. Kill a run with
+`pkill -9 -f "deepseek[.]qat[.]proxy_step"`: the bracket keeps the pattern from
+matching the pkill shell itself, which a plain `pkill -f` kills instead of the job.
 Rank 0 prints the full report to stdout, so a log redirect is a second copy of `--out`.
 
 Run all unit tests (CPU, under a minute; the data tests need the snapshot):
@@ -42,7 +67,8 @@ Run all unit tests (CPU, under a minute; the data tests need the snapshot):
 deepseek/venv/bin/python -B -m unittest deepseek.tests.test_quant deepseek.tests.test_export \
     deepseek.tests.test_fakequant deepseek.tests.test_data deepseek.tests.test_freeze \
     deepseek.tests.test_inbackward deepseek.tests.test_optim deepseek.tests.test_proxy_step \
-    deepseek.tests.test_proxy_export deepseek.tests.test_route_scores deepseek.tests.test_split_experts
+    deepseek.tests.test_proxy_export deepseek.tests.test_route_scores deepseek.tests.test_split_experts \
+    deepseek.tests.test_flips deepseek.tests.test_progress
 ```
 
 Reproduce the stage 3 one-step check (about 5 minutes, both GPUs):
@@ -85,7 +111,18 @@ Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
 `proxy-joint-perexpert.json` (Handoff 5), and `proxy-mem-2layer-inbackward.json`,
 `proxy-mem-2layer-reference.json`, `proxy-mem-2layer-inbackward-rerun.json`, and
 `proxy-mem-esft-top02.json` (Handoff 2), and `proxy-mem-2layer-inbackward-groups.json`
-(Handoff 6 item 2), and `route-scores-perrank10.json` and `proxy-stage6b-*` (stage 6b).
+(Handoff 6 item 2), and `route-scores-perrank10.json` and `proxy-stage6b-*` (stage 6b),
+and `split-bootstrap.json`, `route-scores-full-perrank8.json`, `route-scores-full.json`,
+`full-stage7-first.json`, `full-stage7-run1.log` (killed),
+`full-stage7-lr1e-5.json`, `full-stage7-probe.json`, and, for the killed runs 7
+and 8, which wrote no report, `full-stage7-perclass10-progress.jsonl` and
+`full-stage7-attn-progress.jsonl` with their `.log`, `.progress`, and
+`-step{79,4}-replaced.txt` files (stage 7, on the training host; pulled back by the
+reverse rsync). Every run has `<stem>.log` (the full stdout and stderr) and
+`<stem>.progress` (the filtered step and validation lines, see the stage 7 commands);
+`smoke-export*` and `smoke-reload.log` are the training host's smoke test of the
+per-validation export and retention path on the 4-layer split proxy (3 steps,
+validation every step, `--keep-exports 1`) and its reload.
 Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
 `stage6-experts/` and `stage6-sequential/` (stage 6), and `stage6b-split/`
 (stage 6b), 156 GB each; no check reads them any more, so delete them when
@@ -286,13 +323,14 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
 - Training host requirements for the full model: a rank count dividing 256, with
   the expert-parallel group spanning the world (`tp = pp = cp = 1`); per-GPU memory
   equal to the steady-state peak measured for the selected trainable set at that
-  rank count (Handoff 2 measured the proxy; the full-model figure is the stage 7
-  estimate until the first full-model run's `memory` block measures it; resident
-  expert weights are 516 GiB of dequantized BF16 divided by the rank count); host
-  RAM for loading, export, and the master sampling (estimated under Environment,
-  measured by the first full-model run); no format-specific kernels. The stage 6b hardware estimate bounds
-  the host search; the working target host is a separate decision below, and the
-  first full-model run's `memory` block remains the requirement.
+  rank count (Handoff 2 measured the proxy; stage 7 measured the full model at 8
+  ranks and 30.2% selection over every training row: 79.8 GiB peak allocated,
+  89.7 reserved; a different selection or longer rows need their own
+  measurement, and the requirement run must cover every row and take more than
+  one step, because the first step's peak understates steady state by 15 GiB at
+  full scale and peaks rise with row length); host RAM for loading, export, and the master sampling
+  (estimated under Environment; the first full-model run did not measure it);
+  no format-specific kernels. The working target host is a separate decision below.
 - Development, unit tests, and the four-layer proxy gate run on the owned host
   (Environment) in a venv. The training host runs a container image that mirrors
   this host's OS and user and carries the environment built from the lockfile at
@@ -317,6 +355,25 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   measured there from per-expert gradient-sign consistency and flip fraction,
   with `top_p` by routing share as the starting point. Unselected experts are
   frozen byte for byte and get no optimizer state.
+  Dense tensors need a selection of their own, and the governing quantity is the
+  trainable fraction per token: every dense weight sees every token while a
+  routed-expert weight sees about 2% (and the experts' FP4 half-cells are four
+  times the dense FP8 ones), so at any rate slow enough for experts to publish,
+  dense fits the data first and removes the gradient-sign consistency experts
+  need (stage 5 phase C on the proxy, stage 7 run 7 on the full model). Rate and
+  role are the wrong levers: per-class rates (1e-5 / 1e-4) only move when dense
+  finishes, and attention-only still trains 81% of dense values (run 8). Both
+  were pursued through stage 7 after stage 5 had measured the asymmetry; that
+  was the error of the first training-host rental. Selection by whole tensor or
+  role is closed. The lever is a selection of dense values far sparser than any
+  role split, chosen from a base-model measurement over the training rows, with
+  unselected values frozen byte for byte like unselected experts; the
+  expectation is that the fraction that works measures much closer to 2% than
+  to 81%. There is no fixed percentage target: the unit of selection and the
+  scoring statistic are the open decisions (Pending item 1), settled by the flip
+  and held-out indicators. The current mechanism (`proxy_step --dense-tensors`
+  with the recipe's `freeze_config`, verified by the exact-set check) selects by
+  role only and is a placeholder. SPEC §4 follows the decision.
 - Master precision: BF16 masters with stochastic-rounding updates and torchao
   `AdamW8bit` (8-bit blockwise moments, block 256) for the full run and on the proxy.
   FP32 masters do not fit the proxy (27B parameters at 4 bytes plus moments on two
@@ -379,12 +436,17 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   here first). Reserved GiB per rank at 8 ranks from gate 3's components
   (resident 20.5 + 112 x selection fraction, transient 38 or 27 with
   `distributed.moe.reshard_after_forward: true`, 9 allocator overhead): 8% 77 / 66,
-  15% 85 / 74, 20% 90 / 79, 25% 96 / 85, 30% 102 / 91. The stage 7 recipe sets
-  resharding on; the selection ceiling is about 25% pending the live measurement.
-  Costs: PCIe carries the per-layer expert-parallel collectives and the dense
-  all-gather (step time, unquantified); host RAM is estimated under Environment;
-  `ep_size` 8 has not run. 4x B200 is the fallback. The first
-  full-model run's `memory` block remains the requirement.
+  15% 85 / 74, 20% 90 / 79, 25% 96 / 85, 30% 102 / 91. Measured (stage 7,
+  `full-stage7-lr1e-5.json`, 30.2% selection, resharding on, 20 steps over every
+  row): 89.7 reserved, 79.8 peak allocated, so the estimate was 1 GiB
+  conservative and the host fits that selection with 5.3 GiB of reserved
+  headroom. Each further 1% of experts adds about 1.1 GiB of resident state per
+  rank (BF16 stack plus 8-bit moments minus the packed copy), so 30% is close
+  to the ceiling on this host. Costs: PCIe carries the per-layer
+  expert-parallel collectives and the dense all-gather (steady-state steps of
+  28 to 29 s at local batch 1); host RAM is estimated under Environment. At 8
+  ranks with local batch 1 the loader drops the last 6 of the 142 training rows
+  from every epoch. 4x B200 is the fallback.
 - Everything for this work lives under `deepseek/`. Git is managed by the operator.
 
 ## Layout
@@ -418,15 +480,22 @@ deepseek/
     proxy.py          parity check and export reload (torchrun entry); --set/--unset,
                       --expect-logits PREFIX, --save-logits PREFIX; shared probe token ids;
                       packed-stack byte check under split storage
-    proxy_step.py     stage 3 to 6 training check and diagnostics (torchrun entry);
-                      --in-backward, --per-class-clip, --set/--unset recipe overrides,
-                      --trainable-subset, --dense-every N, --expert-selection SCORES.json,
-                      --expert-shares SCORES.json, held-out capture with per-class and
-                      per-layer flip totals, per-expert flip table in the report,
-                      per-step memory series and resident accounting by class, per-group
-                      rate metrics,
-                      --export DIR [--force] with probe logits and replaced list beside --out
-    route_scores.py   routing-concentration measurement; ESFT top_p or --per-rank N selection (torchrun entry)
+    proxy_step.py     training run and diagnostics (torchrun entry); --in-backward,
+                      --per-class-clip, --set/--unset recipe overrides, --trainable-subset,
+                      --dense-tensors all|attention|shared|none, --dense-every N,
+                      --expert-selection SCORES.json, --expert-shares SCORES.json; live
+                      table per step and eval line per validation (progress.py), flip
+                      fractions per step (flips.py), master drift and sign consistency
+                      per class (inbackward.py samples), per-step memory series and
+                      resident accounting by class; with --out a progress JSONL beside
+                      the report; --export DIR [--force] [--keep-exports K] publishes
+                      DIR/step-N at every validation with DIR/latest, probe logits and
+                      replaced list per step beside --out
+    flips.py          per-step flip accounting on the device: baselines in pinned host
+                      memory, compared against each forward's fake quantization
+    progress.py       live table (StepTable), eval line, progress JSONL (Progress)
+    route_scores.py   routing-concentration measurement; ESFT top_p or --per-rank N selection, with
+                      --hash-per-rank M for the hash-routing layers (torchrun entry)
     split_experts.py  stage 6b: ExpertSplit (selection file, install hook) and SplitExperts, the per-layer
                       module with a trained BF16 stack and a frozen packed stack dequantized on the fly
     split_adapter.py  stage 6b: DeepSeekV4StateDictAdapter subclass routing each expert into the BF16
@@ -434,6 +503,12 @@ deepseek/
     proxy-4layer.yaml stage 2 recipe (mock token ids)
     proxy-train.yaml  training recipe: data bridge, freeze config, optimizer with the
                       experts parameter group (lr_mult), constant-rate scheduler with warmup
+    full-train.yaml   stage 7 recipe: proxy-train with 43 layers, ep_size 8, resharding on,
+                      model.expert_split on route-scores-full.json, global batch 8, lr 1e-4
+    full-attn.yaml    stage 7 run 8 recipe: full-train with the shared experts frozen, at run 7's
+                      rates (dense 1e-5, experts lr_mult 10); launch with --dense-tensors attention
+  sft-without-overfitting.txt                  paper: attention-only SFT keeps OOD generalization,
+                                               FNN/full SFT memorizes; small rates prevent collapse
   container/                                   image and host scripts (gitignored): Dockerfile (OS and user
                                                mirror, venv built from the lockfile), onstart.sh (Vast.ai
                                                on-start), verify.py (environment, tree, GPU, and NCCL check;
@@ -726,8 +801,10 @@ Baseline held-out 16.18. Expert flips begin where drift reaches the small-cell e
 of the half-cell distribution (step 70 at 3e-5, step 30 at 1e-4) and then grow
 smoothly; at 1e-4 nothing destabilizes and the scale changes are upward doublings.
 At 3e-4 the model is rewritten: held-out stalls at 7.1 from step 30 to 70 and ends
-worse than 3e-5. The usable regime is around 1e-4. Dense value changes saturate
-near 54% at that rate. The learning rate sets flip frequency; the quantizer sets
+worse than 3e-5. The usable regime is around 1e-4 on this proxy; on the full
+model it is not (stage 7: 1e-4 degrades, 1e-5 learns), because the proxy's
+baseline loss of 16 made every re-rounding an improvement. Dense value changes
+saturate near 54% at that rate. The learning rate sets flip frequency; the quantizer sets
 flip size. A per-class rate (experts about 4x dense, the cell-size ratio) and a
 schedule are the natural next levers if phase B supports the premise.
 
@@ -1032,19 +1109,21 @@ below): 2 ranks
 about 170 (B300 class only); 4 ranks about 104 (B200: fits; RTX PRO 6000: no);
 8 ranks about 71 to 77 (RTX PRO 6000: fits; B200: fits); 16 ranks about 54. Selection
 fraction matters here: at 30%, 8 ranks is about 102 (91 with resharding) and 4x B200
-about 130. The
+about 130; stage 7 measured 89.7 reserved at 30.2% on 8 ranks with resharding
+(20 steps over every row; the 3-step requirement run saw 83.6). The
 local 2x RTX PRO 6000 host still cannot train the full model (about 170 at 2
 ranks); it gains a 15 to 20 layer proxy.
 
 Not in scope: uneven shards by per-layer `top_p`; MXFP4 compute for selected
 experts; selection scoring changes beyond the per-rank quota.
 
-### Stage 7: full model (planned)
+### Stage 7: full model (in progress)
 
 Container from the gate-passing venv lockfile with a verifier script run first.
 Routing scores over the training data on the training host, then selection, then
-one update, bounded convergence run, export, fresh-process equality, Transformers
-and vLLM probes on hardware that serves the source. Memory plan with the
+the requirement run (at least 3 steps), bounded convergence run, export,
+fresh-process equality, Transformers and vLLM probes on hardware that serves the
+source. Steps through the requirement run are complete (below). Memory plan with the
 expert-parallel group spanning the world and ESFT-style selection (Handoff 5):
 each rank owns its share of every layer's experts outside FSDP as dequantized
 BF16: 43 layers of 6,442,450,944 elements, 516 GiB (the earlier 593 GB counted the
@@ -1074,6 +1153,186 @@ them once dense fits (phase C). Selection is the primary remedy: the task-routed
 experts flip at full dense speed (Handoff 5.3). Dense slowing is a tuning knob
 (Handoff 4). Production runs need more steps than a dense recipe, and the per-layer
 and per-expert flip fractions are the leading indicators to watch, not the loss.
+
+Completed on the training host (8x RTX PRO 6000, 755 GB RAM), in order:
+
+1. `deepseek.container.verify` printed `OK` on all 8 ranks (179 distributions
+   match the lockfile, both NeMo patches present, 48 shards, driver 595.104.02,
+   sm_120 native, NCCL all-reduce over 8 ranks).
+2. Recipe `deepseek/qat/full-train.yaml` (Layout). Update-in-backward needs one
+   microbatch per rank, so `global_batch_size` 8 at `local_batch_size` 1.
+3. Routing scores at 8 ranks under split storage with an all-packed bootstrap
+   selection (`split-bootstrap.json`: `ranks` 8, `selected: []` on every layer),
+   so the load dequantizes nothing: setup 18 s, forward 100 s, about 21 GiB per
+   GPU; two passes reproduced identical `token_scores`. The 415,898 routed tokens
+   are the first 136 training rows: the loader drops 142 mod 8 rows. Token share
+   captured by the N highest-scoring experts of each rank's range, mean over the
+   40 scored layers: N 4 / 6 / 8 / 12 / 16 captures 48 / 59 / 67.5 / 80 / 88.5%.
+   Concentration grows with depth: `top_p` 0.5 needs 43 experts at layer 3 and
+   17 to 27 at layers 36 to 40. Hash layers 0 to 2 capture 40% at 8 per rank
+   against 25% uniform. Zero-slot experts: 27:13, 40:170, 41:33 and 71.
+   Selection (`route-scores-full.json`, `--per-rank 8 --hash-per-rank 32`): 64
+   per scored layer, all 256 on each hash layer, 3,328 experts, 30.2%. The
+   first run used the larger hash-all variant so that one measurement bounds
+   both hash policies; the hash policy itself remains a quality decision.
+4. Requirement run (`full-stage7-first.json`, `--in-backward`, 3 steps at 1e-4,
+   no export): `ok` on every rank, 972 frozen parameters and 45 buffers unchanged,
+   no unselected expert changed, 430 trainable parameters. Memory, GiB per rank:
+   resident after step 54.5 (selected experts 19.5, 8-bit state 21.1, frozen
+   shard 12.5, dense shard 1.3); peak allocated 62.5 / 77.5 / 74.2 by step;
+   hook-entry peak 68.8; transient 22.9; reserved 83.6 after steps 2 and 3.
+   The first step understates the steady-state peak by 15, so a requirement
+   run needs at least 3 steps. Time: setup 233 s; steps 56 / 29 / 28 s; the
+   end validation with flip accounting 400 s; report phase about 800 s; 26
+   minutes total. Host RAM was not measured. Losses 0.761, 0.948, 1.069 on
+   different rows; gradient norms 2.60, 1.61, 2.06 with clip coefficients 0.38,
+   0.62, 0.48; held-out 0.559 at baseline, 0.585 after 3 steps (measurement
+   only; the dataset decision, Handoff 6 item 4, is open). Dense values changed
+   15.9% (900.9M of 5.68B) with 11,616 dense scale changes; expert values
+   changed 10 of 83.75B, as expected before step 30 (stage 5).
+5. Run 1 (`full-stage7-run1.log`, 100 steps at 1e-4 with 10 warmup steps,
+   validation every 20, `--export`): killed at step 25 as a failed test. Held-out
+   0.559 at baseline, 0.592 at step 16 (epoch end; NeMo also validates there),
+   0.629 at step 19, while training loss fell to 0.33 to 0.39 on the second pass
+   over the rows: memorization with damage. The export never started. The data
+   cannot be the sole cause, since held-out rows of the same file got worse.
+6. Rate arm (`full-stage7-lr1e-5.json`, 20 steps at 1e-5 with 5 warmup steps,
+   validation every 10, no export): held-out 0.559, 0.495 (step 9), 0.493
+   (step 16), 0.486 (step 19); dense values changed 2.8 / 4.4 / 4.7% with 2,555 /
+   3,936 / 4,420 scale changes; expert values changed 0; clip coefficient 0.35 to
+   1.0; integrity clean. Memory over every row: peak allocated 79.8, reserved
+   89.7 (the requirement figures above). Time 45 minutes. Reading: the rate was
+   the cause of run 1. At 1e-5 the FP8 flips are directed by the data and held-out
+   falls 13%; at 1e-4 Adam's early updates move every dense element about one
+   rate per step, past the half-cell of most FP8 values within a few steps, and
+   the re-rounding is noise on a converged model. The proxy could not see this
+   because at a baseline loss of 16 every change helped, so no rate derived there
+   transfers. At 1e-5 no expert value changed in 20 steps (FP4 half-cells are
+   about four times FP8's; the proxy saw none in 100 steps at this rate), so the
+   per-class rate (Handoff 6 item 2) is the next arm: dense at 1e-5, experts at
+   1e-4 through `lr_mult` 10. Experts were not what damaged run 1 (10 expert
+   values changed by step 3).
+7. Per-class arm (`full-stage7-perclass10-progress.jsonl` and `.log`; killed, so
+   no report, dense 1e-5, experts 1e-4 via
+   `lr_mult` 10, 100 steps, warmup 10, validation every 5, export every
+   validation with `--keep-exports 1`). Two earlier launches of this arm were
+   killed: one at step 67 because its flip counts were invisible until the end
+   (the design flaw below), one at step 25 for disk (a 156 GB export every
+   validation with `--keep-exports 3`). Live rows of the final launch: held-out
+   0.559 → 0.511 (9) → 0.494 (14) → 0.499 (16) → 0.494 (19) → 0.479 (24) →
+   0.471 (29) → 0.470 (33) → 0.470 (34), flat from step 33; dense values
+   changed 1.7% (9), 4.3% (19), 5.3% (29), 6.3% (39); expert values changed
+   first at step 9 in one layer, 0.000023% at 19 in all 43 layers, 0.00112% at
+   29, 0.0116% at 34, 0.056% at 39 and accelerating; expert drift 1.6e-4 (9),
+   3.4e-4 (19), 6.2e-4 (39) against the 3.9e-3 median half-cell, with sign
+   consistency 0.89 → 0.79 → 0.73; dense consistency 0.98 → 0.81. Reading:
+   dense finished fitting the file before the experts began to publish, so dense
+   at 1e-5 is one to two orders too fast relative to experts at 1e-4, and dense
+   needs a selection of its own (Decisions, trainable set). Killed at step 81:
+   held-out 0.507 (59), 0.555 (69), 0.625 (79) with training loss 0.05 on the
+   memorized rows; expert values changed 0.44% of all routed experts at step 79
+   (1.46% of the selected set), consistency 0.60; dense 8.6% of its trained
+   set. The `step-79` export was discarded with the training host, unverified;
+   its probe logits were never pulled back.
+
+   Instrumentation built during this run, after a design flaw: every mid-run
+   measurement (flip totals at each validation, per-step memory, clip
+   coefficients) lived in memory until the final report, so a killed run lost
+   it and the plan's leading indicator was not watchable; the validation-time
+   flip accounting also cost 7 minutes per validation on the host. Fixes:
+   `deepseek/qat/flips.py` compares every forward's fake quantization against
+   pinned baselines on the device, so flip fractions exist every step at no
+   measurable step cost (28 s before and after) and the host accounting is
+   gone; `deepseek/qat/progress.py` prints one table row per step (loss, epoch
+   mean, held-out with Δprev/Δbase, dense% and expert% changed, layers with
+   expert changes, sampled master drift and sign consistency per class, per-class
+   gradient norms, seconds) and an `eval step N` line per validation; with
+   `--out`, every record also goes to `<out stem>-progress.jsonl`; `--export`
+   publishes `DIR/step-N` at every validation with `DIR/latest`, keeping the
+   newest `--keep-exports` (default 3), unchanged shards hard-linked to the
+   source (non-weight files copied, so an edit in an export cannot reach the
+   source). At this selection 43 of 48 shards carry replacements, so an export is
+   156 GB and hard-linking saves little; several kept exports need a
+   replaced-tensors-only format (Pending). NeMo's tqdm bar glues lines to its
+   carriage returns; launches set `TQDM_DISABLE=1`.
+
+8. Attention-only arm (`full-stage7-attn-progress.jsonl` and `.log`; killed, so no
+   report; recipe `full-attn.yaml`: run 7
+   with the shared experts frozen, the only change; `--dense-tensors attention`;
+   100 steps, validation every 5, warmup 10, export every validation). From this
+   run on, the table's `dense%` and `expert%` are fractions of the class's total
+   values in the model, trained or not (dense 5.68B, routed experts 277.0B),
+   so runs with different trainable sets compare; `flips.py` reports them as
+   `{dense,expert}_class_elements` beside the trained-set `_value_elements`.
+   Run 7's expert fractions convert by 0.302. Killed at step 8: freezing the
+   shared experts removes 19% of dense values (attention projections are 4.60B
+   of 5.68B), and the attention tensors flipped at run 7's rate (`dense%` 0.347
+   at step 4 against run 7's 0.442 on the same denominator), so role selection
+   cannot move the dense turn far.
+9. Consistency probe (`full-stage7-probe.json`, `full-train.yaml` at run 7's
+   rates, 20 steps, warmup 5, no export; every dense tensor's shard sampled by
+   the stepper, per-tensor drift and update-sign consistency in the report's
+   `drift_by_tensor` and in the progress file every step). Held-out 0.488 at
+   step 19. Consistency over 20 steps is 0.841 to 0.945 across the 344 dense
+   tensors, median 0.898, roles within 0.02 of each other (shared experts
+   0.886 to 0.889, attention 0.896 to 0.910), layers 11 to 21 highest (0.914)
+   and 33 to 42 lowest (0.886); expert samples 0.73 to 0.79. On 136 rows every
+   tensor's updates point the same way through the first epoch, so this
+   statistic does not separate tensors that generalize from tensors that
+   memorize; it is not the selection criterion.
+
+Pending, in order (each a separate decision):
+
+1. Dense value selection, the priority (Decisions, trainable set): the unit of
+   selection (whole tensors and roles are closed; a finer unit inside tensors is
+   to be decided) and the scoring statistic measured on the base model over the
+   training rows, the dense analogue of `route_scores`, producing a selection
+   file that drives the stepper and the integrity check as the expert selection
+   does. Closed: role (run 8) and ranking whole tensors by 20-step update-sign
+   consistency (run 9: 0.84 to 0.95 across all 344 tensors). The selected
+   fraction is an outcome to measure, not a target. SPEC §4 follows the decision.
+2. `ood` evaluation: a second validation set (`validation_ood`, any `messages`
+   rows read by the data bridge) scored at every validation, shown as `ood` and
+   `Δbase` columns and on the eval line, in the progress file and report. Rows
+   from the operator: the source model's own outputs via `trlx replay-build
+   --endpoint` on an endpoint serving it, or a general-domain sample. Same-
+   distribution held-out cannot see dense drifting from pretrained behavior;
+   this can, and it sets the dense budget (Handoff 6 item 5).
+3. Run launcher CLI: one console entry replacing the torchrun line, with named
+   options for rates, expert multiplier, steps, validation interval, warmup,
+   export and retention, selection file; a run directory holding report, log,
+   progress file, and exports; `TQDM_DISABLE` and the progress split built in;
+   `--set` kept for the rest.
+4. Publish CLI: `<run> [--step N | latest] --out DIR`: `verify_export` against
+   the source with that export's replaced list, the reload probe check against
+   its saved logits, staged publication (hard-linked shards where possible,
+   `--force`), `verify.json` beside it. No weights change; there is no merge.
+5. Export format for several kept checkpoints: replaced tensors only, assembled
+   into a complete tree on publish.
+
+Commands (training host, from the repository root, `nohup` from a plain terminal;
+a clean progress file for watching comes from `tee` and a filter, see run 6):
+
+```sh
+deepseek/venv/bin/torchrun --nproc-per-node 8 -m deepseek.container.verify
+# all-packed bootstrap: {"ranks": 8, "n_routed_experts": 256, "per_rank": 0,
+#   "layers": {"0": {"selected": []}, ..., "42": {"selected": []}}}
+deepseek/venv/bin/torchrun --nproc-per-node 8 -m deepseek.qat.route_scores \
+    --config deepseek/qat/full-train.yaml --per-rank 8 --hash-per-rank 32 \
+    --set model.expert_split.scores=deepseek/exports/logs/split-bootstrap.json \
+    --out deepseek/exports/logs/route-scores-full.json
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 8 \
+    -m deepseek.qat.proxy_step --config deepseek/qat/full-train.yaml --in-backward \
+    --set step_scheduler.max_steps=3 --out deepseek/exports/logs/full-stage7-first.json
+# run 6, the rate arm; run 1 was the same with lr 1e-4, 100 steps, warmup 10, val 20, --export
+PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 8 \
+    -m deepseek.qat.proxy_step --config deepseek/qat/full-train.yaml --in-backward \
+    --set optimizer.lr=1e-5 --set step_scheduler.max_steps=20 --set step_scheduler.val_every_steps=10 \
+    --set lr_scheduler.lr_warmup_steps=5 --out deepseek/exports/logs/full-stage7-lr1e-5.json 2>&1 \
+    | tee deepseek/exports/logs/full-stage7-lr1e-5.log \
+    | stdbuf -oL tr '\r' '\n' | grep --line-buffered -oE "(step [0-9]+ \| .*|\[val\] .*|Traceback.*|.*out of memory.*)" \
+    > deepseek/exports/logs/full-stage7-lr1e-5.progress
+```
 
 ## Verified facts
 
@@ -1148,7 +1407,23 @@ and per-expert flip fractions are the leading indicators to watch, not the loss.
   consistent drift; it does not change what experts can learn.
 - First-step peak memory understates steady state: optimizer state allocated
   progressively during a first backward is fully resident before every later one.
-  Measured in Handoff 2: 9 to 14 GiB at two layers.
+  Measured in Handoff 2: 9 to 14 GiB at two layers; stage 7: 15 GiB on the full
+  model at 8 ranks (62.5 against 77.5), and 20 steps over every row reached 79.8.
+- Dense FP8 values are 5.68B: attention projections 4.60B (81%; `wq_b`, `wo_a`,
+  `wo_b` 33.5M each per layer, `wq_a` 4.2M, `wkv` 2.1M), shared experts 1.08B
+  (three 8.4M tensors per layer), indexer `wq_b` 0.18B (frozen). Routed experts
+  are 277.0B over the 43 backbone layers (296.4B with the three MTP modules).
+- Update-sign consistency over the first 20 steps on `data/engineering.jsonl`
+  is 0.84 to 0.95 for every dense tensor and 0.73 to 0.79 for sampled experts;
+  it reflects one consistent epoch over 136 rows, not which tensors generalize.
+- The learning rate does not transfer from the proxy to the full model. On the
+  full model (held-out baseline 0.559) 1e-4 re-rounds 15.9% of dense FP8 values
+  in 3 steps and degrades held-out within one epoch; 1e-5 changes 4.7% in 20
+  steps and improves held-out by 13%. Adam's early update is about one rate per
+  element regardless of gradient size, so the rate against the half-cell
+  distribution sets whether flips are directed or noise; the proxy's baseline
+  loss of 16 hid this because every change helped. Zero expert values changed in
+  20 steps at 1e-5.
 - NeMo `param_group_overrides` only stores `lr_mult` on a group; the multiplier is
   applied by `OptimizerParamScheduler.step`, so it is inert without an
   `lr_scheduler` block. The scheduler calls `step(0)` at build and `step(1)` after

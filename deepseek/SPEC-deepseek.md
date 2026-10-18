@@ -148,17 +148,25 @@ holdout is the last N rows in file order.
 
 ## 9. Artifacts
 
-A training run (`deepseek.qat.proxy_step`) writes its report to `--out`; with
-`--export DIR` it also writes probe logits to `<out stem>-logits-rank{r}.pt`, the
-replaced tensor names to `<out stem>-replaced.txt`, and the checkpoint to `DIR`.
-Reports live in `deepseek/exports/logs/`, exports in `deepseek/exports/`. Exports
-are regenerable and may be deleted.
+A training run (`deepseek.qat.proxy_step`) reports every step and every
+validation live on rank 0's stderr: loss, gradient norm, clip coefficient, rates,
+memory; held-out loss with the dense and expert values and scales changed and the
+layers whose selected experts changed. With `--out` it writes its report there
+and every live record to `<out stem>-progress.jsonl` as it is taken, so a killed
+run keeps its measurements. With `--export DIR` it publishes a checkpoint at every
+validation and at completion under `DIR/step-N`, `DIR/latest` pointing at the
+newest, keeping the newest `--keep-exports` (default 3); each export's probe
+logits are `<out stem>-step{N}-logits-rank{r}.pt` and its replaced tensor names
+`<out stem>-step{N}-replaced.txt`. Reports live in `deepseek/exports/logs/`,
+exports in `deepseek/exports/`. Exports are regenerable and may be deleted.
 
 ## 10. Export and verification
 
 - `deepseek/qat/export.py` writes every shard with its header copied verbatim.
   A replaced payload must match the source entry's shape, dtype, and byte count.
-  Every other payload and every non-weight file is copied byte for byte.
+  Shards without a replacement are hard links to the source's files when the
+  destination shares its filesystem, otherwise byte copies; non-weight files are
+  always byte copies, so an edit inside an export never reaches the source.
 - `deepseek/qat/proxy_export.py` quantizes every trained target with the
   training quantizers (section 3), gathers expert codes and scales to rank 0 over the expert
   mesh, materializes dense tensors in full, and replaces only tensors whose
@@ -178,9 +186,10 @@ are regenerable and may be deleted.
 ## 11. Failure and cancellation
 
 Export is staged and publishes only a complete tree; replacing an existing
-destination requires `--force`. An export error is recorded in the report and
-fails the run without raising, so every rank reaches the final collective. A
-failed run publishes nothing.
+destination requires `--force`. A failed export at a validation stops the run on
+every rank; a failed completion export is recorded in the report and fails the
+run without raising, so every rank reaches the final collective. A failed export
+publishes nothing.
 
 ## 12. Dependencies and versions
 

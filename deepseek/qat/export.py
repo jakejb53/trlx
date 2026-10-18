@@ -4,8 +4,14 @@ A DeepSeek-V4-Flash export must be indistinguishable from the released
 checkpoint except for the payloads of trained tensors. Every replacement keeps
 its source tensor's name, shape, dtype and byte size, so every shard's header
 bytes, tensor order and offsets are copied verbatim from the source; only the
-replaced payload ranges are overwritten. Non-weight files (config, tokenizer,
-encoding and inference resources, index) are copied byte for byte.
+replaced payload ranges are overwritten. Shards with no replacement are
+hard-linked to the source's files when both live on one filesystem, and copied
+byte for byte otherwise; either way the bytes are the source's, and linking
+makes an export cost only its replaced shards, so a run can publish one at
+every validation and keep several. Non-weight files (config, tokenizer,
+encoding and inference resources, index) are always copied: a hard link would
+make an edit inside the export, such as a serving config change, silently edit
+the source.
 
 Replacements map a tensor name to a tensor whose storage dtype and byte count
 match the source entry; shape is compared on the logical shape recorded in the
@@ -18,6 +24,7 @@ every shard is written and verified, following the repository's publication
 policy; an existing destination needs ``force``.
 """
 
+import errno
 import json
 import os
 import shutil
@@ -71,6 +78,22 @@ def _check_replacement(name: str, meta: dict, tensor: torch.Tensor) -> torch.Ten
     if tensor.numel() * tensor.element_size() != end - start:
         raise ExportError(f"{name}: replacement is {tensor.numel() * tensor.element_size()} bytes, checkpoint entry is {end - start}")
     return tensor
+
+
+# Publish an unchanged file: a hard link to the source's real file (the HF cache
+# stores snapshot entries as symlinks into its blob store, so the link targets
+# the blob), or a byte copy when the destination is on another filesystem.
+# Returns "linked" or "copied" for the export's summary.
+def _link_or_copy(src: str, dst: str) -> str:
+    real = os.path.realpath(src)
+    try:
+        os.link(real, dst)
+        return "linked"
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.copyfile(real, dst)
+        return "copied"
 
 
 # Copy `length` bytes between open files in bounded chunks.
@@ -142,12 +165,23 @@ def export(snapshot: str, out_dir: str, replacements: dict[str, torch.Tensor], f
     os.makedirs(staging)
     start = time.monotonic()
     result: dict[str, list[str]] = {}
+    unchanged = {"linked": 0, "copied": 0}
+
+    def publish_unchanged(src: str, dst: str) -> None:
+        unchanged[_link_or_copy(src, dst)] += 1
+
     try:
         entries = sorted(os.listdir(snapshot))
         shards = [e for e in entries if e.endswith(".safetensors")]
         for i, shard in enumerate(shards, 1):
-            print(f"shard {i}/{len(shards)} {shard} ({len(by_shard.get(shard, {}))} replaced)", file=log, flush=True)
-            result[shard] = write_shard(os.path.join(snapshot, shard), os.path.join(staging, shard), by_shard.get(shard, {}))
+            reps = by_shard.get(shard, {})
+            if not reps:
+                # No payload changes: the shard is the source's, byte for byte.
+                publish_unchanged(os.path.join(snapshot, shard), os.path.join(staging, shard))
+                result[shard] = []
+                continue
+            print(f"shard {i}/{len(shards)} {shard} ({len(reps)} replaced)", file=log, flush=True)
+            result[shard] = write_shard(os.path.join(snapshot, shard), os.path.join(staging, shard), reps)
         for entry in entries:
             if entry.endswith(".safetensors"):
                 continue
@@ -169,5 +203,6 @@ def export(snapshot: str, out_dir: str, replacements: dict[str, torch.Tensor], f
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    print(f"exported to {out_dir} in {time.monotonic() - start:.0f}s", file=log, flush=True)
+    print(f"exported to {out_dir} in {time.monotonic() - start:.0f}s: {sum(1 for v in result.values() if v)} shards written, "
+          f"{unchanged['linked']} unchanged shards hard-linked, {unchanged['copied']} copied", file=log, flush=True)
     return result

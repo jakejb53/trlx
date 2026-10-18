@@ -46,14 +46,30 @@ def quantize_fp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return Q.quantize_fp4_rows(w, scale_rule=FP4_SCALE_RULE)
 
 
+# Observer of the quantizer's output during one tensor's fake quantization: set
+# by `observed()` so flip accounting (deepseek.qat.flips) can read the codes,
+# scales, and float32 values the forward is built from instead of recomputing
+# them. Called once for an FP8 tensor with position None, and once per expert
+# chunk and half for FP4 with position (first expert, expert count, half: 0 for
+# w1, 1 for w3, None for w2); FP4 rows are HF [experts x out, in] order. None
+# when nothing is counting.
+_observer = None
+
+
 def _fp8_dequant_quant(w: torch.Tensor) -> torch.Tensor:
     codes, scales = Q.quantize_fp8_blocks(w)
-    return Q.dequantize_fp8_blocks(codes, scales).to(w.dtype)
+    values = Q.dequantize_fp8_blocks(codes, scales)
+    if _observer is not None:
+        _observer("fp8", None, codes, scales, values)
+    return values.to(w.dtype)
 
 
-def _fp4_dequant_quant(w: torch.Tensor) -> torch.Tensor:
+def _fp4_dequant_quant(w: torch.Tensor, pos: tuple | None = None) -> torch.Tensor:
     packed, scales = quantize_fp4(w)
-    return Q.dequantize_fp4_rows(packed, scales).to(w.dtype)
+    values = Q.dequantize_fp4_rows(packed, scales)
+    if _observer is not None:
+        _observer("fp4", pos, packed, scales, values)
+    return values.to(w.dtype)
 
 
 # [E, dim, 2*inter] -> fake-quantize each expert's w1 and w3 in HF [inter, dim]
@@ -65,9 +81,9 @@ def fake_quant_gate_up(w: torch.Tensor) -> torch.Tensor:
     for start in range(0, e, EXPERT_CHUNK):
         chunk = w[start : start + EXPERT_CHUNK]
         n = chunk.shape[0]
-        for lo, hi in ((0, inter), (inter, two_inter)):
+        for half, (lo, hi) in enumerate(((0, inter), (inter, two_inter))):
             hf = chunk[:, :, lo:hi].transpose(1, 2).reshape(n * inter, dim)
-            out[start : start + n, :, lo:hi] = _fp4_dequant_quant(hf).reshape(n, inter, dim).transpose(1, 2)
+            out[start : start + n, :, lo:hi] = _fp4_dequant_quant(hf, (start, n, half)).reshape(n, inter, dim).transpose(1, 2)
     return out
 
 
@@ -79,7 +95,7 @@ def fake_quant_down(w: torch.Tensor) -> torch.Tensor:
         chunk = w[start : start + EXPERT_CHUNK]
         n = chunk.shape[0]
         hf = chunk.transpose(1, 2).reshape(n * dim, inter)
-        out[start : start + n] = _fp4_dequant_quant(hf).reshape(n, dim, inter).transpose(1, 2)
+        out[start : start + n] = _fp4_dequant_quant(hf, (start, n, None)).reshape(n, dim, inter).transpose(1, 2)
     return out
 
 
@@ -112,6 +128,17 @@ def fake_quant(w: torch.Tensor, kind: str) -> torch.Tensor:
     return FakeQuant.apply(w, kind)
 
 
+def observed(w: torch.Tensor, kind: str, observer) -> torch.Tensor:
+    """fake_quant with `observer` receiving the quantizer's output for this tensor (None: no observer)."""
+    global _observer
+    previous = _observer
+    _observer = observer
+    try:
+        return fake_quant(w, kind)
+    finally:
+        _observer = previous
+
+
 @dataclass
 class Target:
     name: str  # module path within the model
@@ -123,6 +150,9 @@ class Target:
 class FakeQuantState:
     targets: list[Target]
     originals: dict[str, object] = field(default_factory=dict)
+    # Observer factory, (target name, attribute, kind) -> per-tensor observer or
+    # None, consulted on every forward; set by flip accounting, None otherwise.
+    observer: object = None
 
 
 # Trained-tensor targets of a DeepSeek-V4 model, by layer, verified against the
@@ -171,8 +201,11 @@ def install(model: nn.Module) -> FakeQuantState:
         original = t.module.forward
         state.originals[t.name] = original
 
-        def wrapped(*args, _module=t.module, _params=t.params, _orig=original, **kwargs):
-            swapped = {attr: fake_quant(getattr(_module, attr), kind) for attr, kind in _params.items()}
+        def wrapped(*args, _name=t.name, _module=t.module, _params=t.params, _orig=original, **kwargs):
+            swapped = {}
+            for attr, kind in _params.items():
+                observer = state.observer(_name, attr, kind) if state.observer is not None else None
+                swapped[attr] = observed(getattr(_module, attr), kind, observer)
             with _reparametrize_module(_module, swapped):
                 return _orig(*args, **kwargs)
 

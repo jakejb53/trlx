@@ -10,9 +10,11 @@ selection: with ``--top-p``, experts taken in descending score until the
 cumulative score reaches ``top_p``; with ``--per-rank N``, the N highest-scoring
 experts inside each expert-parallel rank's contiguous expert range, in every
 layer, so split expert storage (stage 6b) gets even shards; the report records
-the rank count. The selection is the trainable set for ESFT-style training; the
-coverage says whether selection concentrates signal on this data or only saves
-memory.
+the rank count. ``--hash-per-rank M`` gives the hash-routing layers their own
+quota (0 freezes them, the per-rank total trains all of them: share does not
+predict their flips, Handoff 5.4), default the ``--per-rank`` value. The
+selection is the trainable set for ESFT-style training; the coverage says
+whether selection concentrates signal on this data or only saves memory.
 
 The forward is the recipe's own validation epoch over the train dataloader, so
 batch handling and eval mode are NeMo's; the hook reads ``token_mask`` from the
@@ -105,13 +107,14 @@ def select(score: list[float], top_p: float) -> list[int]:
 # Even-shard selection for split expert storage (stage 6b): the n highest-scoring
 # experts inside each rank's contiguous range [r*E/R, (r+1)*E/R), ties to the
 # lower index, so every expert-parallel rank holds the same count per layer.
+# n = 0 is a layer with no trained experts (every expert stays packed).
 def select_per_rank(score: list[float], n: int, ranks: int) -> list[int]:
     e = len(score)
     if ranks < 1 or e % ranks:
         raise ValueError(f"{e} experts do not divide over {ranks} ranks")
     per_rank = e // ranks
-    if not (1 <= n <= per_rank):
-        raise ValueError(f"per-rank count must be in [1, {per_rank}], got {n}")
+    if not (0 <= n <= per_rank):
+        raise ValueError(f"per-rank count must be in [0, {per_rank}], got {n}")
     chosen = []
     for r in range(ranks):
         lo = r * per_rank
@@ -149,6 +152,9 @@ def main(argv=None) -> int:
     parser.add_argument("--per-rank", type=int, default=None, metavar="N",
                         help="select the N highest-scoring experts of each rank's expert range in every layer (even shards for "
                              "split expert storage); the report records the rank count")
+    parser.add_argument("--hash-per-rank", type=int, default=None, metavar="M",
+                        help="per-rank count for the hash-routing layers only (0 to the per-rank total; default: the --per-rank "
+                             "value); requires --per-rank")
     parser.add_argument("--score-function", choices=("token", "gate"), default="token",
                         help="which ESFT score the selection uses (default: token, the share of routed slots)")
     add_override_arguments(parser)
@@ -159,6 +165,12 @@ def main(argv=None) -> int:
         parser.error(f"--top-p must be in (0, 1], got {args.top_p}")
     if args.per_rank is not None and args.per_rank < 1:
         parser.error(f"--per-rank must be a positive integer, got {args.per_rank}")
+    if args.hash_per_rank is not None:
+        if args.per_rank is None:
+            parser.error("--hash-per-rank requires --per-rank")
+        if args.hash_per_rank < 0:
+            parser.error(f"--hash-per-rank must be a nonnegative integer, got {args.hash_per_rank}")
+    hash_per_rank = args.hash_per_rank if args.hash_per_rank is not None else args.per_rank
 
     from nemo_automodel.components.config.loader import load_yaml_config
     from nemo_automodel.recipes.llm.train_ft import TrainFinetuneRecipeForNextTokenPrediction
@@ -216,12 +228,16 @@ def main(argv=None) -> int:
         "topk": topk,
         "top_p": args.top_p,
         "per_rank": args.per_rank,
+        "hash_per_rank": hash_per_rank,
         "ranks": ranks,
         "score_function": args.score_function,
         "hash_routing_layers": hash_layers,
         "setup_seconds": round(t1 - t0, 1),
         "forward_seconds": round(time.monotonic() - t1, 1),
-        "layers": {str(i): summarize_layer(c, g, topk, args.score_function, top_p=args.top_p, per_rank=args.per_rank, ranks=ranks)
+        # Hash-routing layers take their own per-rank quota; top_p applies alike.
+        "layers": {str(i): summarize_layer(c, g, topk, args.score_function, top_p=args.top_p,
+                                           per_rank=None if args.top_p is not None else (hash_per_rank if i in hash_layers else args.per_rank),
+                                           ranks=ranks)
                    for i, (c, g) in sorted(totals.items())},
     }
     report["selected_total"] = sum(len(v["selected"]) for v in report["layers"].values())
@@ -234,7 +250,8 @@ def main(argv=None) -> int:
                   f"selected {len(v['selected'])}", file=sys.stderr, flush=True)
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=1)
-        rule = f"top_p {args.top_p}" if args.top_p is not None else f"{args.per_rank} per rank over {ranks} ranks"
+        rule = (f"top_p {args.top_p}" if args.top_p is not None
+                else f"{args.per_rank} per rank over {ranks} ranks, hash layers {hash_per_rank}")
         print(f"wrote {args.out} ({report['selected_total']} experts selected at {rule})", file=sys.stderr, flush=True)
     if dist.is_initialized():
         dist.barrier()

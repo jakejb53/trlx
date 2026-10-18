@@ -12,7 +12,10 @@ import torch
 
 from deepseek.qat import fakequant as FQ
 from deepseek.qat import quant as Q
-from deepseek.qat.proxy_step import entry_value_changes, expert_breakdown, load_selection, load_shares, per_expert, quantized_state, value_changes
+from deepseek.qat.proxy_step import (
+    entry_value_changes, expert_breakdown, load_selection, load_shares, per_expert, point_latest, quantized_state,
+    retain_exports, step_exports, value_changes,
+)
 
 
 def _fp4_state(w: torch.Tensor):
@@ -157,3 +160,22 @@ class ExpertReporting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExportRetention(unittest.TestCase):
+    def test_retention_keeps_newest_and_latest_points_at_them(self):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as root:
+            for step in (16, 19, 33, 39, 50):
+                os.makedirs(os.path.join(root, f"step-{step}"))
+            os.makedirs(os.path.join(root, "step-99.staging"))  # a leftover, not an export
+            point_latest(root, "step-50")
+            self.assertEqual([n for _, n in step_exports(root)], ["step-16", "step-19", "step-33", "step-39", "step-50"])
+            self.assertEqual(retain_exports(root, 3), ["step-16", "step-19"])
+            self.assertEqual([n for _, n in step_exports(root)], ["step-33", "step-39", "step-50"])
+            self.assertTrue(os.path.isdir(os.path.join(root, "step-99.staging")))
+            self.assertEqual(os.readlink(os.path.join(root, "latest")), "step-50")
+            point_latest(root, "step-39")
+            self.assertEqual(os.readlink(os.path.join(root, "latest")), "step-39")
+            self.assertEqual(retain_exports(root, 5), [])
+            with self.assertRaises(ValueError):
+                retain_exports(root, 0)

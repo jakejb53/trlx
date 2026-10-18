@@ -86,6 +86,23 @@ class Exporter(unittest.TestCase):
             verify_export.file_digest(os.path.join(self.out, "model-00002-of-00002.safetensors")),
         )
 
+    def test_unchanged_shards_are_hard_links_and_other_files_are_copies(self):
+        # Shard 1 carries the replacement and is a new file; shard 2 shares the
+        # source's inode (same filesystem in the test); non-weight files are
+        # copies so an edit inside the export cannot reach the source.
+        new = torch.randn(128, 128).to(torch.float8_e4m3fn)
+        export.export(self.src, self.out, {"layers.0.attn.wq.weight": new}, log=io.StringIO())
+        same = lambda rel: os.stat(os.path.join(self.src, rel)).st_ino == os.stat(os.path.join(self.out, rel)).st_ino
+        self.assertFalse(same("model-00001-of-00002.safetensors"))
+        self.assertTrue(same("model-00002-of-00002.safetensors"))
+        self.assertFalse(same("config.json"))
+        self.assertFalse(same(os.path.join("encoding", "x.py")))
+        self.assertFalse(same("model.safetensors.index.json"))
+        # Replacing the export removes links only; the source is intact.
+        export.export(self.src, self.out, {}, force=True, log=io.StringIO())
+        code, text = _verify(self.src, self.out)
+        self.assertEqual(code, 0, text)
+
     def test_packed_fp4_uint8_accepted_for_i8_entry(self):
         packed = torch.randint(0, 256, (4, 16), dtype=torch.uint8)
         export.export(self.src, self.out, {"layers.0.ffn.experts.0.w1.weight": packed}, log=io.StringIO())
