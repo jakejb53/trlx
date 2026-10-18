@@ -31,7 +31,7 @@ rates, exports a verified checkpoint that reloads bit-identically, and peaks at
 44.4 GiB against 53.4. Next is Handoff 6 from item 3. The dataset, optimizer,
 trainable set, and mechanism are decided and verified below. Every command runs
 from the repository root
-`/home/goon/trl/trlx`. Launch GPU runs from a plain terminal with `nohup`: the
+`/home/$USER/trl/trlx`. Launch GPU runs from a plain terminal with `nohup`: the
 post-training report phase drives host memory low enough that an agent
 session's background-process reaper has killed a run.
 Rank 0 prints the full report to stdout, so a log redirect is a second copy of `--out`.
@@ -88,7 +88,8 @@ Reports are in `deepseek/exports/logs/`, named by stage (`proxy-stage2.log`,
 (Handoff 6 item 2), and `route-scores-perrank10.json` and `proxy-stage6b-*` (stage 6b).
 Exports: `deepseek/exports/identity/` and `one-tensor/` (stage 1),
 `stage6-experts/` and `stage6-sequential/` (stage 6), and `stage6b-split/`
-(stage 6b), 156 GB each; all can be deleted and regenerated.
+(stage 6b), 156 GB each; no check reads them any more, so delete them when
+space is wanted; all can be regenerated.
 
 Handoff items, in order:
 
@@ -244,7 +245,7 @@ Handoff items, in order:
    (`proxy-mem-2layer-inbackward-groups.json`). `--dense-every` remains as the
    frequency-split form; a class entering mid-run is outside this mechanism. The
    values of N and the warmup length are stage 7 tuning questions); the container from the
-   gate-passing lockfile; the dataset, where distance from policy is a condition
+   gate-passing lockfile (complete: Environment, Training host); the dataset, where distance from policy is a condition
    for the method and not only a quality choice: QAT publishes only drift that
    crossed a half-cell, directed drift needs the data to disagree with the model
    consistently, and a dataset built close to the model's own outputs may
@@ -288,13 +289,16 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   rank count (Handoff 2 measured the proxy; the full-model figure is the stage 7
   estimate until the first full-model run's `memory` block measures it; resident
   expert weights are 516 GiB of dequantized BF16 divided by the rank count); host
-  RAM for NeMo's dequantized load staging and the master sampling (unquantified for
-  the full model); no format-specific kernels. The stage 6b hardware estimate bounds
+  RAM for loading, export, and the master sampling (estimated under Environment,
+  measured by the first full-model run); no format-specific kernels. The stage 6b hardware estimate bounds
   the host search; the working target host is a separate decision below, and the
   first full-model run's `memory` block remains the requirement.
 - Development, unit tests, and the four-layer proxy gate run on the owned host
-  (Environment) in a venv. A container is built for the training host from the
-  lockfile of the venv that passed the gate and is not tested locally.
+  (Environment) in a venv. The training host runs a container image that mirrors
+  this host's OS and user and carries the environment built from the lockfile at
+  the tree's own path; the working tree and snapshot are synced and downloaded
+  into it (Environment, Training host). Tested locally on the same architecture
+  and on the first instance.
 - Engine: NeMo AutoModel 0.8.0, the source copy in `deepseek/automodel/` from
   https://github.com/nvidia-nemo/automodel. It supplies the model definition, FSDP2,
   expert parallelism, and grouped expert execution. It provides no weight fake-quant,
@@ -370,10 +374,17 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   export contract is unchanged, only shorter along dim 0.
 - The vendored NeMo copy may be patched and its module code adapted into
   `deepseek/qat`. Each patch is listed in the stage that introduces it.
-- Working target host: 4x B200 (NVLink, about 40% margin on the stage 6b estimate,
-  fits a 30% selection). 8x RTX PRO 6000 is the fallback (PCIe, about 25% margin
-  at 8% selection). The first full-model run's `memory` block remains the
-  requirement.
+- Working target host: 8x RTX PRO 6000 Blackwell (PCIe, 95.0 GiB per card as torch reports it, sm120
+  as the development host, so compiled libraries and the container are tested
+  here first). Reserved GiB per rank at 8 ranks from gate 3's components
+  (resident 20.5 + 112 x selection fraction, transient 38 or 27 with
+  `distributed.moe.reshard_after_forward: true`, 9 allocator overhead): 8% 77 / 66,
+  15% 85 / 74, 20% 90 / 79, 25% 96 / 85, 30% 102 / 91. The stage 7 recipe sets
+  resharding on; the selection ceiling is about 25% pending the live measurement.
+  Costs: PCIe carries the per-layer expert-parallel collectives and the dense
+  all-gather (step time, unquantified); host RAM is estimated under Environment;
+  `ep_size` 8 has not run. 4x B200 is the fallback. The first
+  full-model run's `memory` block remains the requirement.
 - Everything for this work lives under `deepseek/`. Git is managed by the operator.
 
 ## Layout
@@ -423,6 +434,10 @@ deepseek/
     proxy-4layer.yaml stage 2 recipe (mock token ids)
     proxy-train.yaml  training recipe: data bridge, freeze config, optimizer with the
                       experts parameter group (lr_mult), constant-rate scheduler with warmup
+  container/                                   image and host scripts (gitignored): Dockerfile (OS and user
+                                               mirror, venv built from the lockfile), onstart.sh (Vast.ai
+                                               on-start), verify.py (environment, tree, GPU, and NCCL check;
+                                               torchrun entry)
   tests/                                       unittest, run from the repo root
 ```
 
@@ -439,12 +454,60 @@ Snapshot path, used below as `$SNAP`:
 - Verified: both GPUs are compute capability 12.0 and in torch's arch list;
   matmuls run on both. torchao's C++ extensions are skipped on torch 2.10; its
   Triton paths work (the optimizer step compiles and runs).
-- Stages 0 and 1 also run under `/home/goon/trl/venv` (torch 2.13); either works.
+- Stages 0 and 1 also run under `/home/$USER/trl/venv` (torch 2.13); either works.
 - Host: 2x RTX PRO 6000 Blackwell (97,887 MiB each), driver 595.91, CUDA 13.3
   toolkit, 122 GB RAM, 48 cores, 1.4 TB free on the repo filesystem. Host RAM is the
   binding limit for check scripts that copy masters; see Handoff.
 - Launch training with `PYTORCH_ALLOC_CONF=expandable_segments:True`; the step
   peaked at 85 GB per GPU with 7 to 11 GB of allocator fragmentation without it.
+- Training host (Vast.ai, 8x RTX PRO 6000): the image built by
+  `deepseek/container/Dockerfile` mirrors this host's OS and user and carries
+  `deepseek/venv` built from the lockfile at the tree's own path (nothing in it
+  is compiled from source); the working tree and snapshot are synced and
+  downloaded into it. Build and push from the repository root:
+  `docker build -f deepseek/container/Dockerfile -t deepseek-qat deepseek/automodel`,
+  then `docker tag` and `docker push` under the registry path the template names.
+  Template: that image path, launch mode SSH, on-start script pasted from
+  `deepseek/container/onstart.sh` (propagates the account key to `$USER`,
+  disables Vast's auto-tmux, strips per-user entries from Vast's
+  `/etc/environment` dump, whose `HOME=/root` otherwise applies to every login
+  and makes Triton's cache unwritable, and on first boot moves the tree to
+  `/workspace/trl/trlx` with `/home/$USER/trl` a symlink to it), disk at least
+  11 + 167 + 2 x 167 GB (image, snapshot, one staged export). Vast starts sshd
+  and maps port 22; nothing else is set. Login `ssh -p PORT $USER@HOST`. Sync
+  the tree, about 300 MB (the image has the venv and NeMo, the download the
+  snapshot):
+
+  ```sh
+  rsync -a --info=progress2 -e "ssh -p PORT" --exclude runs --exclude deepseek/venv \
+      --exclude 'deepseek/models--*' --exclude 'deepseek/exports/stage*' --exclude 'deepseek/exports/logs/*.pt' \
+      --exclude deepseek/automodel --exclude authoring-work --exclude endpoint-responses --exclude contexts \
+      /home/$USER/trl/trlx/ $USER@HOST:/home/$USER/trl/trlx/
+  ```
+
+  Snapshot, from the repository root on the instance (huggingface_hub 1.33 puts
+  the blobs in `deepseek/blobs/` and links the snapshot directory into it; a
+  reverse rsync pulls `deepseek/exports/logs/` only):
+
+  ```sh
+  deepseek/venv/bin/hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
+      --revision 7872f01b1d1fe23eabc4c98b48bffcef5a386062 --cache-dir deepseek
+  ```
+
+  Then, before anything else, `deepseek/venv/bin/torchrun --nproc-per-node 8 -m
+  deepseek.container.verify` must print `OK` on every rank: it checks the venv
+  against the lockfile, NeMo and the patches in the tree, the snapshot, every
+  GPU's native target, and an NCCL all-reduce. First instance: driver
+  595.104.02, 755 GB RAM, `/dev/shm` 377 GiB, 184 CPUs, `/workspace` 580 GB with
+  418 GB free after the snapshot and tree (one staged export at a time). Local
+  use of the same image: `docker run --rm -it --gpus all --ipc=host --user
+  $(id -u):$(id -g) -v /home/$USER/trl/trlx:/home/$USER/trl/trlx -w
+  /home/$USER/trl/trlx deepseek-qat bash`, where the bind mount shadows the
+  image's venv with the identical host one.
+- Host RAM (estimate; the first full-model run measures it): loading streams,
+  4.1 GiB anonymous per rank measured on the split proxy, so 5 to 8 per rank;
+  export holds every replaced tensor on rank 0, about 45 GB at 25% selection;
+  128 GB is the floor and 256 GB comfortable.
 
 ## Stages
 
@@ -936,7 +999,7 @@ Gates, in order, each blocking the next:
 4. GPU, estimate (optional, unblocking): a 16-layer proxy memory run at 2 ranks
    (a 16-layer `--per-rank` selection first, both with
    `--set model.config.num_hidden_layers=16`), giving the 4x B200 column a
-   measured transient. Its only value is avoiding a wrong rental; the first live
+   measured transient. Its only value is avoiding a wrong host; the first live
    step measures the same thing.
 
 Gate commands (both GPUs, `nohup` from a plain terminal; `$SNAP` as above):
@@ -967,8 +1030,9 @@ the per-layer dequantization transient measured 7.9 at 118 packed experts per
 rank per layer in gate 3, so about 4 at 4 ranks and 2 at 8, inside the allowance
 below): 2 ranks
 about 170 (B300 class only); 4 ranks about 104 (B200: fits; RTX PRO 6000: no);
-8 ranks about 71 (RTX PRO 6000: fits; B200: fits); 16 ranks about 54. Selection
-fraction matters here: at 30%, 8 ranks is about 99 and 4x B200 about 130. The
+8 ranks about 71 to 77 (RTX PRO 6000: fits; B200: fits); 16 ranks about 54. Selection
+fraction matters here: at 30%, 8 ranks is about 102 (91 with resharding) and 4x B200
+about 130. The
 local 2x RTX PRO 6000 host still cannot train the full model (about 170 at 2
 ranks); it gains a 15 to 20 layer proxy.
 
@@ -1002,7 +1066,7 @@ peak allocated about 105 to 112 at eight ranks and 120 to 127 reserved, outside 
 96 GB GPU. Two levers: `distributed.moe.reshard_after_forward: true` removes most
 of the unsharded-dense term (about 95 to 101 allocated at eight ranks), and
 sixteen ranks give about 69 to 76 allocated (58 to 65 with resharding) and 80 to 87
-reserved, inside a 96 GB (89.4 GiB) GPU. The measured peak of the first full-model
+reserved, inside a 95.6 GiB RTX PRO 6000. The measured peak of the first full-model
 run is the per-GPU memory requirement and selects the host. The preparation
 decisions are listed in Handoff 6. Expert flips arrive tens of steps
 after dense changes at the same rate (stage 5), and a joint run at one rate starves

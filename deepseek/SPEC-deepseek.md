@@ -189,6 +189,13 @@ dependencies only (torch 2.10.0+cu130, transformers 5.18.0, torchao 0.18.0,
 NeMo editable); no `cuda` or `moe` extras. The optimizer's row restriction relies on torchao allocating
 optimizer state lazily on the first step; re-verify on any torchao upgrade.
 
+The training host runs a container image that mirrors the development host's OS
+and user and carries `deepseek/venv` built from this lockfile at the tree's own
+path; the working tree and snapshot are synced and downloaded into it.
+`deepseek.container.verify` must pass on every rank before any run: it checks the
+venv against the lockfile, NeMo and its patches in the tree, the snapshot, every
+GPU's native target, and an NCCL all-reduce.
+
 ## 13. Deferred extensions
 
 - Publication alternatives if expert QAT does not deliver, ranked in
@@ -204,7 +211,6 @@ weaken the preservation guarantees above.
 
 ## 14. Open decisions
 
-- The container for the training host.
 - The training dataset, and its distance from the model's own policy.
 - An evaluation on prompts outside the SFT distribution.
 - The expert score function (`token_scores` or `gate_scores`), and the thresholds
