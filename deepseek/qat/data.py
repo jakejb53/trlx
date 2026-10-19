@@ -80,18 +80,20 @@ def encode_row(row: dict, encoder, tokenizer) -> tuple[list[int], int]:
 
 
 class ReasoningChatDataset(Dataset):
-    """``split`` is ``train`` (all rows but the last ``holdout``) or ``holdout``."""
+    """``split`` is ``train`` (all rows but the last ``holdout``), ``holdout``, or
+    ``all`` (every row; ``holdout`` is ignored), the last for a separate evaluation
+    file such as the ``ood`` set."""
 
     def __init__(self, path: str, snapshot: str, tokenizer, max_tokens: int, split: str = "train", holdout: int = 16):
         rows = read_rows(path)
-        if holdout <= 0 or holdout >= len(rows):
-            raise ValueError(f"holdout must be in 1..{len(rows) - 1}, got {holdout}")
-        if split == "train":
-            rows = rows[:-holdout]
-        elif split == "holdout":
-            rows = rows[-holdout:]
-        else:
-            raise ValueError(f"split must be 'train' or 'holdout', got {split!r}")
+        if split not in ("train", "holdout", "all"):
+            raise ValueError(f"split must be 'train', 'holdout', or 'all', got {split!r}")
+        if split != "all":
+            if holdout <= 0 or holdout >= len(rows):
+                raise ValueError(f"holdout must be in 1..{len(rows) - 1}, got {holdout}")
+            rows = rows[:-holdout] if split == "train" else rows[-holdout:]
+        if not rows:
+            raise ValueError(f"{path}: no rows")
         encoder = load_encoder(snapshot)
         self.pad_id = tokenizer.pad_token_id
         self.eos_id = tokenizer.eos_token_id

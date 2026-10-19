@@ -71,7 +71,7 @@ deepseek/venv/bin/python -B -m unittest deepseek.tests.test_quant deepseek.tests
     deepseek.tests.test_fakequant deepseek.tests.test_data deepseek.tests.test_freeze \
     deepseek.tests.test_inbackward deepseek.tests.test_optim deepseek.tests.test_proxy_step \
     deepseek.tests.test_proxy_export deepseek.tests.test_route_scores deepseek.tests.test_split_experts \
-    deepseek.tests.test_flips deepseek.tests.test_progress
+    deepseek.tests.test_flips deepseek.tests.test_progress deepseek.tests.test_launch deepseek.tests.test_publish
 ```
 
 Reproduce the stage 3 one-step check (about 5 minutes, both GPUs):
@@ -543,7 +543,8 @@ deepseek/
     verify_export.py  shard/tensor/file diff of two checkpoints; --expect @FILE
     fakequant.py      straight-through fake-quant hooks on the NeMo model
     freeze.py         disables NeMo's router correction-bias update
-    data.py           reasoning-conversation dataset bridge (NeMo shifted format)
+    data.py           reasoning-conversation dataset bridge (NeMo shifted format); split
+                      train|holdout|all (all: a separate evaluation file such as ood)
     optim.py          torchao optimizer over local shards; FP32-master AdamW; step_param;
                       restrict_rows (per-row views for expert selection); NeMo parameter
                       groups with rate sync into torchao's tensor rates
@@ -567,10 +568,18 @@ deepseek/
                       resident accounting by class; with --out a progress JSONL beside
                       the report; --export DIR [--force] [--keep-exports K] publishes
                       DIR/step-N at every validation with DIR/latest, probe logits and
-                      replaced list per step beside --out
+                      replaced list per step beside --out; --run-dir DIR [--export-steps]
+                      [--run-name] puts all of it in a run directory (SPEC §9); a
+                      validation_dataset_ood set is reported as `ood`
+    launch.py         run launcher: named options to recipe overrides, run-directory
+                      allocation (trlx §2.3 rule), config.yaml snapshot, command.txt,
+                      log.txt; --ood PATH; --dry-run
+    publish.py        verify_export + reload probe + staged publication of a run's export;
+                      <run>/verify.json
     flips.py          per-step flip accounting on the device: baselines in pinned host
                       memory, compared against each forward's fake quantization
-    progress.py       live table (StepTable), eval line, progress JSONL (Progress)
+    progress.py       live table (StepTable; held-out and ood columns), eval line, progress
+                      JSONL and progress.txt mirror (Progress)
     route_scores.py   routing-concentration measurement; ESFT top_p or --per-rank N selection, with
                       --hash-per-rank M for the hash-routing layers (torchrun entry)
     split_experts.py  stage 6b: ExpertSplit (selection file, install hook) and SplitExperts, the per-layer
@@ -633,6 +642,7 @@ Snapshot path, used below as `$SNAP`:
   ```sh
   rsync -a --info=progress2 -e "ssh -p PORT" --exclude runs --exclude deepseek/venv \
       --exclude 'deepseek/models--*' --exclude 'deepseek/exports/stage*' --exclude 'deepseek/exports/logs/*.pt' \
+      --exclude 'deepseek/runs/*/step-*' --exclude 'deepseek/runs/*/latest' \
       --exclude deepseek/automodel --exclude authoring-work --exclude endpoint-responses --exclude contexts \
       /home/$USER/trl/trlx/ $USER@HOST:/home/$USER/trl/trlx/
   ```
@@ -1402,22 +1412,37 @@ Pending, in order (each a separate decision):
    score concentrates there. Closed: role as the selection (run 8), whole
    tensors by first-epoch sign consistency (run 9). SPEC §4 follows the
    decision.
-2. `ood` evaluation: a second validation set (`validation_ood`, any `messages`
-   rows read by the data bridge) scored at every validation, shown as `ood` and
-   `Δbase` columns and on the eval line, in the progress file and report. Rows
-   from the operator: the source model's own outputs via `trlx replay-build
-   --endpoint` on an endpoint serving it, or a general-domain sample. Same-
-   distribution held-out cannot see dense drifting from pretrained behavior;
-   this can, and it sets the dense budget (Handoff 6 item 5).
-3. Run launcher CLI: one console entry replacing the torchrun line, with named
-   options for rates, expert multiplier, steps, validation interval, warmup,
-   export and retention, selection file; a run directory holding report, log,
-   progress file, and exports; `TQDM_DISABLE` and the progress split built in;
-   `--set` kept for the rest.
-4. Publish CLI: `<run> [--step N | latest] --out DIR`: `verify_export` against
-   the source with that export's replaced list, the reload probe check against
-   its saved logits, staged publication (hard-linked shards where possible,
-   `--force`), `verify.json` beside it. No weights change; there is no merge.
+2. `ood` evaluation (built): a second validation set, `validation_dataset_ood`
+   in the recipe or `launch --ood PATH`, in the training contract (one user
+   turn, one assistant turn, nonempty `reasoning`; `data.py` `split: all`),
+   scored at every validation and shown as `ood` and `Δbase` columns and on the
+   eval line, in the progress file and report; optional, blank when absent.
+   Same-distribution held-out cannot see dense drifting from pretrained
+   behavior; this can, and it sets the dense budget (Handoff 6 item 5). Rows
+   are the operator's: `dataset chat` output qualifies; `trlx replay-build`
+   drops the endpoint's reasoning and would need a `reasoning` column (trlx
+   change, not scheduled) to supply the source model's own outputs.
+3. Run launcher (built: `deepseek/qat/launch.py`; SPEC §9), after the trlx
+   CLI: the recipe (`--config`, default `full-train.yaml`) holds persistent
+   settings and options name only what changes between runs: `--dataset`,
+   `--dataset-eval`, `--dataset-ood`, `--holdout`; `--learning-rate`,
+   `--expert-learning-rate` (as `lr_mult`), `--max-steps`, `--eval-steps`,
+   `--warmup-steps`, `--per-device-batch-size` (the global batch is derived
+   from the ranks); `--expert-selection FILE` (creates the split block when
+   absent), `--experts-only`, `--dense-start-step`, `--dense-every`;
+   `--export`/`--no-export`, `--keep-exports`, `--run-name`; `--gpus`, `--set`,
+   `--unset`, `--dry-run`; `--help` states types, defaults, constraints, and
+   examples. A run directory `deepseek/runs/YYYYMMDD-N--<recipe>--<dataset>/`
+   with the resolved `config.yaml` the run reads, `command.txt`, `log.txt`,
+   `progress.jsonl`, `progress.txt`, `report.json`, `step-N` exports;
+   `TQDM_DISABLE` and the allocator setting built in. Run under `nohup` as
+   before. Ablation flags (`--dense-tensors`, `--trainable-subset`,
+   `--per-class-clip`) stay on the raw `proxy_step` line.
+4. Publish (built: `deepseek/qat/publish.py`; SPEC §10): `<run> --step N |
+   --latest --out DIR [--force] [--skip-probe]`: `verify_export` with the
+   export's replaced list, the reload probe (`proxy --expect-logits` on the
+   recipe's `ep_size` ranks), then staged publication of the export tree;
+   `<run>/verify.json`; nothing published on a failed check.
 5. Export format for several kept checkpoints: replaced tensors only, assembled
    into a complete tree on publish.
 
@@ -1443,19 +1468,16 @@ PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-p
     | tee deepseek/exports/logs/full-stage7-lr1e-5.log \
     | stdbuf -oL tr '\r' '\n' | grep --line-buffered -oE "(step [0-9]+ \| .*|\[val\] .*|Traceback.*|.*out of memory.*)" \
     > deepseek/exports/logs/full-stage7-lr1e-5.progress
-# Pending item 1 (a): experts-only control (TQDM_DISABLE=1; the live table is on stderr,
-# so a plain `2>&1 | tee LOG` keeps it; add the filter above for a .progress file)
-TQDM_DISABLE=1 PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 8 \
-    -m deepseek.qat.proxy_step --config deepseek/qat/full-train.yaml --in-backward \
-    --trainable-subset experts --set 'freeze_config.unfreeze_modules=[{glob: "model.layers.*.mlp.experts"}]' \
-    --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=5 --set lr_scheduler.lr_warmup_steps=10 \
-    --out deepseek/exports/logs/full-stage7-experts-only.json 2>&1 | tee deepseek/exports/logs/full-stage7-experts-only.log
+# Pending item 1 (a): experts-only control, through the launcher (nohup; the run
+# directory is printed first; add --ood PATH when an ood file exists)
+deepseek/venv/bin/python -m deepseek.qat.launch --experts-only --learning-rate 1e-4 \
+    --max-steps 100 --eval-steps 5 --warmup-steps 10 --run-name experts-only
 # Pending item 1 (b): delayed dense at 1e-6 with experts at 1e-4; S from (a)'s expert onset
-TQDM_DISABLE=1 PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 8 \
-    -m deepseek.qat.proxy_step --config deepseek/qat/full-train.yaml --in-backward --dense-start-step S \
-    --set optimizer.lr=1e-6 --set "optimizer.param_group_overrides=[{pattern: 'mlp\.experts', lr_mult: 100.0}]" \
-    --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=5 --set lr_scheduler.lr_warmup_steps=10 \
-    --out deepseek/exports/logs/full-stage7-delayed-dense.json 2>&1 | tee deepseek/exports/logs/full-stage7-delayed-dense.log
+deepseek/venv/bin/python -m deepseek.qat.launch --learning-rate 1e-6 --expert-learning-rate 1e-4 \
+    --dense-start-step S --max-steps 100 --eval-steps 5 --warmup-steps 10 \
+    --export --keep-exports 1 --run-name delayed-dense
+# publish the chosen export after the run
+deepseek/venv/bin/python -m deepseek.qat.publish deepseek/runs/<run> --latest --out deepseek/exports/<name>
 ```
 
 ## Verified facts

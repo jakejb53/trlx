@@ -150,15 +150,37 @@ holdout is the last N rows in file order.
 
 A training run (`deepseek.qat.proxy_step`) reports every step and every
 validation live on rank 0's stderr: loss, gradient norm, clip coefficient, rates,
-memory; held-out loss with the dense and expert values and scales changed and the
-layers whose selected experts changed. With `--out` it writes its report there
-and every live record to `<out stem>-progress.jsonl` as it is taken, so a killed
-run keeps its measurements. With `--export DIR` it publishes a checkpoint at every
-validation and at completion under `DIR/step-N`, `DIR/latest` pointing at the
-newest, keeping the newest `--keep-exports` (default 3); each export's probe
-logits are `<out stem>-step{N}-logits-rank{r}.pt` and its replaced tensor names
-`<out stem>-step{N}-replaced.txt`. Reports live in `deepseek/exports/logs/`,
-exports in `deepseek/exports/`. Exports are regenerable and may be deleted.
+memory; held-out loss, and the `ood` loss when the recipe has a
+`validation_dataset_ood` set, with the dense and expert values and scales changed
+and the layers whose selected experts changed. Every live record is written as it
+is taken, so a killed run keeps its measurements.
+
+`deepseek.qat.launch` is the entry for a run. It allocates a run directory
+`deepseek/runs/YYYYMMDD-N--<recipe>--<dataset>/` as §2.3 of the trlx spec does
+(date and counter shared by every recipe and dataset, labels lowercased), writes
+the recipe with every option and override applied as `config.yaml`, the exact
+command as `command.txt`, and launches `proxy_step --run-dir` under it. The run
+reads `config.yaml`, never the source recipe. Contents:
+
+```
+<run>/
+  config.yaml           resolved recipe; the run's snapshot
+  command.txt           the torchrun command and environment
+  log.txt               all ranks' stdout and stderr
+  progress.jsonl        every live record
+  progress.txt          the live table and eval lines as printed
+  report.json           the rank-0 report
+  step-N/               exports at every validation and at completion (--export);
+                        latest -> the newest; the newest --keep-exports kept (default 3)
+  step-N-replaced.txt   tensors the export replaced
+  step-N-logits-rank{r}.pt  probe logits recorded before the export
+  verify.json           written by deepseek.qat.publish
+```
+
+`proxy_step --out`/`--export` remain for runs outside a run directory, with the
+per-step files as `<out stem>-step{N}-...` beside the report. Reports from before
+the launcher live in `deepseek/exports/logs/`. Exports are regenerable and may be
+deleted.
 
 ## 10. Export and verification
 
@@ -179,6 +201,12 @@ exports in `deepseek/exports/`. Exports are regenerable and may be deleted.
 - Reload (`deepseek.qat.proxy` against the export): the fixed-point and
   source-parity checks pass, and hooked logits on fixed probe token ids equal
   the saved ones bit for bit.
+- Publication (`deepseek.qat.publish <run> --step N | --latest --out DIR`): runs
+  `verify_export` with the export's replaced list, then the reload check, and
+  only then copies the export tree to `DIR` by staged publication (shards
+  hard-linked where the filesystem allows, other files copied; `--force` to
+  replace). No weights change. `<run>/verify.json` records every check and the
+  published path; nothing is published when a check fails.
 - Runtime: the published artifact loads through Transformers and vLLM on
   hardware that serves the source and completes deterministic forward and
   generation probes.

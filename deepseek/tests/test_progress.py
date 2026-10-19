@@ -66,6 +66,23 @@ class Table(unittest.TestCase):
         t.note_validation(0.4951)
         self.assertEqual(t.validation_line(9), "eval step 9: held-out 0.4951 (Δprev -0.0584, Δbase -0.0641)")
 
+    def test_ood_columns_and_line(self):
+        t = StepTable(100, 17, 43)
+        t.note_validation(0.5592, baseline=True)
+        t.note_validation(1.2000, baseline=True, name="ood")
+        # Before any ood measurement the ood cells are blank: the row has the same
+        # visible cells as a run without an ood set.
+        cells = t.row(0, 0.7, _flips(0, 0, set()), None, None).split("\n")[-1].split()
+        self.assertEqual(len(cells), 7)  # step, epoch, loss, ep-mean, dense%, expert%, layers
+        t.note_validation(0.5535)
+        t.note_validation(1.2500, name="ood")
+        cells = t.row(1, 0.7, _flips(0, 0, set()), None, None).split()
+        # held-out, Δbase (no Δprev yet), ood, its Δbase against the ood baseline.
+        self.assertEqual(cells[5:9], ["0.5535", "-0.0057", "1.2500", "+0.0500"])
+        self.assertEqual(t.validation_line(4), "eval step 4: held-out 0.5535 (Δbase -0.0057); ood 1.2500 (Δbase +0.0500)")
+        with self.assertRaisesRegex(ValueError, "unknown validation set"):
+            t.note_validation(0.1, name="other")
+
 
 class ProgressFile(unittest.TestCase):
     def test_one_json_record_per_line_on_rank_zero_only(self):
@@ -82,6 +99,18 @@ class ProgressFile(unittest.TestCase):
             Progress(path, rank=0)  # a new run truncates
             self.assertEqual(os.path.getsize(path), 0)
             Progress(None, rank=0).record("step", {})  # no path: nothing written, no error
+
+    def test_text_mirror_holds_every_said_line(self):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as root:
+            text = os.path.join(root, "progress.txt")
+            pr = Progress(None, rank=0, text_path=text)
+            pr.say("held-out baseline: loss 0.5592")
+            pr.say("eval step 4: held-out 0.5535")
+            with open(text, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "held-out baseline: loss 0.5592\neval step 4: held-out 0.5535\n")
+            Progress(None, rank=1, text_path=text).say("rank 1 says nothing")
+            with open(text, encoding="utf-8") as f:
+                self.assertEqual(f.read().count("\n"), 2)
 
 
 if __name__ == "__main__":

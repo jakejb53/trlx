@@ -3,7 +3,9 @@
 The run is watched from these lines, so they carry what a decision needs and
 nothing else: the step's loss and the running mean over the current epoch, the
 latest held-out loss with its change from the previous validation and from the
-baseline, the fraction of the model's dense and expert values changed since the
+baseline, the latest ``ood`` loss with its change from baseline (a second
+validation set outside the training distribution; blank when the run has none),
+the fraction of the model's dense and expert values changed since the
 start (over every value of the class, trained or frozen, so runs with different
 trainable sets compare; the flip indicator, measured every step by
 ``deepseek.qat.flips``), how many layers
@@ -18,9 +20,12 @@ as that step began (its forward is what was measured), so they lag the update by
 one step; the ``eval`` line and the final report describe the masters after the
 last update.
 
-``Progress`` prints on rank 0 unconditionally and, when a report path is given,
-appends every record as one JSON line to ``<out stem>-progress.jsonl``, flushed
-per record, so a killed run keeps every measurement taken before the kill.
+``Progress`` prints on rank 0 unconditionally and, when a record path is given,
+appends every record as one JSON line to it (``<out stem>-progress.jsonl``, or
+``progress.jsonl`` in a run directory), flushed per record, so a killed run
+keeps every measurement taken before the kill. With a text path, every printed
+line is also appended there (``progress.txt``), so the watched table survives
+without a shell filter over the log.
 """
 
 import json
@@ -28,10 +33,16 @@ import sys
 
 HEADER_EVERY = 20
 
+# Validation set names as NeMo reports them: the recipe's `validation_dataset`
+# block is "default" (the held-out rows), `validation_dataset_ood` is "ood".
+HELD_OUT = "default"
+OOD = "ood"
+
 # (heading, width). Every cell is right-aligned to its width.
 COLUMNS = [
     ("step", 9), ("epoch", 6), ("loss", 8), ("ep-mean", 8), ("Δ", 8),
     ("held-out", 9), ("Δprev", 8), ("Δbase", 8),
+    ("ood", 9), ("Δbase", 8),
     ("dense%", 8), ("expert%", 9), ("layers", 7),
     ("drift-d", 8), ("cons-d", 7), ("drift-e", 8), ("cons-e", 7),
     ("gn-dense", 9), ("gn-expert", 10), ("s/step", 7),
@@ -39,12 +50,14 @@ COLUMNS = [
 
 
 class Progress:
-    def __init__(self, path: str | None, rank: int):
+    def __init__(self, path: str | None, rank: int, text_path: str | None = None):
         self.rank = rank
         self.path = path if rank == 0 else None
-        if self.path is not None:
-            with open(self.path, "w", encoding="utf-8"):
-                pass  # a fresh run starts a fresh file
+        self.text_path = text_path if rank == 0 else None
+        for p in (self.path, self.text_path):
+            if p is not None:
+                with open(p, "w", encoding="utf-8"):
+                    pass  # a fresh run starts fresh files
 
     def record(self, kind: str, data: dict) -> None:
         if self.path is None:
@@ -53,8 +66,12 @@ class Progress:
             f.write(json.dumps({"kind": kind, **data}) + "\n")
 
     def say(self, line: str) -> None:
-        if self.rank == 0:
-            print(line, file=sys.stderr, flush=True)
+        if self.rank != 0:
+            return
+        print(line, file=sys.stderr, flush=True)
+        if self.text_path is not None:
+            with open(self.text_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
 
 def _cell(value, width: int, spec: str = "", signed: bool = False) -> str:
@@ -83,30 +100,50 @@ class StepTable:
         self._epoch_index: int | None = None
         self._epoch_losses: list[float] = []
         self._previous_mean: float | None = None
-        self.baseline: float | None = None
-        self.held_out: float | None = None
-        self.previous_held_out: float | None = None
+        # Per validation set (HELD_OUT, OOD): the step-zero baseline, the latest
+        # measurement, and the one before it.
+        self.baseline: dict[str, float] = {}
+        self.latest: dict[str, float] = {}
+        self.previous: dict[str, float] = {}
 
     def header(self) -> str:
         return "  ".join(name.rjust(width) for name, width in COLUMNS)
 
-    def note_validation(self, loss: float, baseline: bool = False) -> None:
+    def note_validation(self, loss: float, baseline: bool = False, name: str = HELD_OUT) -> None:
+        if name not in (HELD_OUT, OOD):
+            raise ValueError(f"unknown validation set {name!r}; the table shows {HELD_OUT!r} and {OOD!r}")
         if baseline:
-            self.baseline = loss
+            self.baseline[name] = loss
             return
-        self.previous_held_out = self.held_out
-        self.held_out = loss
+        if name in self.latest:
+            self.previous[name] = self.latest[name]
+        self.latest[name] = loss
+
+    def _delta(self, name: str, against: dict[str, float]) -> float | None:
+        if name not in self.latest or name not in against:
+            return None
+        return self.latest[name] - against[name]
+
+    # Properties kept for the names the report code and tests use.
+    @property
+    def held_out(self) -> float | None:
+        return self.latest.get(HELD_OUT)
 
     def validation_line(self, step: int) -> str:
-        parts = [f"eval step {step}: held-out {self.held_out:.4f}"]
+        parts = [f"eval step {step}: held-out {self.latest[HELD_OUT]:.4f}"]
         deltas = []
-        if self.previous_held_out is not None:
-            deltas.append(f"Δprev {self.held_out - self.previous_held_out:+.4f}")
-        if self.baseline is not None:
-            deltas.append(f"Δbase {self.held_out - self.baseline:+.4f}")
+        if (d := self._delta(HELD_OUT, self.previous)) is not None:
+            deltas.append(f"Δprev {d:+.4f}")
+        if (d := self._delta(HELD_OUT, self.baseline)) is not None:
+            deltas.append(f"Δbase {d:+.4f}")
         if deltas:
             parts.append("(" + ", ".join(deltas) + ")")
-        return " ".join(parts)
+        line = " ".join(parts)
+        if OOD in self.latest:
+            line += f"; ood {self.latest[OOD]:.4f}"
+            if (d := self._delta(OOD, self.baseline)) is not None:
+                line += f" (Δbase {d:+.4f})"
+        return line
 
     # One row for a finished step. `flips` is FlipCounter.totals() of the pass
     # that started this step (the state the step's forward saw), or None;
@@ -134,9 +171,11 @@ class StepTable:
             layers = f"{changed_layers}/{self.expert_layers}"
         cells = [
             _cell(step_text, 9), _cell(epoch, 6, ".2f"), _cell(loss, 8, ".4f"), _cell(mean, 8, ".4f"), _cell(delta, 8, ".4f", signed=True),
-            _cell(self.held_out, 9, ".4f"),
-            _cell(None if self.held_out is None or self.previous_held_out is None else self.held_out - self.previous_held_out, 8, ".4f", signed=True),
-            _cell(None if self.held_out is None or self.baseline is None else self.held_out - self.baseline, 8, ".4f", signed=True),
+            _cell(self.latest.get(HELD_OUT), 9, ".4f"),
+            _cell(self._delta(HELD_OUT, self.previous), 8, ".4f", signed=True),
+            _cell(self._delta(HELD_OUT, self.baseline), 8, ".4f", signed=True),
+            _cell(self.latest.get(OOD), 9, ".4f"),
+            _cell(self._delta(OOD, self.baseline), 8, ".4f", signed=True),
             _cell(None if flips is None else _pct(flips.get("dense_values_changed"), flips.get("dense_class_elements"), 4), 8, ".4f"),
             _cell(None if flips is None else _pct(flips.get("expert_values_changed"), flips.get("expert_class_elements"), 6), 9, ".6f"),
             _cell(layers, 7),

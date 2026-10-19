@@ -69,6 +69,13 @@ is also appended as one JSON line to ``<out stem>-progress.jsonl``, so a killed
 run keeps every measurement taken before the kill. The final report remains the
 complete record.
 
+``--run-dir DIR`` (``deepseek.qat.launch``) replaces ``--out``/``--export``: the
+report is ``DIR/report.json``, the records ``DIR/progress.jsonl``, the printed
+table ``DIR/progress.txt``, and with ``--export-steps`` the exports are
+``DIR/step-N`` with ``DIR/latest`` and the per-step files ``DIR/step-N-replaced.txt``
+and ``DIR/step-N-logits-rank{r}.pt`` (SPEC §9). ``--run-name`` is a display
+label recorded in the report.
+
 ``--export DIR`` (stage 6, stage 7) writes the trained targets as a complete
 checkpoint in the layout of the recipe's ``pretrained_model_name_or_path``
 (``deepseek.qat.proxy_export``) at every validation and at the end of the run,
@@ -101,7 +108,7 @@ from deepseek.qat import proxy_export
 from deepseek.qat.export import ExportError
 from deepseek.qat.flips import FlipCounter
 from deepseek.qat.freeze import freeze_gate_bias
-from deepseek.qat.progress import Progress, StepTable
+from deepseek.qat.progress import HELD_OUT, OOD, Progress, StepTable
 from deepseek.qat.overrides import add_override_arguments, apply_overrides
 from deepseek.qat.proxy import local_expert_ids, logits as hooked_logits, logits_path, probe_token_ids
 
@@ -418,7 +425,20 @@ def main(argv=None) -> int:
     parser.add_argument("--keep-exports", type=int, default=3, metavar="K",
                         help="with --export: keep the newest K step exports and remove older ones (default 3)")
     parser.add_argument("--force", action="store_true", help="replace an existing --export directory")
+    parser.add_argument("--run-dir", default=None, metavar="DIR",
+                        help="run directory (deepseek.qat.launch): report.json, progress.jsonl, progress.txt, and with --export-steps "
+                             "the step exports at DIR/step-N with DIR/latest; replaces --out/--export")
+    parser.add_argument("--export-steps", action="store_true",
+                        help="with --run-dir: export at every validation and at the end into the run directory")
+    parser.add_argument("--run-name", default=None, help="display label recorded in the report (the run directory is the identity)")
     args = parser.parse_args(argv)
+    if args.run_dir is not None:
+        if args.out or args.export is not None or args.force:
+            parser.error("--run-dir replaces --out, --export, and --force")
+        if not os.path.isdir(args.run_dir):
+            parser.error(f"--run-dir: {args.run_dir} is not a directory")
+    elif args.export_steps:
+        parser.error("--export-steps needs --run-dir; use --export DIR without one")
     if args.export is not None and not args.out:
         parser.error("--export requires --out: probe logits and the replaced-tensor lists are saved beside the report")
     if args.keep_exports < 1:
@@ -445,8 +465,9 @@ def main(argv=None) -> int:
     # The export copies untouched tensors from the checkpoint the model loads,
     # so a train-on-export run exports from that export, not the original snapshot.
     snapshot = cfg.model.config.pretrained_model_name_or_path
-    if args.export is not None and not os.path.isfile(os.path.join(snapshot, "model.safetensors.index.json")):
-        raise SystemExit(f"--export: the recipe's model path {snapshot} has no model.safetensors.index.json to export from")
+    exporting = args.export is not None or args.export_steps
+    if exporting and not os.path.isfile(os.path.join(snapshot, "model.safetensors.index.json")):
+        raise SystemExit(f"export: the recipe's model path {snapshot} has no model.safetensors.index.json to export from")
     # Split expert storage (stage 6b) freezes unselected experts in packed stacks;
     # the stepper's row restriction is the single-stack form of the same selection.
     if args.expert_selection is not None and cfg.model.get("expert_split", None) is not None:
@@ -455,19 +476,42 @@ def main(argv=None) -> int:
     recipe.setup()
     rank = dist.get_rank() if dist.is_initialized() else 0
     model = recipe.model_parts[0]
-    # The export root is created (or, with --force, replaced) once, by rank 0,
-    # before anything else; step exports are staged inside it.
-    export_root = os.path.abspath(args.export) if args.export is not None else None
+    # Artifact locations. Flat form: the report at --out with its progress file
+    # and per-step files beside it as <out stem>-..., exports under --export.
+    # Run directory: report.json, progress.jsonl, progress.txt, and step-N with
+    # the per-step files as step-N-... at the root (SPEC §9).
+    run_dir = os.path.abspath(args.run_dir) if args.run_dir is not None else None
+    if run_dir is not None:
+        out_path = os.path.join(run_dir, "report.json")
+        progress_paths = (os.path.join(run_dir, "progress.jsonl"), os.path.join(run_dir, "progress.txt"))
+        export_root = run_dir if args.export_steps else None
+        step_prefix_of = lambda step: os.path.join(run_dir, f"step-{step}")
+    else:
+        out_path = args.out
+        prefix = os.path.splitext(args.out)[0] if args.out else None
+        progress_paths = (f"{prefix}-progress.jsonl" if prefix else None, None)
+        export_root = os.path.abspath(args.export) if args.export is not None else None
+        step_prefix_of = lambda step: f"{prefix}-step{step}"
+    # The export root is prepared once, by rank 0, before anything else; step
+    # exports are staged inside it. A flat --export root is created (or, with
+    # --force, replaced); a run directory is kept and only its step exports and
+    # `latest` from an earlier attempt are removed.
     if export_root is not None and rank == 0:
-        if os.path.lexists(export_root):
-            shutil.rmtree(export_root) if os.path.isdir(export_root) and not os.path.islink(export_root) else os.remove(export_root)
-        os.makedirs(export_root)
+        if run_dir is not None:
+            for _, name in step_exports(run_dir):
+                shutil.rmtree(os.path.join(run_dir, name))
+            if os.path.lexists(os.path.join(run_dir, "latest")):
+                os.remove(os.path.join(run_dir, "latest"))
+        else:
+            if os.path.lexists(export_root):
+                shutil.rmtree(export_root) if os.path.isdir(export_root) and not os.path.islink(export_root) else os.remove(export_root)
+            os.makedirs(export_root)
     if dist.is_initialized():
         dist.barrier()
-    prefix = os.path.splitext(args.out)[0] if args.out else None
-    progress = Progress(f"{prefix}-progress.jsonl" if prefix else None, rank)
+    progress = Progress(progress_paths[0], rank, text_path=progress_paths[1])
     progress.record("run", {"config": args.config, "overrides": overrides, "in_backward": args.in_backward,
                             "dense_every": args.dense_every, "dense_start_step": args.dense_start_step,
+                            "run_dir": run_dir, "run_name": args.run_name,
                             "export": export_root, "keep_exports": args.keep_exports})
     # Disable NeMo's per-step router-bias update before any training step.
     gate_factor_before, gates_with_bias = freeze_gate_bias(model)
@@ -477,6 +521,8 @@ def main(argv=None) -> int:
     report["gates_with_correction_bias"] = gates_with_bias
     report["in_backward"] = args.in_backward
     report["overrides"] = overrides
+    report["run_dir"] = run_dir
+    report["run_name"] = args.run_name
 
     # Update-in-backward: the stepper takes over clipping and stepping. The
     # recipe's own step is wrapped so the exact global norm replaces the zero
@@ -663,7 +709,7 @@ def main(argv=None) -> int:
 
     def export_at(step: int) -> str | None:
         dest = os.path.join(export_root, f"step-{step}")
-        step_prefix = f"{prefix}-step{step}"
+        step_prefix = step_prefix_of(step)
         ids = probe_token_ids(int(model.config.vocab_size)).to(next(model.parameters()).device)
         torch.save(hooked_logits(model, ids).cpu(), logits_path(step_prefix, rank))
         t2 = time.monotonic()
@@ -691,7 +737,7 @@ def main(argv=None) -> int:
             # list are useless without it; they go with it.
             world = dist.get_world_size() if dist.is_initialized() else 1
             for name in removed:
-                gone_prefix = f"{prefix}-step{name.split('-', 1)[1]}"
+                gone_prefix = step_prefix_of(int(name.split('-', 1)[1]))
                 for path in [f"{gone_prefix}-replaced.txt", *(logits_path(gone_prefix, r) for r in range(world))]:
                     if os.path.exists(path):
                         os.remove(path)
@@ -713,19 +759,33 @@ def main(argv=None) -> int:
 
     recipe._run_validation_epoch = counting_val_epoch
 
+    # Validation sets: the recipe's held-out rows ("default") and optionally the
+    # `ood` rows (`validation_dataset_ood`, Pending item 2). NeMo runs every set
+    # at each validation step in recipe order; the eval line and the step export
+    # happen once per step, after the last set, so an export is never written
+    # between two sets of the same step.
+    val_names = list(recipe.val_dataloaders)
+    if HELD_OUT not in val_names:
+        raise SystemExit(f"the recipe has no validation_dataset block (sets: {val_names})")
+    unknown_sets = [n for n in val_names if n not in (HELD_OUT, OOD)]
+    if unknown_sets:
+        raise SystemExit(f"unknown validation sets {unknown_sets}: the run reports {HELD_OUT!r} and {OOD!r} only")
+    last_set = val_names[-1]
+
     def capturing_val_log(val_name, log_data, metric_logger=None):
         entry = {"step": int(log_data.step), "name": val_name, "val_loss": float(log_data.metrics["val_loss"])}
         entry.update(counter.totals())
         captured_val.append(entry)
         progress.record("validation", entry)
-        table.note_validation(entry["val_loss"])
-        progress.say(table.validation_line(entry["step"]))
-        if export_root is not None:
-            # The validation left the model in eval mode, which the probe needs.
-            failure = export_at(entry["step"])
-            if failure is not None:
-                # Mid-run, a broken destination would waste every further step.
-                raise SystemExit(f"export at step {entry['step']} failed; stopping the run: {failure}")
+        table.note_validation(entry["val_loss"], name=val_name)
+        if val_name == last_set:
+            progress.say(table.validation_line(entry["step"]))
+            if export_root is not None:
+                # The validation left the model in eval mode, which the probe needs.
+                failure = export_at(entry["step"])
+                if failure is not None:
+                    # Mid-run, a broken destination would waste every further step.
+                    raise SystemExit(f"export at step {entry['step']} failed; stopping the run: {failure}")
         return original_val_log(val_name, log_data, metric_logger)
 
     recipe.log_val_metrics = capturing_val_log
@@ -733,8 +793,8 @@ def main(argv=None) -> int:
         sample = recipe._run_validation_epoch(val_loader)
         captured_val.append({"step": -1, "name": val_name, "val_loss": float(sample.metrics["val_loss"])})
         progress.record("validation", captured_val[-1])
-        table.note_validation(captured_val[-1]["val_loss"], baseline=True)
-        progress.say(f"held-out baseline: loss {captured_val[-1]['val_loss']:.4f}")
+        table.note_validation(captured_val[-1]["val_loss"], baseline=True, name=val_name)
+        progress.say(f"{'held-out' if val_name == HELD_OUT else val_name} baseline: loss {captured_val[-1]['val_loss']:.4f}")
     for mp in recipe.model_parts:
         mp.train()
 
@@ -930,8 +990,8 @@ def main(argv=None) -> int:
     report["elapsed_seconds"] = round(time.monotonic() - t0, 1)
     if rank == 0:
         print(json.dumps(report, indent=1), flush=True)
-        if args.out:
-            with open(args.out, "w", encoding="utf-8") as f:
+        if out_path:
+            with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=1)
     else:
         print(json.dumps({k: report[k] for k in ("rank", "ok", "frozen_changed", "unselected_experts_changed", "total_value_changes_in_trainable", "masters_sha256")}), flush=True)

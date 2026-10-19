@@ -76,6 +76,12 @@ class Bridge(unittest.TestCase):
         self.assertEqual(hold[0]["input_ids"], last_ids[:-1])
         with self.assertRaises(ValueError):
             D.ReasoningChatDataset(self.path, SNAP, self.tok, max_tokens=256, split="train", holdout=3)
+        # "all" takes every row and ignores holdout, even a value train/holdout would reject.
+        every = D.ReasoningChatDataset(self.path, SNAP, self.tok, max_tokens=256, split="all", holdout=3)
+        self.assertEqual(len(every), 3)
+        self.assertEqual(every[2]["input_ids"], last_ids[:-1])
+        with self.assertRaisesRegex(ValueError, "split must be"):
+            D.ReasoningChatDataset(self.path, SNAP, self.tok, max_tokens=256, split="eval", holdout=1)
 
     def test_getitem_returns_copies(self):
         ds = D.ReasoningChatDataset(self.path, SNAP, self.tok, max_tokens=256, split="train", holdout=1)
