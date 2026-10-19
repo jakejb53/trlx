@@ -43,6 +43,11 @@ report): selected experts train as BF16 stacks, unselected experts stay packed
 and are covered by the frozen digest; the per-expert tables name rows by the
 module's global ids. ``--expert-selection`` is rejected alongside it.
 
+``--dense-start-step S`` (with ``--in-backward``) holds the dense class back
+until step S: its gradients are discarded before S and it carries no optimizer
+state until then, so the run to S is an experts-only run and dense enters
+afterwards at the recipe's dense rate (Pending item 1).
+
 ``--dense-tensors attention|shared|none`` declares which dense targets the recipe
 trains (the recipe's ``freeze_config`` freezes the rest); frozen targets stay
 fake-quantized and are covered by the frozen digest, like the indexer.
@@ -395,6 +400,9 @@ def main(argv=None) -> int:
     parser.add_argument("--dense-every", type=int, default=1, metavar="N",
                         help="with --in-backward: update dense parameters on 1 step in N (gradients discarded otherwise, "
                              "Adam moments untouched); experts update every step; implies --per-class-clip")
+    parser.add_argument("--dense-start-step", type=int, default=0, metavar="S",
+                        help="with --in-backward: dense parameters are not updated before step S (gradients discarded, no optimizer "
+                             "state until then); experts update from step 0; implies --per-class-clip")
     parser.add_argument("--trainable-subset", choices=("all", "dense", "experts"), default="all",
                         help="which target classes the recipe is expected to train (ablations freeze the rest via --set); the exact-set check uses it")
     parser.add_argument("--dense-tensors", choices=("all", "attention", "shared", "none"), default="all",
@@ -421,6 +429,10 @@ def main(argv=None) -> int:
         parser.error(f"--dense-every must be a positive integer, got {args.dense_every}")
     if args.dense_every > 1 and not args.in_backward:
         parser.error("--dense-every needs --in-backward: the update period lives in the stepper")
+    if args.dense_start_step < 0:
+        parser.error(f"--dense-start-step must be a nonnegative integer, got {args.dense_start_step}")
+    if args.dense_start_step > 0 and not args.in_backward:
+        parser.error("--dense-start-step needs --in-backward: the start step lives in the stepper")
     if args.expert_selection is not None and not args.in_backward:
         parser.error("--expert-selection needs --in-backward: row restriction lives in the stepper")
 
@@ -455,6 +467,7 @@ def main(argv=None) -> int:
     prefix = os.path.splitext(args.out)[0] if args.out else None
     progress = Progress(f"{prefix}-progress.jsonl" if prefix else None, rank)
     progress.record("run", {"config": args.config, "overrides": overrides, "in_backward": args.in_backward,
+                            "dense_every": args.dense_every, "dense_start_step": args.dense_start_step,
                             "export": export_root, "keep_exports": args.keep_exports})
     # Disable NeMo's per-step router-bias update before any training step.
     gate_factor_before, gates_with_bias = freeze_gate_bias(model)
@@ -506,9 +519,10 @@ def main(argv=None) -> int:
     stepper = None
     if args.in_backward:
         stepper = inbackward.from_recipe(recipe, recipe.max_grad_norm, per_class=args.per_class_clip, dense_every=args.dense_every,
-                                         rows_of=rows_of if selection is not None else None)
-        report["per_class_clip"] = args.per_class_clip or args.dense_every > 1
+                                         dense_start=args.dense_start_step, rows_of=rows_of if selection is not None else None)
+        report["per_class_clip"] = args.per_class_clip or args.dense_every > 1 or args.dense_start_step > 0
         report["dense_every"] = args.dense_every
+        report["dense_start_step"] = args.dense_start_step
 
     # Every step is wrapped for memory sampling (Handoff 2: steady-state peaks
     # and the update-in-backward saving need per-step figures). Under

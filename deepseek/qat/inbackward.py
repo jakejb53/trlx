@@ -37,6 +37,13 @@ counts toward the norm and is then freed without an optimizer call, so the
 class's Adam moments are untouched. This is the frequency-split lever: under
 Adam, 1 step in N at rate r drifts the same expected distance as every step at
 r/N, with every applied update at the full rate.
+
+Start step per class (``start``): a class with start S is not stepped before
+step S; its gradient counts toward the norm and is freed, as on an off-period
+step, so no optimizer state exists for it until S (torchao allocates lazily)
+and the other classes' moments are unaffected. The period, if any, counts from
+S. This is the delayed dense start (Pending item 1): experts publish first, and
+the run to S is identical to an experts-only run by construction.
 """
 
 import math
@@ -78,6 +85,7 @@ class InBackwardStepper:
         reduce_group=None,
         class_of: Callable[[str], str] | None = None,
         every: dict[str, int] | None = None,
+        start: dict[str, int] | None = None,
         rows_of: Callable[[str], list[int] | None] | None = None,
         report_class_of: Callable[[str], str] | None = None,
         drift_sample_of: Callable[[str, torch.Tensor], tuple[str, tuple] | None] | None = None,
@@ -152,6 +160,14 @@ class InBackwardStepper:
             if not (isinstance(n, int) and n >= 1):
                 raise ValueError(f"update period for class {cls!r} must be a positive integer, got {n!r}")
             self.every[cls] = n
+        # Start step per class; absent means step 0. Same validation as every.
+        self.start: dict[str, int] = {}
+        for cls, s in (start or {}).items():
+            if cls not in self.classes:
+                raise ValueError(f"start step given for unknown class {cls!r}; classes are {self.classes}")
+            if not (isinstance(s, int) and s >= 0):
+                raise ValueError(f"start step for class {cls!r} must be a nonnegative integer, got {s!r}")
+            self.start[cls] = s
         self.coefs: dict[str, float] = {c: 1.0 for c in self.classes}
         self.last_norms: dict[str, float] = {}
         self.report_classes: list[str] = sorted(set(self._report_class_by_param.values()))
@@ -211,9 +227,11 @@ class InBackwardStepper:
             event = torch.cuda.Event()
             event.record()
         self._sq_parts.append((cls, self._report_class_by_param[id(p)], sq, event))
-        # A class off its update period contributes to the norm above and is
-        # otherwise skipped: no optimizer call, so its moments do not advance.
-        if self.step_count % self.every.get(cls, 1) == 0:
+        # A class before its start step or off its update period contributes to
+        # the norm above and is otherwise skipped: no optimizer call, so its
+        # moments do not advance (and before the start, do not yet exist).
+        since_start = self.step_count - self.start.get(cls, 0)
+        if since_start >= 0 and since_start % self.every.get(cls, 1) == 0:
             coef = self.coefs[cls]
             if coef != 1.0:
                 g.mul_(coef)
@@ -310,9 +328,10 @@ class InBackwardStepper:
 # topology the single all-reduce relies on and disables the recipe's own clip
 # (``max_grad_norm = None``), since the YAML cannot express "no clipping": an
 # absent or null key falls back to 1.0 in the recipe. ``dense_every`` sets the
-# dense update period; it needs the dense/expert classifier and therefore
-# implies per-class clipping (a no-effect lever, stage 5 phase C).
-def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: int = 1,
+# dense update period and ``dense_start`` the step dense first updates; either
+# needs the dense/expert classifier and therefore implies per-class clipping
+# (a no-effect lever, stage 5 phase C).
+def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: int = 1, dense_start: int = 0,
                 rows_of: Callable[[str], list[int] | None] | None = None) -> InBackwardStepper:
     from nemo_automodel.components.training.utils import (
         get_expert_tp_replication_factor,
@@ -354,12 +373,15 @@ def from_recipe(recipe, max_norm: float, per_class: bool = False, dense_every: i
     recipe.max_grad_norm = None
     if dense_every < 1:
         raise ValueError(f"dense_every must be a positive integer, got {dense_every}")
+    if dense_start < 0:
+        raise ValueError(f"dense_start must be a nonnegative integer, got {dense_start}")
     # Dense (attention, shared experts) and routed experts clipped separately.
     by_class = lambda name: "expert" if ".mlp.experts" in name else "dense"
-    class_of = by_class if (per_class or dense_every > 1) else None
+    class_of = by_class if (per_class or dense_every > 1 or dense_start > 0) else None
     every = {"dense": dense_every} if dense_every > 1 else None
-    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every, report_class_of=by_class,
-                             rows_of=rows_of, drift_sample_of=drift_sample)
+    start = {"dense": dense_start} if dense_start > 0 else None
+    return InBackwardStepper(recipe.model_parts, recipe.optimizer[0], max_norm, scale_grads, class_of=class_of, every=every, start=start,
+                             report_class_of=by_class, rows_of=rows_of, drift_sample_of=drift_sample)
 
 
 # Drift sample: every dense tensor's shard, its first rows up to one DRIFT_FRACTION

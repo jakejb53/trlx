@@ -2,7 +2,8 @@
 normal step with the same clip coefficient, the stored norm is the exact global
 norm, the coefficient lags one step, gradients are freed, the scaling callback
 sees exactly one gradient, a class on an update period skips its optimizer call
-without touching its moments, a row selection steps only the selected rows and
+without touching its moments, a class with a start step holds no state and is
+not updated before it (the period counting from the start), a row selection steps only the selected rows and
 excludes the rest from the norm, and a parameter without a gradient is an error."""
 
 import copy
@@ -161,6 +162,62 @@ class UpdatePeriod(unittest.TestCase):
             InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, every={"c": 2})
         with self.assertRaisesRegex(ValueError, "positive integer"):
             InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, every={"a": 0})
+        with self.assertRaisesRegex(ValueError, "unknown class"):
+            InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, start={"c": 2})
+        with self.assertRaisesRegex(ValueError, "nonnegative integer"):
+            InBackwardStepper([model], opt, MAX_NORM, lambda: None, class_of=class_of, start={"a": -1})
+
+
+class StartStep(unittest.TestCase):
+    # Class "a" starts at step 2 (optionally with a period of 2 from there), class
+    # "b" every step. The reference drops class "a"'s gradients on the steps it
+    # must not update, so torch AdamW allocates no state for it before the start
+    # and leaves its moments alone on off-period steps; the hooked parameters
+    # must match on every step and the norm must still include the discarded
+    # gradients.
+    def _run(self, every):
+        hooked = _model()
+        reference = copy.deepcopy(hooked)
+        opt_h = LocalShardOptimizer(list(hooked.parameters()), torch.optim.AdamW, lr=LR, weight_decay=0.0)
+        opt_r = torch.optim.AdamW(reference.parameters(), lr=LR, weight_decay=0.0)
+        class_of = lambda name: "a" if name.startswith("0.") else "b"
+        stepper = InBackwardStepper([hooked], opt_h, 1e9, lambda: None, class_of=class_of, start={"a": 2}, every=every)
+        torch.manual_seed(1)
+        a_params = [p for n, p in reference.named_parameters() if class_of(n) == "a"]
+        updates = 0
+        for step, x in enumerate([torch.randn(4, 16) for _ in range(6)]):
+            opt_r.zero_grad()
+            _loss(reference, x).backward()
+            norm = _global_norm(reference)
+            skip = step < 2 or (every is not None and (step - 2) % every["a"])
+            if skip:
+                for p in a_params:
+                    p.grad = None
+            else:
+                updates += 1
+            opt_r.step()
+            if step < 2:
+                # No optimizer state exists for class "a" before its start.
+                self.assertTrue(all(p not in opt_r.state for p in a_params))
+                self.assertTrue(all(v not in opt_h.inner.state
+                                    for n, q in hooked.named_parameters() if class_of(n) == "a"
+                                    for v, _ in opt_h._chunks_by_param[id(q)]))
+
+            _loss(hooked, x).backward()
+            self.assertTrue(all(p.grad is None for p in hooked.parameters()), "gradients were not freed")
+            self.assertAlmostEqual(stepper.end_step(), norm, places=5)
+            for a, b in zip(hooked.parameters(), reference.parameters()):
+                self.assertTrue(torch.equal(a, b), f"mismatch at step {step}")
+        a_state = [opt_r.state[p]["step"] for p in a_params]
+        self.assertTrue(all(float(s) == updates for s in a_state))
+        self.assertEqual(stepper.step_count, 6)
+        return updates
+
+    def test_class_waits_for_its_start_step(self):
+        self.assertEqual(self._run(every=None), 4)  # steps 2, 3, 4, 5
+
+    def test_period_counts_from_the_start_step(self):
+        self.assertEqual(self._run(every={"a": 2}), 2)  # steps 2 and 4
 
 
 class RowSelection(unittest.TestCase):

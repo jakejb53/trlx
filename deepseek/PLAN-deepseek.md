@@ -15,7 +15,8 @@ is a snapshot of `Q(master)`. There is no post-training requantization step.
 
 ## Handoff
 
-Read this first when resuming. Stages 0 to 6 are complete: routed experts train
+Read this first when resuming, then Mechanism, which fixes the terms and the
+reasoning every later decision rests on. Stages 0 to 6 are complete: routed experts train
 under QAT (stage 5), and a trained proxy exports to a complete source-layout
 checkpoint that reloads bit-identically, twice in a chain (stage 6). The frequency
 split (Handoff 4) passed: slowing dense restores expert flips. ESFT-style expert
@@ -44,11 +45,13 @@ values changed, zero expert values changed). The per-class arm (dense 1e-5,
 experts 1e-4) shows the second asymmetry: dense fits the 136 rows by step 33
 while expert flips only start at volume around step 34, and by step 79 held-out
 is above baseline with 0.44% of expert values changed (stage 7 run 7). The
-priority is therefore a dense selection to match the expert one (Decisions,
-trainable set): which dense tensors train, by what criterion. Selecting by
-role gives little, since the attention projections are 81% of dense values
-(run 8), and 20-step update-sign consistency does not rank dense tensors on
-this data (run 9); the criterion is open and is Pending item 1. Runs are
+next arm is therefore dense held back until the experts begin to publish and
+run at a rate set for 75% of the experts' movement, against an experts-only
+control (Decisions, trainable set; Pending item 1). Selecting by role gives
+little, since the attention projections are 81% of dense values (run 8), and
+20-step update-sign consistency does not rank dense tensors on this data
+(run 9); a sparse dense selection is the refinement if the rate arm falls
+short. Runs are
 watched live: one table row per step with held-out, flip fractions, master
 drift and sign consistency per class and per tensor, and an export at every
 validation (`DIR/step-N`, `DIR/latest`). Handoff 6 item 4, the dataset, is
@@ -315,6 +318,77 @@ Excluded with reason: BF16 training then FP4 requantization, and FP8 training th
 FP4, are post-hoc rounding onto the aligned grid and erase the fine-tune; LoRA at
 tens of steps yields deltas about 1e-4, below both grids' half-cells.
 
+## Mechanism
+
+Why a class publishes, and why dense outruns the experts. Each statement
+names its evidence; the rest is reasoning the next session should not
+re-derive.
+
+- QAT here: BF16 masters are updated; every loss-bearing forward, training
+  and validation, uses `dequant(Q(master))`; the gradient passes straight
+  through to the master. Both losses measure the model that would be
+  published at that moment (stage 6: a reloaded export reproduces the final
+  held-out loss).
+- Cold start. The release holds `Q(master)` only; DeepSeek's masters and
+  their sub-cell offsets are gone. Our masters start at every cell's center,
+  so nothing publishes until a master has drifted a full half-cell in a
+  consistent direction. This applies to FP8 and FP4 alike and is not
+  recoverable: the trajectory is new, not resumed.
+- Cell size. FP4 half-cells are about four times FP8's (medians 3.9e-3 and
+  9.8e-4), so at equal drift experts need four times the steps and each
+  published change is four times coarser. The coarseness is the publication
+  format's, not a consequence of the missing masters.
+- Exposure. A routed expert sees about 2% of tokens (top-6 of 256); attention
+  and the shared expert see all of them. Fewer tokens give a less consistent
+  gradient sign (run 9: 0.73 to 0.79 for experts, 0.84 to 0.95 for dense),
+  and under Adam drift per step follows sign consistency, not gradient size.
+- Starvation. Whichever parameters can reduce the loss fastest take the fit,
+  and the falling loss removes the gradient direction from the rest (gradient
+  starvation, Pezeshki et al. 2021). Dense, always-on and on the finer grid,
+  fits first; the experts' sign consistency then decays before their masters
+  reach a boundary (phase C: expert gradient norm 4.75 to 0.81; run 7:
+  consistency 0.89 to 0.60, dense done at step 33, expert flips at volume
+  from 34).
+- Thresholded publication amplifies starvation in the artifact. In BF16 a
+  starved parameter still publishes its small movement; here a master that
+  did not finish crossing publishes nothing. The same starvation therefore
+  removes more expert learning from the checkpoint than from the training
+  dynamics; the limiting case is an artifact whose experts are byte-identical
+  to the source (run 6: 20 steps, dense 4.7% changed, experts 0). Drift that
+  does not cross is not in the checkpoint; the flip fraction, not master
+  drift, is the measure.
+- Generalization. Always-on parameters see every token of every repeated
+  row; an expert sees its slice. The capacity to memorize specific rows sits
+  in dense, and dense-dominated fine-tunes cost general ability (ESFT; the
+  attention-only paper in the repo; FFN layers as key-value memory). Run 7's
+  second epoch: training loss 0.05 on repeated rows, held-out 0.47 to 0.63.
+- Rate sets dense's slope, not only its onset. A dense value publishes when
+  its cumulative drift (about rate times steps) exceeds its half-cell, and
+  FP8 half-cells scale with the weight, so the fraction of dense values
+  flipped by step T is a function of rate times T and the loss dense has
+  removed tracks it (run 7: 1.7% at step 9, 4.3% at 19, 5.3% at 29, the file
+  fit near 6%). At one tenth the rate the same fraction arrives ten times
+  later. The rates tried (1e-5 against experts at 1e-4) were one to two
+  orders too fast, as run 7's reading said; 1e-6 and below with a delayed
+  onset is the untested regime. A slow dense still memorizes eventually, so
+  run length is part of any result.
+- Consequence. Dense must not finish the fit before the experts publish, and
+  the published dense change should stay below the experts' (Pending item
+  1). Any lever is judged by: per-class flip onset, expert sign consistency
+  until onset, held-out after the experts begin publishing against the
+  experts-only baseline, and training-versus-held-out divergence from the
+  second epoch, all recorded every step by `flips.py` and `progress.py`.
+
+Terms. "Dense" in this plan is the always-on FP8 class: the attention
+projections (`wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b`; 4.60B values, 81%) and
+the shared expert (`gate_proj`, `up_proj`, `down_proj`; 1.08B, 19%). It is
+not NVIDIA's "dense MLP", of which this model has none. The three roles are
+attention, the shared expert (one FFN of exactly a routed expert's size that
+every token passes through), and the routed experts. `wq_a` and `wkv` are
+low-rank bottlenecks shared by all 64 heads and will dominate any per-element
+score. "Movement" of a class is the fraction of its trained values changed
+since the start (`{dense,expert}_values_changed / _value_elements`).
+
 ## Decisions
 
 - Full-parameter QAT is the only path pursued until exhausted. The LoRA-QAT gate arm
@@ -360,20 +434,22 @@ tens of steps yields deltas about 1e-4, below both grids' half-cells.
   routed-expert weight sees about 2% (and the experts' FP4 half-cells are four
   times the dense FP8 ones), so at any rate slow enough for experts to publish,
   dense fits the data first and removes the gradient-sign consistency experts
-  need (stage 5 phase C on the proxy, stage 7 run 7 on the full model). Rate and
-  role are the wrong levers: per-class rates (1e-5 / 1e-4) only move when dense
-  finishes, and attention-only still trains 81% of dense values (run 8). Both
-  were pursued through stage 7 after stage 5 had measured the asymmetry; that
-  was the error of the first training-host rental. Selection by whole tensor or
-  role is closed. The lever is a selection of dense values far sparser than any
-  role split, chosen from a base-model measurement over the training rows, with
-  unselected values frozen byte for byte like unselected experts; the
-  expectation is that the fraction that works measures much closer to 2% than
-  to 81%. There is no fixed percentage target: the unit of selection and the
-  scoring statistic are the open decisions (Pending item 1), settled by the flip
-  and held-out indicators. The current mechanism (`proxy_step --dense-tensors`
-  with the recipe's `freeze_config`, verified by the exact-set check) selects by
-  role only and is a placeholder. SPEC §4 follows the decision.
+  need (stage 5 phase C on the proxy, stage 7 run 7 on the full model;
+  Mechanism). Role is not a lever: attention-only still trains 81% of dense
+  values (run 8), and selection by whole tensor or role is closed. Rate was
+  tried only at 1e-5 against experts at 1e-4, one to two orders too fast; both
+  arms were run after stage 5 had measured the asymmetry, which was the error
+  of the first training-host rental. The lever to test first is the simple
+  one: dense starts when the experts begin to publish and runs at a rate set so
+  that its movement ends near 75% of the experts' (Mechanism, Terms), the
+  margin chosen to favor generalization over memorization of the file. The
+  experts-only run (ESFT's own recipe) is the control. If that leaves dense
+  flips that do not help held-out, or no rate separates useful dense change
+  from memorization, the refinement is a sparse selection of dense values from
+  a base-model measurement, with unselected values frozen byte for byte like
+  unselected experts (Pending item 1). The current `proxy_step --dense-tensors`
+  mechanism selects by role only and is a placeholder. SPEC §4 follows the
+  decision.
 - Master precision: BF16 masters with stochastic-rounding updates and torchao
   `AdamW8bit` (8-bit blockwise moments, block 256) for the full run and on the proxy.
   FP32 masters do not fit the proxy (27B parameters at 4 bytes plus moments on two
@@ -472,7 +548,8 @@ deepseek/
                       restrict_rows (per-row views for expert selection); NeMo parameter
                       groups with rate sync into torchao's tensor rates
     inbackward.py     update-in-backward stepper with lagged clipping, optional per-class norms,
-                      per-class update period (frequency split), per-parameter row selection,
+                      per-class update period (frequency split) and start step (delayed dense),
+                      per-parameter row selection,
                       hook-entry peak memory sample
     overrides.py      --set/--unset recipe overrides shared by the torchrun entries
     proxy_export.py   trained-target export: quantize, gather experts to rank 0,
@@ -482,7 +559,7 @@ deepseek/
                       packed-stack byte check under split storage
     proxy_step.py     training run and diagnostics (torchrun entry); --in-backward,
                       --per-class-clip, --set/--unset recipe overrides, --trainable-subset,
-                      --dense-tensors all|attention|shared|none, --dense-every N,
+                      --dense-tensors all|attention|shared|none, --dense-every N, --dense-start-step S,
                       --expert-selection SCORES.json, --expert-shares SCORES.json; live
                       table per step and eval line per validation (progress.py), flip
                       fractions per step (flips.py), master drift and sign consistency
@@ -1283,14 +1360,48 @@ Completed on the training host (8x RTX PRO 6000, 755 GB RAM), in order:
 
 Pending, in order (each a separate decision):
 
-1. Dense value selection, the priority (Decisions, trainable set): the unit of
-   selection (whole tensors and roles are closed; a finer unit inside tensors is
-   to be decided) and the scoring statistic measured on the base model over the
-   training rows, the dense analogue of `route_scores`, producing a selection
-   file that drives the stepper and the integrity check as the expert selection
-   does. Closed: role (run 8) and ranking whole tensors by 20-step update-sign
-   consistency (run 9: 0.84 to 0.95 across all 344 tensors). The selected
-   fraction is an outcome to measure, not a target. SPEC §4 follows the decision.
+1. Dense held back and slowed (Decisions, trainable set), two runs on the next
+   host, everything else matched (expert selection, data order, validation
+   steps, frozen contract):
+   (a) Experts-only control: `full-train.yaml` with the unfreeze list reduced
+       to `mlp.experts` and `--trainable-subset experts`, experts at 1e-4,
+       100 steps, validation every 5. Gives the expert onset step S (first
+       step where selected-expert movement passes the threshold chosen when
+       reading the run; run 7 puts the 0.01% region at step 34) and the
+       held-out trajectory experts produce alone.
+   (b) Delayed dense: `full-train.yaml`, dense 1e-6 and experts 1e-4
+       (`lr_mult` 100), `--dense-start-step S` (stepper gate: dense gradients
+       counted toward the norm and discarded before S, no optimizer state
+       until S, experts' Adam state continuous; the trajectory to S equals
+       (a) by construction), same length and validation. Dense enters at
+       1e-6 with fresh moments, whose first updates are 1e-6 per element,
+       below every half-cell, so no entry warmup. Target: dense movement at
+       the end near 75% of the experts' (Terms). 1e-6 is the estimate from
+       run 7's dense curve (1.7% at step 9 needs about 4e-5 of drift); the
+       measured end ratio corrects the rate for a third run.
+   Read: held-out of (b) against (a) after S; expert sign consistency intact
+   until S; both classes' flip curves; training-versus-held-out from the
+   second epoch. BF16 masters at 1e-6 apply updates as rare whole-ulp
+   stochastic-rounding jumps with the expected drift preserved (about 35%
+   variance in an element's crossing time); acceptable for the measurement,
+   and `MasterOptimizer` (FP32, no parameter groups) is the fix if not.
+   Contingent refinement, if (b) leaves dense flips that do not help held-out
+   or no rate separates useful dense change from memorization: a sparse
+   selection of dense values. Unit: scale-coupled and byte-checkable (the
+   FP8 128x128 block is the natural candidate; rows cross blocks and cannot
+   keep unselected values frozen without pinning scales); uniform units make
+   the budget a top-k. Score candidates, all from one base-model gradient
+   pass unless noted: gradient energy (FISH Mask); Taylor sensitivity
+   mean |W * G|; publishable benefit, -<G, Q(W + D(H)) - Q(W)> with D(H) the
+   schedule's cumulative drift by step H and Q requantizing the whole unit,
+   ranked at a horizon near S; update-sign consistency past the first epoch
+   (a pilot run); task-to-general gradient-energy ratio (needs `ood` rows);
+   role as a cap or weight on the unit-level selection, measured by
+   ablation on held-out and `ood` (needs item 2), with the bottleneck
+   tensors `wq_a` and `wkv` as a group of their own since every per-element
+   score concentrates there. Closed: role as the selection (run 8), whole
+   tensors by first-epoch sign consistency (run 9). SPEC §4 follows the
+   decision.
 2. `ood` evaluation: a second validation set (`validation_ood`, any `messages`
    rows read by the data bridge) scored at every validation, shown as `ood` and
    `Δbase` columns and on the eval line, in the progress file and report. Rows
@@ -1332,6 +1443,19 @@ PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-p
     | tee deepseek/exports/logs/full-stage7-lr1e-5.log \
     | stdbuf -oL tr '\r' '\n' | grep --line-buffered -oE "(step [0-9]+ \| .*|\[val\] .*|Traceback.*|.*out of memory.*)" \
     > deepseek/exports/logs/full-stage7-lr1e-5.progress
+# Pending item 1 (a): experts-only control (TQDM_DISABLE=1; the live table is on stderr,
+# so a plain `2>&1 | tee LOG` keeps it; add the filter above for a .progress file)
+TQDM_DISABLE=1 PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 8 \
+    -m deepseek.qat.proxy_step --config deepseek/qat/full-train.yaml --in-backward \
+    --trainable-subset experts --set 'freeze_config.unfreeze_modules=[{glob: "model.layers.*.mlp.experts"}]' \
+    --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=5 --set lr_scheduler.lr_warmup_steps=10 \
+    --out deepseek/exports/logs/full-stage7-experts-only.json 2>&1 | tee deepseek/exports/logs/full-stage7-experts-only.log
+# Pending item 1 (b): delayed dense at 1e-6 with experts at 1e-4; S from (a)'s expert onset
+TQDM_DISABLE=1 PYTORCH_ALLOC_CONF=expandable_segments:True deepseek/venv/bin/torchrun --nproc-per-node 8 \
+    -m deepseek.qat.proxy_step --config deepseek/qat/full-train.yaml --in-backward --dense-start-step S \
+    --set optimizer.lr=1e-6 --set "optimizer.param_group_overrides=[{pattern: 'mlp\.experts', lr_mult: 100.0}]" \
+    --set step_scheduler.max_steps=100 --set step_scheduler.val_every_steps=5 --set lr_scheduler.lr_warmup_steps=10 \
+    --out deepseek/exports/logs/full-stage7-delayed-dense.json 2>&1 | tee deepseek/exports/logs/full-stage7-delayed-dense.log
 ```
 
 ## Verified facts
